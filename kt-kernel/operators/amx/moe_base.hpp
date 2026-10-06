@@ -131,6 +131,15 @@ class AMX_MOE_BASE {
       down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
 
+      // Keep global expert indexing for routing, but allow backends to omit
+      // resident weight buffers for experts served by another device.
+      if (!derived_const()->should_allocate_expert_weights(i)) {
+        gate_bb_.push_back(nullptr);
+        up_bb_.push_back(nullptr);
+        down_bb_.push_back(nullptr);
+        continue;
+      }
+
       void* gate_bb_ptr =
           std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
       gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
@@ -146,10 +155,15 @@ class AMX_MOE_BASE {
     // (config_.expert_num * T::M_STEP) in pool_count_ is to ensure padding for each experts.
     pool_count_ = (size_t)config_.max_len * config_.num_experts_per_tok + config_.expert_num * T::M_STEP;
 
-    gate_up_ba_pool_bytes_ = buffer_a_required_size(pool_count_, config_.hidden_size) + pool_count_ * 64;
+    // BufferA implementations may alias prefill inputs and require only a
+    // one-row staging tile per active expert. Reserve for every expert even
+    // when required_size(pool_count_) no longer scales with pool_count_.
+    gate_up_ba_pool_bytes_ = std::max(buffer_a_required_size(pool_count_, config_.hidden_size) + pool_count_ * 64,
+                                      config_.expert_num * (buffer_a_required_size(1, config_.hidden_size) + 64));
     gate_bc_pool_bytes_ = buffer_c_required_size(pool_count_, config_.intermediate_size) + pool_count_ * 64;
     up_bc_pool_bytes_ = buffer_c_required_size(pool_count_, config_.intermediate_size) + pool_count_ * 64;
-    down_ba_pool_bytes_ = buffer_a_required_size(pool_count_, config_.intermediate_size) + pool_count_ * 64;
+    down_ba_pool_bytes_ = std::max(buffer_a_required_size(pool_count_, config_.intermediate_size) + pool_count_ * 64,
+                                   config_.expert_num * (buffer_a_required_size(1, config_.intermediate_size) + 64));
     down_bc_pool_bytes_ = buffer_c_required_size(pool_count_, config_.hidden_size) + pool_count_ * 64;
 
     mem_requests.append_pointer(&gate_up_ba_pool_, gate_up_ba_pool_bytes_);
@@ -674,6 +688,11 @@ class AMX_MOE_BASE {
   // Called after base class init() completes, allows derived classes to perform
   // their own initialization that depends on base class being fully initialized
   // ============================================================================
+  bool should_allocate_expert_weights(int expert_idx) const {
+    (void)expert_idx;
+    return true;
+  }
+
   void derived_init() {
     // Default implementation does nothing - derived classes can override
   }

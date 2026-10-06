@@ -672,6 +672,10 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
            config_.quant_config.group_size);
   }
 
+  bool should_allocate_expert_weights(int expert_idx) const {
+    return !config_.should_skip_expert(expert_idx);
+  }
+
   size_t buffer_a_required_size_impl(size_t m, size_t k) const {
     return T::BufferA::required_size(m, k, config_.quant_config.group_size);
   }
@@ -1092,6 +1096,7 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
         pool->get_subpool(i)->do_work_stealing_job(
             tpc.expert_num, nullptr,
             [&, i](int eid) {
+              if (tpc.should_skip_expert(eid)) return;
               uint64_t lid = expert_map(physical_to_logical_map, eid);
               uint8_t* src_gate = (uint8_t*)config.gate_proj +
                                   (lid * (size_t)config.intermediate_size + i * n_per_tp) * config.hidden_size / 2;

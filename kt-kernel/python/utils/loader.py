@@ -1210,8 +1210,10 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
     FP4 backend already consumes bf16 scales.
     """
 
-    EXPERTS_PATH_TPL = "{base}.ffn.experts"
-    PROJ_NAMES = ("w1", "w3", "w2")  # (gate, up, down)
+    #EXPERTS_PATH_TPL = "{base}.ffn.experts"
+    #PROJ_NAMES = ("w1", "w3", "w2")  # (gate, up, down)
+    EXPERTS_PATH_TPL = "{base}.mlp.experts"
+    PROJ_NAMES = ("gate_proj", "up_proj", "down_proj")  # (gate, up, down)
 
     def _experts_prefix_candidates(self, base_key: str) -> list[str]:
         candidates = [self.EXPERTS_PATH_TPL.format(base=base_key)]
@@ -1230,7 +1232,12 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
         # because torch CPU has no lshift kernel for uint16.
         return (scale_t.to(torch.int32) << 7).to(torch.int16).view(torch.bfloat16).contiguous()
 
-    def load_experts(self, base_key: str, device: str = "cpu"):
+    def load_experts(
+        self,
+        base_key: str,
+        device: str = "cpu",
+        gpu_experts_mask: torch.Tensor | None = None,
+    ):
         gate_name, up_name, down_name = self.PROJ_NAMES
         prefix = None
         expert_count = 0
@@ -1246,6 +1253,16 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 f"No MXFP4 experts found under any of: {self._experts_prefix_candidates(base_key)}"
             )
 
+        if gpu_experts_mask is None:
+            skipped_experts = [False] * expert_count
+        else:
+            skipped_experts = gpu_experts_mask.to(device="cpu", dtype=torch.bool).tolist()
+            if len(skipped_experts) != expert_count:
+                raise ValueError(
+                    "gpu_experts_mask length does not match MXFP4 expert count: "
+                    f"{len(skipped_experts)} != {expert_count}"
+                )
+
         gate_weights = [None] * expert_count
         up_weights = [None] * expert_count
         down_weights = [None] * expert_count
@@ -1254,6 +1271,8 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
         down_scales = [None] * expert_count
 
         for exp_id in range(expert_count):
+            if skipped_experts[exp_id]:
+                continue
             for proj, dst in (
                 (gate_name, gate_weights),
                 (up_name, up_weights),
@@ -1269,10 +1288,14 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 (up_name, up_scales),
                 (down_name, down_scales),
             ):
-                s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.scale", device)
+                s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight_scale", device)
                 dst[exp_id] = self._ue8m0_to_bf16(s)
 
-        print(f"[MXFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
+        loaded_expert_count = expert_count - sum(skipped_experts)
+        print(
+            f"[MXFP4SafeTensorLoader] Loaded {loaded_expert_count}/{expert_count} "
+            f"CPU experts from {prefix}"
+        )
         return {
             "gate": gate_weights,
             "up": up_weights,

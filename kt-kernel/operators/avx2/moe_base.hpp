@@ -119,6 +119,15 @@ class AVX2_MOE_BASE {
       down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
 
+      // Keep global expert indexing for routing, but allow backends to omit
+      // resident weight buffers for experts served by another device.
+      if (!derived_const()->should_allocate_expert_weights(i)) {
+        gate_bb_.push_back(nullptr);
+        up_bb_.push_back(nullptr);
+        down_bb_.push_back(nullptr);
+        continue;
+      }
+
       void* gate_bb_ptr = std::aligned_alloc(
           64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
       if (!gate_bb_ptr) throw std::runtime_error("aligned_alloc failed for gate BufferB");
@@ -522,6 +531,11 @@ class AVX2_MOE_BASE {
 
   void run_fused_down_decode(int activated_experts, int qlen) {
     if constexpr (has_fused_down_decode()) derived()->decode_down_projection(activated_experts, qlen);
+  }
+
+  bool should_allocate_expert_weights(int expert_idx) const {
+    (void)expert_idx;
+    return true;
   }
 
   void derived_init() {}

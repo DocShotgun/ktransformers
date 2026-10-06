@@ -780,9 +780,22 @@ class NativeMoEWrapper(BaseMoEWrapper):
             f"model.language_model.layers.{self.layer_idx}",
         ]
         weights = None
+        gpu_logical_experts_mask = None
+        if self.method == "MXFP4" and self.num_gpu_experts:
+            physical_gpu_experts = self.gpu_experts_mask.nonzero(as_tuple=False).flatten()
+            gpu_logical_experts = physical_to_logical_map_cpu[physical_gpu_experts].to(torch.int64)
+            if torch.any((gpu_logical_experts < 0) | (gpu_logical_experts >= self.num_experts)):
+                raise ValueError("physical_to_logical_map_cpu contains an invalid GPU expert mapping")
+            gpu_logical_experts_mask = torch.zeros(self.num_experts, dtype=torch.bool)
+            gpu_logical_experts_mask[gpu_logical_experts] = True
         for base_key in _candidates:
             try:
-                weights = self.loader.load_experts(base_key)
+                if self.method == "MXFP4":
+                    weights = self.loader.load_experts(
+                        base_key, gpu_experts_mask=gpu_logical_experts_mask
+                    )
+                else:
+                    weights = self.loader.load_experts(base_key)
                 break
             except (ValueError, KeyError):
                 continue
@@ -810,6 +823,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
             self.gate_scales = weights["gate_scale"]
             self.up_scales = weights["up_scale"]
             self.down_scales = weights["down_scale"]
+            scale_sample = next((scale for scale in self.gate_scales if scale is not None), None)
+            if scale_sample is None:
+                raise ValueError("No CPU expert scales were loaded")
             if self.method == "RAWINT4":
                 assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for RAWINT4"
             elif self.method == "FP8":
@@ -827,7 +843,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
             elif self.method == "MXFP4":
                 # ue8m0 is losslessly representable in bf16 (8-bit exponent, 0 mantissa);
                 # the loader has already done that conversion.
-                assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for MXFP4"
+                assert scale_sample.dtype == torch.bfloat16, "Expected bf16 scales for MXFP4"
             elif self.method == "NVFP4":
                 # e4m3 block scale x per-tensor global, folded to bf16 by the loader.
                 assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for NVFP4"
@@ -839,9 +855,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
 
         # Build pointer lists: [numa_id][expert_id] -> pointer
         # Since RAWINT4/FP8/BF16 has no numa sharding, numa dimension is 1
-        gate_ptrs = [[t.data_ptr() for t in self.gate_weights]]
-        up_ptrs = [[t.data_ptr() for t in self.up_weights]]
-        down_ptrs = [[t.data_ptr() for t in self.down_weights]]
+        gate_ptrs = [[0 if t is None else t.data_ptr() for t in self.gate_weights]]
+        up_ptrs = [[0 if t is None else t.data_ptr() for t in self.up_weights]]
+        down_ptrs = [[0 if t is None else t.data_ptr() for t in self.down_weights]]
 
         # BF16 has no scales, pass empty lists (will use 0/nullptr for consistency)
         if self.method == "BF16":
@@ -849,9 +865,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
             up_scale_ptrs = [[0 for _ in self.up_weights]]
             down_scale_ptrs = [[0 for _ in self.down_weights]]
         else:
-            gate_scale_ptrs = [[t.data_ptr() for t in self.gate_scales]]
-            up_scale_ptrs = [[t.data_ptr() for t in self.up_scales]]
-            down_scale_ptrs = [[t.data_ptr() for t in self.down_scales]]
+            gate_scale_ptrs = [[0 if t is None else t.data_ptr() for t in self.gate_scales]]
+            up_scale_ptrs = [[0 if t is None else t.data_ptr() for t in self.up_scales]]
+            down_scale_ptrs = [[0 if t is None else t.data_ptr() for t in self.down_scales]]
         t3 = time.time()
 
         moe_config = MOEConfig(
@@ -912,7 +928,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         elif self.method == "MXFP4":
             # MXFP4: E2M1 nibble-packed weights, ue8m0/bf16 per-32 group scale
             # (e.g. DeepSeek-V4-Flash routed experts)
-            group_size = self.hidden_size // self.gate_scales[0].shape[1]
+            group_size = self.hidden_size // scale_sample.shape[1]
             moe_config.quant_config.bits = 4
             moe_config.quant_config.group_size = group_size
             moe_config.quant_config.zero_point = False
