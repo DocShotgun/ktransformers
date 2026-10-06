@@ -237,16 +237,22 @@ class MOEBindings {
       intptr_t input;
       intptr_t output;
       bool incremental;
+      // qlen captured at task build time. `qlen` points into a pinned scalar
+      // tensor shared across forwards; the task executes deferred (worker pool /
+      // CUDA host callback) and must not dereference that shared pointer at exec
+      // time, or it reads whatever memory holds by then.
+      int qlen_value;
     };
     static void inner(void* args) {
       Args* args_ = (Args*)args;
-      args_->cpuinfer->enqueue(&TP_MOE<T>::forward_binding, args_->moe, args_->qlen, args_->k, args_->expert_ids,
-                               args_->weights, args_->input, args_->output, args_->incremental);
+      args_->cpuinfer->enqueue(&TP_MOE<T>::forward_binding, args_->moe, (intptr_t)&args_->qlen_value, args_->k,
+                               args_->expert_ids, args_->weights, args_->input, args_->output, args_->incremental);
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
                                                             intptr_t expert_ids, intptr_t weights, intptr_t input,
                                                             intptr_t output, bool incremental = false) {
-      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, weights, input, output, incremental};
+      int qlen_value = qlen ? *reinterpret_cast<int*>(qlen) : 0;
+      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, weights, input, output, incremental, qlen_value};
       return std::make_pair((intptr_t)&inner, (intptr_t)args);
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,

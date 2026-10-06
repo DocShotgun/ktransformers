@@ -226,6 +226,39 @@ class KExpertsCPUBuffer:
     temp_buffer: tuple = tuple()
     buffer_depth: int = 2
 
+    # (cpuinfer, stream) pairs with submits whose deferred tasks may still
+    # reference temp_buffer. Cleared by _quiesce(); see get_buffer below.
+    pending_submitters: Dict = dict()
+
+    @classmethod
+    def _note_pending_submitter(cls, cpu_infer, cuda_stream) -> None:
+        stream_key = cuda_stream if isinstance(cuda_stream, int) else id(cuda_stream)
+        cls.pending_submitters[(id(cpu_infer), stream_key)] = (cpu_infer, cuda_stream)
+
+    @classmethod
+    def _quiesce(cls) -> None:
+        """Block until every submitted expert task has actually executed.
+
+        ``submit_with_cuda_stream`` is fire-and-forget: it defers the task enqueue
+        to the CUDA host-callback thread, and the task then executes on the CPU
+        worker pool. Every task argument pointer (qlen, expert ids, weights,
+        input, output) points into the pinned tensors of a buffer tuple, so a
+        tuple must outlive all tasks built against it. Fence each submit stream
+        (covered backward through its queued host callbacks) and drain the CPU
+        task queue before any tuple is dropped.
+        """
+        submitters = list(cls.pending_submitters.values())
+        cls.pending_submitters.clear()
+        cpuinfer_seen = dict()
+        for cpu_infer, cuda_stream in submitters:
+            if cuda_stream is not None:
+                cpu_infer.sync_with_cuda_stream(cuda_stream, 0)
+            cpuinfer_seen[id(cpu_infer)] = cpu_infer
+        # Belt for host-side submits (no stream fence involved): drain the queue
+        # directly so no enqueue-eagerly task survives either.
+        for cpu_infer in cpuinfer_seen.values():
+            cpu_infer.sync(0)
+
     @classmethod
     def get_buffer(cls, hidden_states: torch.Tensor, num_experts_per_tok):
         hidden_size = hidden_states.shape[-1]
@@ -237,6 +270,14 @@ class KExpertsCPUBuffer:
             return cls.capture_buffers[batch_size]
         if batch_size == cls.temp_bs:
             return cls.temp_buffer
+
+        # Batch size changed -> the previous temp tuple is about to be dropped,
+        # but fire-and-forget tasks built against it may not have executed yet
+        # (and their exec-time qlen/dst reads and writes then hit freed pinned
+        # memory: garbage qlen merges, stale dst writes, SIGSEGV or silent
+        # corruption). Drain them first; after this point no task can reference
+        # the old tuple.
+        cls._quiesce()
 
         input_tensor_cpu = [
             torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
@@ -670,6 +711,8 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 self.cpu_infer.submit_with_cuda_stream(cuda_stream, deferred_task)
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
+        KExpertsCPUBuffer._note_pending_submitter(self.cpu_infer, cuda_stream)
+
     def run_pinned_forward_sync(
         self,
         hidden_states: torch.Tensor,
@@ -726,6 +769,9 @@ class BaseMoEWrapper(_MoEBase, ABC):
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
         allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
         self.cpu_infer.sync(allow_pending)
+        # Host-side submits only (cuda_stream intentionally unused above); a
+        # partial drain (allow_pending == 1) can leave a deferred task queued.
+        KExpertsCPUBuffer._note_pending_submitter(self.cpu_infer, None)
 
     def submit_forward(
         self,
@@ -815,6 +861,8 @@ class BaseMoEWrapper(_MoEBase, ABC):
             else:
                 self.cpu_infer.submit_with_cuda_stream(cuda_stream, deferred_task)
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
+
+        KExpertsCPUBuffer._note_pending_submitter(self.cpu_infer, cuda_stream)
 
     def copy_forward_output_to_device(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Copy pinned CPU output to the device tensor (CPU work already finished)."""
