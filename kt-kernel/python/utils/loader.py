@@ -1350,7 +1350,12 @@ class NVFP4SafeTensorLoader(SafeTensorLoader):
         s = block_scale.to(torch.float32) * global_scale.to(torch.float32).reshape(())
         return s.to(torch.bfloat16).contiguous()
 
-    def load_experts(self, base_key: str, device: str = "cpu"):
+    def load_experts(
+        self,
+        base_key: str,
+        device: str = "cpu",
+        gpu_experts_mask: torch.Tensor | None = None,
+    ):
         gate_name, up_name, down_name = self.PROJ_NAMES
         prefix = None
         expert_count = 0
@@ -1366,6 +1371,16 @@ class NVFP4SafeTensorLoader(SafeTensorLoader):
                 f"No NVFP4 experts found under any of: {self._experts_prefix_candidates(base_key)}"
             )
 
+        if gpu_experts_mask is None:
+            skipped_experts = [False] * expert_count
+        else:
+            skipped_experts = gpu_experts_mask.to(device="cpu", dtype=torch.bool).tolist()
+            if len(skipped_experts) != expert_count:
+                raise ValueError(
+                    "gpu_experts_mask length does not match NVFP4 expert count: "
+                    f"{len(skipped_experts)} != {expert_count}"
+                )
+
         gate_weights = [None] * expert_count
         up_weights = [None] * expert_count
         down_weights = [None] * expert_count
@@ -1374,6 +1389,8 @@ class NVFP4SafeTensorLoader(SafeTensorLoader):
         down_scales = [None] * expert_count
 
         for exp_id in range(expert_count):
+            if skipped_experts[exp_id]:
+                continue
             for proj, wdst, sdst in (
                 (gate_name, gate_weights, gate_scales),
                 (up_name, up_weights, up_scales),
@@ -1388,7 +1405,11 @@ class NVFP4SafeTensorLoader(SafeTensorLoader):
                 gs = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight_scale_2", device)
                 sdst[exp_id] = self._fold_scales_to_bf16(bs, gs)
 
-        print(f"[NVFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
+        loaded_expert_count = expert_count - sum(skipped_experts)
+        print(
+            f"[NVFP4SafeTensorLoader] Loaded {loaded_expert_count}/{expert_count} "
+            f"CPU experts from {prefix}"
+        )
         return {
             "gate": gate_weights,
             "up": up_weights,

@@ -612,11 +612,11 @@ class NativeMoEWrapper(BaseMoEWrapper):
         # by GLM-5-Next's E4M3 + FP32 [128, 128] checkpoint format.
         # if the experts.py guard is bypassed (e.g., by a future caller
         # that constructs NativeMoEWrapper directly). Origin: kt-sglang 耦合.
-        if swiglu_limit != 0.0 and method not in ("FP8", "MXFP4", "MXFP8"):
+        if swiglu_limit != 0.0 and method not in ("FP8", "MXFP4", "NVFP4", "MXFP8"):
             raise ValueError(
                 f"NativeMoEWrapper received swiglu_limit={swiglu_limit} with "
                 f"method={method!r}; the clamp is supported only by "
-                "FP8/MXFP4/MXFP8. "
+                "FP8/MXFP4/NVFP4/MXFP8. "
                 f"This indicates a missing guard in the caller."
             )
         if method == "RAWINT4" and not (
@@ -662,9 +662,12 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 "SYCL_GPTQ_INT4 backend not available. Rebuild kt_kernel_ext with "
                 "CPUINFER_USE_SYCL=1 using a SYCL compiler such as icpx."
             )
-        if method == "NVFP4" and not _HAS_AVX2_MXFP4_SUPPORT:
+        if method == "NVFP4" and not (_HAS_MXFP4_SUPPORT or _HAS_AVX2_MXFP4_SUPPORT):
             raise RuntimeError(
-                "NVFP4 needs the AVX2 FP4 backend (AVX2MXFP4_MOE), which is not compiled in."
+                "NVFP4 backend not available. Required ISA (any one of):\n"
+                "  - AVX512F + AVX512BW + AVX512_BF16 (for AMX/AVX-512 backend)\n"
+                "  - AVX2 + FMA (for AVX2 fallback backend)\n"
+                "Please recompile kt_kernel_ext with one of the above enabled."
             )
         if method == "MXFP4" and not (_HAS_MXFP4_SUPPORT or _HAS_AVX2_MXFP4_SUPPORT):
             raise RuntimeError(
@@ -781,7 +784,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         ]
         weights = None
         gpu_logical_experts_mask = None
-        if self.method == "MXFP4" and self.num_gpu_experts:
+        if self.method in ("MXFP4", "NVFP4") and self.num_gpu_experts:
             physical_gpu_experts = self.gpu_experts_mask.nonzero(as_tuple=False).flatten()
             gpu_logical_experts = physical_to_logical_map_cpu[physical_gpu_experts].to(torch.int64)
             if torch.any((gpu_logical_experts < 0) | (gpu_logical_experts >= self.num_experts)):
@@ -790,7 +793,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
             gpu_logical_experts_mask[gpu_logical_experts] = True
         for base_key in _candidates:
             try:
-                if self.method == "MXFP4":
+                if self.method in ("MXFP4", "NVFP4"):
                     weights = self.loader.load_experts(
                         base_key, gpu_experts_mask=gpu_logical_experts_mask
                     )
@@ -846,7 +849,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 assert scale_sample.dtype == torch.bfloat16, "Expected bf16 scales for MXFP4"
             elif self.method == "NVFP4":
                 # e4m3 block scale x per-tensor global, folded to bf16 by the loader.
-                assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for NVFP4"
+                assert scale_sample.dtype == torch.bfloat16, "Expected bf16 scales for NVFP4"
             elif self.method == "MXFP8":
                 # ue8m0 scales stay as uint8; C++ convert_ue8m0_to_fp32 handles conversion.
                 assert self.gate_scales[0].dtype == torch.uint8, "Expected uint8 (ue8m0) scales for MXFP8"
@@ -890,12 +893,13 @@ class NativeMoEWrapper(BaseMoEWrapper):
         if self.swiglu_limit != 0.0 and self.method not in (
             "FP8",
             "MXFP4",
+            "NVFP4",
             "MXFP8",
         ):
             raise ValueError(
                 f"NativeMoEWrapper.load_weights: swiglu_limit="
                 f"{self.swiglu_limit} with method={self.method!r}; clamp is "
-                f"only valid for FP8/MXFP4/MXFP8."
+                f"only valid for FP8/MXFP4/NVFP4/MXFP8."
             )
         moe_config.swiglu_limit = self.swiglu_limit
 
@@ -944,12 +948,12 @@ class NativeMoEWrapper(BaseMoEWrapper):
             # in E4M3 times a per-tensor global scale. The loader has already
             # folded both into one bf16 scale per group, so the FP4 kernel runs
             # this unchanged -- only group_size differs (16 vs 32).
-            group_size = self.hidden_size // self.gate_scales[0].shape[1]
+            group_size = self.hidden_size // scale_sample.shape[1]
             if group_size != 16:
                 raise RuntimeError(
                     f"NVFP4 expects group_size 16, derived {group_size} from "
                     f"hidden_size={self.hidden_size} and scale shape "
-                    f"{tuple(self.gate_scales[0].shape)}."
+                    f"{tuple(scale_sample.shape)}."
                 )
             moe_config.quant_config.bits = 4
             moe_config.quant_config.group_size = group_size
@@ -959,13 +963,6 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 raise RuntimeError(
                     "No FP4 backend available for NVFP4 after runtime selection. "
                     "Compile with AVX512_BF16 (AMXFP4_KGroup_MOE) or AVX2 (AVX2MXFP4_MOE)."
-                )
-            if backend_cls is not AVX2MXFP4_MOE:
-                # Only the AVX2 kernel has the group-16 path; the AMX FP4 kernel
-                # is built around a 32-value k-group.
-                raise RuntimeError(
-                    "NVFP4 (group_size 16) currently requires the AVX2 FP4 backend. "
-                    "Set KT_MXFP4_BACKEND=avx2, or extend the AMX kernel to group-16."
                 )
             self.moe = backend_cls(moe_config)
         elif self.method == "MXFP8":
