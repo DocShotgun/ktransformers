@@ -1195,31 +1195,188 @@ class GPTQSafeTensorLoader(FP8SafeTensorLoader):
         }
 
 
-class MXFP4SafeTensorLoader(SafeTensorLoader):
-    """Loader for native MXFP4 expert weights (DeepSeek-V4-Flash format).
+# ---------------------------------------------------------------------------
+# Sparse MoE tensor-name resolution shared by the FP4-family loaders.
+#
+# Checkpoint families disagree on three independent axes:
+#   * experts container:  "{base}.mlp.experts" | "{base}.ffn.experts"
+#                         | "{base}.block_sparse_moe.experts" | "{base}.experts"
+#   * projection names:   gate_proj/up_proj/down_proj  |  w1/w3/w2
+#   * scale suffixes:     block:  weight_scale|scale (MXFP4 ue8m0 / NVFP4 fp8)
+#                                 | weight_scale_inv|scale_inv (MXFP8)
+#                         global: weight_scale_2|scaling_factor|scale_2 (NVFP4)
+#
+# `resolve_experts_layout()` probes expert 0 keys per layer and answers all
+# three questions at once; `KT_MOE_NAMING=<variant>` pins a naming variant
+# instead of probing. Base keys are probed with/without `model.` and VL
+# prefixes (`model.language_model.` etc.), matching real HF checkpoints.
+# ---------------------------------------------------------------------------
 
-    Per expert layout:
-      {base}.ffn.experts.{i}.w1.weight  I8       [N, K/2]   nibble-packed E2M1 (gate)
-      {base}.ffn.experts.{i}.w1.scale   F8_E8M0  [N, K/32]  ue8m0 group scale
-      {base}.ffn.experts.{i}.w3.{weight,scale}              up
-      {base}.ffn.experts.{i}.w2.{weight,scale}              down
+MOE_NAMING_VARIANTS: dict[str, tuple[str, tuple[str, str, str]]] = {
+    # variant: (experts path template, (gate, up, down) projection names)
+    "hf_mlp": ("{base}.mlp.experts", ("gate_proj", "up_proj", "down_proj")),
+    "deepseek_v4": ("{base}.ffn.experts", ("w1", "w3", "w2")),
+    "mixtral": ("{base}.block_sparse_moe.experts", ("w1", "w3", "w2")),
+    "mistral": ("{base}.experts", ("w1", "w3", "w2")),
+}
+MOE_NAMING_PROBE_ORDER = ("hf_mlp", "deepseek_v4", "mixtral", "mistral")
+MOE_NAMING_ENV_VAR = "KT_MOE_NAMING"
 
-    V4 ckpt keys are not prefixed with ``model.``; we also probe the stripped form so
-    callers can keep passing ``base_key="model.layers.{L}"``. ue8m0 → bf16 is a lossless
-    bit shift (both have an 8-bit exponent and zero mantissa for ue8m0), and the AMX
-    FP4 backend already consumes bf16 scales.
+_BLOCK_SCALE_SUFFIXES = ("weight_scale", "scale", "weight_scale_inv", "scale_inv")
+_GLOBAL_SCALE_SUFFIXES = ("weight_scale_2", "scaling_factor", "scale_2")
+_MXFP8_BLOCK_SCALE_SUFFIXES = ("weight_scale_inv", "scale_inv")
+
+_BASE_KEY_STRIP_PREFIXES = (
+    "model.language_model.",
+    "language_model.model.",
+    "language_model.",
+    "model.",
+)
+_BASE_KEY_ADD_PREFIXES = ("model.language_model.", "language_model.model.")
+
+_E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
+
+
+def naming_variant_candidates() -> tuple[str, ...]:
+    """Naming variants to probe, in order (`KT_MOE_NAMING` pins exactly one)."""
+    forced = os.environ.get(MOE_NAMING_ENV_VAR, "").strip().lower()
+    if not forced:
+        return MOE_NAMING_PROBE_ORDER
+    if forced not in MOE_NAMING_VARIANTS:
+        raise ValueError(
+            f"{MOE_NAMING_ENV_VAR}={forced!r} is not a known naming variant; "
+            f"expected one of {sorted(MOE_NAMING_VARIANTS)}"
+        )
+    return (forced,)
+
+
+def base_key_variants(base_key: str) -> list[str]:
+    """Base-key variants probed in order: exact, bare (`layers.N`), then VL prefixes."""
+    variants = [base_key]
+    core = base_key
+    for strip in _BASE_KEY_STRIP_PREFIXES:
+        if base_key.startswith(strip):
+            core = base_key[len(strip):]
+            break
+    if core not in variants:
+        variants.append(core)
+    for add in _BASE_KEY_ADD_PREFIXES:
+        candidate = add + core
+        if candidate not in variants:
+            variants.append(candidate)
+    return variants
+
+
+def _is_ue8m0_dtype(dtype) -> bool:
+    """ue8m0 scales arrive as uint8 or torch.float8_e8m0fnu depending on torch."""
+    return dtype == torch.uint8 or (_E8M0_DTYPE is not None and dtype == _E8M0_DTYPE)
+
+
+class ExpertsLayout:
+    """Resolved sparse-experts tensor naming + quant family for one MoE layer."""
+
+    def __init__(
+        self,
+        variant: str,
+        prefix: str,
+        proj_names: tuple[str, str, str],
+        block_scale_suffix: str,
+        global_scale_suffix: str | None,
+        family: str,
+    ):
+        self.variant = variant
+        self.prefix = prefix
+        self.proj_names = proj_names
+        self.block_scale_suffix = block_scale_suffix
+        self.global_scale_suffix = global_scale_suffix
+        self.family = family
+
+    def weight_key(self, expert_idx: int, proj_idx: int) -> str:
+        return f"{self.prefix}.{expert_idx}.{self.proj_names[proj_idx]}.weight"
+
+    def block_scale_key(self, expert_idx: int, proj_idx: int) -> str:
+        return f"{self.prefix}.{expert_idx}.{self.proj_names[proj_idx]}.{self.block_scale_suffix}"
+
+    def global_scale_key(self, expert_idx: int, proj_idx: int) -> str | None:
+        if self.global_scale_suffix is None:
+            return None
+        return f"{self.prefix}.{expert_idx}.{self.proj_names[proj_idx]}.{self.global_scale_suffix}"
+
+
+def resolve_experts_layout(loader, base_key: str, family: str | None = None) -> ExpertsLayout | None:
+    """Probe expert 0 keys and resolve naming variant + quant family for one layer.
+
+    family: "mxfp4" | "nvfp4" | "mxfp8" to require a specific quant family, or
+    None to accept any. Returns None when no complete layout is found; loaders
+    turn that into an error listing every probed prefix.
     """
+    for variant in naming_variant_candidates():
+        path_tpl, proj_names = MOE_NAMING_VARIANTS[variant]
+        gate = proj_names[0]
+        for bk in base_key_variants(base_key):
+            prefix = path_tpl.format(base=bk)
+            gate_key = f"{prefix}.0.{gate}"
+            if not loader.has_tensor(f"{gate_key}.weight"):
+                continue
+            block_suffix = next(
+                (s for s in _BLOCK_SCALE_SUFFIXES if loader.has_tensor(f"{gate_key}.{s}")),
+                None,
+            )
+            if block_suffix is None:
+                continue
+            global_suffix = next(
+                (s for s in _GLOBAL_SCALE_SUFFIXES if loader.has_tensor(f"{gate_key}.{s}")),
+                None,
+            )
+            if block_suffix in _MXFP8_BLOCK_SCALE_SUFFIXES:
+                fam = "mxfp8"
+            elif global_suffix is not None:
+                fam = "nvfp4"
+            else:
+                # Bare block scale: MXFP4 ue8m0 versus NVFP4 fp8 block scales with
+                # the global scale baked into the checkpoint. ue8m0 is recognizable
+                # by dtype; fp8-shaped scales belong to NVFP4.
+                scale_dtype = loader.load_tensor(f"{gate_key}.{block_suffix}", "cpu").dtype
+                fam = "mxfp4" if _is_ue8m0_dtype(scale_dtype) else "nvfp4"
+            if family is not None and fam != family:
+                continue
+            return ExpertsLayout(variant, prefix, proj_names, block_suffix, global_suffix, fam)
+    return None
 
-    #EXPERTS_PATH_TPL = "{base}.ffn.experts"
-    #PROJ_NAMES = ("w1", "w3", "w2")  # (gate, up, down)
-    EXPERTS_PATH_TPL = "{base}.mlp.experts"
-    PROJ_NAMES = ("gate_proj", "up_proj", "down_proj")  # (gate, up, down)
 
-    def _experts_prefix_candidates(self, base_key: str) -> list[str]:
-        candidates = [self.EXPERTS_PATH_TPL.format(base=base_key)]
-        if base_key.startswith("model."):
-            candidates.append(self.EXPERTS_PATH_TPL.format(base=base_key[len("model.") :]))
-        return list(dict.fromkeys(candidates))
+def _layout_not_found_error(loader_name: str, base_key: str, family: str) -> ValueError:
+    tried = []
+    for variant in naming_variant_candidates():
+        path_tpl, _ = MOE_NAMING_VARIANTS[variant]
+        for bk in base_key_variants(base_key):
+            tried.append(f"{path_tpl.format(base=bk)} (naming variant '{variant}')")
+    return ValueError(
+        f"{loader_name}: no MoE experts in {family} format found for base_key "
+        f"'{base_key}'. Probed expert prefixes:\n  "
+        + "\n  ".join(tried)
+        + "\nExpected expert-0 keys '{prefix}.{expert}.{gate_proj|w1}.weight' with block "
+        f"scale suffix ({'|'.join(_BLOCK_SCALE_SUFFIXES)}); set {MOE_NAMING_ENV_VAR}="
+        + "<" + "|".join(MOE_NAMING_VARIANTS) + "> to pin a naming variant."
+    )
+
+
+class MXFP4SafeTensorLoader(SafeTensorLoader):
+    """Loader for sparse MoE experts in OCP MXFP4 safetensors.
+
+    Naming is resolved per layer via `MOE_NAMING_VARIANTS` (hf_mlp /
+    deepseek_v4 / mixtral / mistral); block scale suffix `.weight_scale`
+    or `.scale` (DeepSeek-V4-Flash uses `ffn.experts.{i}.w{1,3,2}.{weight,scale}`,
+    MiMo uses `mlp.experts.{i}.{gate,up,down}_proj.{weight,weight_scale}`).
+
+    Per expert layout (hf_mlp naming):
+      {base}.mlp.experts.{i}.gate_proj.weight        U8/I8     [N, K/2]   nibble-packed E2M1
+      {base}.mlp.experts.{i}.gate_proj.weight_scale  F8_E8M0   [N, K/32]  ue8m0 group scale
+
+    ue8m0 → bf16 is a lossless bit shift (both have an 8-bit exponent and zero
+    mantissa for ue8m0), and the AMX FP4 backend already consumes bf16 scales.
+    Folding happens per expert so GPU-resident experts can be skipped without
+    touching their tensors.
+    """
 
     @staticmethod
     def _ue8m0_to_bf16(scale_t: torch.Tensor) -> torch.Tensor:
@@ -1238,20 +1395,14 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
         device: str = "cpu",
         gpu_experts_mask: torch.Tensor | None = None,
     ):
-        gate_name, up_name, down_name = self.PROJ_NAMES
-        prefix = None
+        layout = resolve_experts_layout(self, base_key, family="mxfp4")
+        if layout is None:
+            raise _layout_not_found_error(type(self).__name__, base_key, "mxfp4")
+        prefix = layout.prefix
+
         expert_count = 0
-        for cand in self._experts_prefix_candidates(base_key):
-            expert_count = 0
-            while self.has_tensor(f"{cand}.{expert_count}.{gate_name}.weight"):
-                expert_count += 1
-            if expert_count > 0:
-                prefix = cand
-                break
-        if prefix is None:
-            raise ValueError(
-                f"No MXFP4 experts found under any of: {self._experts_prefix_candidates(base_key)}"
-            )
+        while self.has_tensor(layout.weight_key(expert_count, 0)):
+            expert_count += 1
 
         if gpu_experts_mask is None:
             skipped_experts = [False] * expert_count
@@ -1273,22 +1424,22 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
         for exp_id in range(expert_count):
             if skipped_experts[exp_id]:
                 continue
-            for proj, dst in (
-                (gate_name, gate_weights),
-                (up_name, up_weights),
-                (down_name, down_weights),
+            for proj_idx, dst in (
+                (0, gate_weights),
+                (1, up_weights),
+                (2, down_weights),
             ):
-                w = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight", device).contiguous()
+                w = self.load_tensor(layout.weight_key(exp_id, proj_idx), device).contiguous()
                 if w.dtype != torch.uint8:
                     w = w.view(torch.uint8)
                 dst[exp_id] = w
 
-            for proj, dst in (
-                (gate_name, gate_scales),
-                (up_name, up_scales),
-                (down_name, down_scales),
+            for proj_idx, dst in (
+                (0, gate_scales),
+                (1, up_scales),
+                (2, down_scales),
             ):
-                s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight_scale", device)
+                s = self.load_tensor(layout.block_scale_key(exp_id, proj_idx), device)
                 dst[exp_id] = self._ue8m0_to_bf16(s)
 
         loaded_expert_count = expert_count - sum(skipped_experts)
@@ -1307,7 +1458,12 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
 
 
 class NVFP4SafeTensorLoader(SafeTensorLoader):
-    """Loader for ModelOpt NVFP4 expert weights (W4A16_NVFP4, group_size 16).
+    """Loader for sparse MoE experts in NVFP4 safetensors (W4A16_NVFP4, group_size 16).
+
+    Naming is resolved per layer via `MOE_NAMING_VARIANTS`; block scale suffix
+    `.weight_scale`/`.scale`, global scale suffix `.weight_scale_2`/
+    `.scaling_factor`/`.scale_2` (an absent global defaults to 1.0, e.g.
+    checkpoints that baked the global into the block scales).
 
     Per expert layout (compressed-tensors / ModelOpt naming):
       {base}.mlp.experts.{i}.gate_proj.weight          U8        [N, K/2]   nibble-packed E2M1
@@ -1328,22 +1484,6 @@ class NVFP4SafeTensorLoader(SafeTensorLoader):
     only (cosine 0.999993 on Ornith-1.5-35B-A3B-NVFP4).
     """
 
-    EXPERTS_PATH_TPL = "{base}.mlp.experts"
-    PROJ_NAMES = ("gate_proj", "up_proj", "down_proj")
-
-    def _experts_prefix_candidates(self, base_key: str) -> list[str]:
-        candidates = [self.EXPERTS_PATH_TPL.format(base=base_key)]
-        for strip in ("model.language_model.", "language_model.model.", "language_model.", "model."):
-            if base_key.startswith(strip):
-                candidates.append(self.EXPERTS_PATH_TPL.format(base=base_key[len(strip):]))
-        # ModelOpt checkpoints for multimodal Qwen3.5-MoE nest under
-        # model.language_model.layers.{L}; callers may pass either form.
-        if not base_key.startswith("model.language_model."):
-            for pre in ("model.language_model.", "language_model.model."):
-                if base_key.startswith("model."):
-                    candidates.append(self.EXPERTS_PATH_TPL.format(base=pre + base_key[len("model."):]))
-        return list(dict.fromkeys(candidates))
-
     @staticmethod
     def _fold_scales_to_bf16(block_scale: torch.Tensor, global_scale: torch.Tensor) -> torch.Tensor:
         """e4m3 block scale x per-tensor f32 global -> bf16 [N, K/16]."""
@@ -1356,20 +1496,14 @@ class NVFP4SafeTensorLoader(SafeTensorLoader):
         device: str = "cpu",
         gpu_experts_mask: torch.Tensor | None = None,
     ):
-        gate_name, up_name, down_name = self.PROJ_NAMES
-        prefix = None
+        layout = resolve_experts_layout(self, base_key, family="nvfp4")
+        if layout is None:
+            raise _layout_not_found_error(type(self).__name__, base_key, "nvfp4")
+        prefix = layout.prefix
+
         expert_count = 0
-        for cand in self._experts_prefix_candidates(base_key):
-            expert_count = 0
-            while self.has_tensor(f"{cand}.{expert_count}.{gate_name}.weight"):
-                expert_count += 1
-            if expert_count > 0:
-                prefix = cand
-                break
-        if prefix is None:
-            raise ValueError(
-                f"No NVFP4 experts found under any of: {self._experts_prefix_candidates(base_key)}"
-            )
+        while self.has_tensor(layout.weight_key(expert_count, 0)):
+            expert_count += 1
 
         if gpu_experts_mask is None:
             skipped_experts = [False] * expert_count
@@ -1391,18 +1525,23 @@ class NVFP4SafeTensorLoader(SafeTensorLoader):
         for exp_id in range(expert_count):
             if skipped_experts[exp_id]:
                 continue
-            for proj, wdst, sdst in (
-                (gate_name, gate_weights, gate_scales),
-                (up_name, up_weights, up_scales),
-                (down_name, down_weights, down_scales),
+            for proj_idx, wdst, sdst in (
+                (0, gate_weights, gate_scales),
+                (1, up_weights, up_scales),
+                (2, down_weights, down_scales),
             ):
-                w = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight", device).contiguous()
+                w = self.load_tensor(layout.weight_key(exp_id, proj_idx), device).contiguous()
                 if w.dtype != torch.uint8:
                     w = w.view(torch.uint8)
                 wdst[exp_id] = w
 
-                bs = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight_scale", device)
-                gs = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight_scale_2", device)
+                bs = self.load_tensor(layout.block_scale_key(exp_id, proj_idx), device)
+                gs_key = layout.global_scale_key(exp_id, proj_idx)
+                gs = (
+                    self.load_tensor(gs_key, device)
+                    if gs_key is not None
+                    else torch.ones((), dtype=torch.float32, device=device)
+                )
                 sdst[exp_id] = self._fold_scales_to_bf16(bs, gs)
 
         loaded_expert_count = expert_count - sum(skipped_experts)
@@ -1421,44 +1560,47 @@ class NVFP4SafeTensorLoader(SafeTensorLoader):
 
 
 class MXFP8SafeTensorLoader(SafeTensorLoader):
-    """Loader for native MXFP8 expert weights (MiniMax M3 Preview format).
+    """Loader for sparse MoE experts in MXFP8 safetensors (e.g. MiniMax M3 Preview).
 
-    Per expert layout:
+    Naming is resolved per layer via `MOE_NAMING_VARIANTS` (mixtral for M3;
+    hf_mlp/deepseek_v4/mistral supported); block scale suffix `.weight_scale_inv`
+    or `.scale_inv`.
+
+    Per expert layout (mixtral naming):
       {base}.block_sparse_moe.experts.{i}.w1.weight            F8_E4M3  [N, K]     gate
       {base}.block_sparse_moe.experts.{i}.w1.weight_scale_inv  U8       [N, K/32]  ue8m0
       {base}.block_sparse_moe.experts.{i}.w3.{weight,weight_scale_inv}             up
       {base}.block_sparse_moe.experts.{i}.w2.{weight,weight_scale_inv}             down
 
-    M3 keys are prefixed with ``language_model.model.layers.{L}``; we also probe
-    the stripped form. Scales stay as uint8 — the C++ kernel converts ue8m0→FP32
-    via bit-shift during load_weights.
+    Scales stay as uint8 — the C++ kernel converts ue8m0→FP32 via bit-shift
+    during load_weights. GPU-resident experts are skipped without touching
+    their tensors.
     """
 
-    EXPERTS_PATH_TPL = "{base}.block_sparse_moe.experts"
-    PROJ_NAMES = ("w1", "w3", "w2")  # (gate, up, down)
+    def load_experts(
+        self,
+        base_key: str,
+        device: str = "cpu",
+        gpu_experts_mask: torch.Tensor | None = None,
+    ):
+        layout = resolve_experts_layout(self, base_key, family="mxfp8")
+        if layout is None:
+            raise _layout_not_found_error(type(self).__name__, base_key, "mxfp8")
+        prefix = layout.prefix
 
-    def _experts_prefix_candidates(self, base_key: str) -> list[str]:
-        candidates = [self.EXPERTS_PATH_TPL.format(base=base_key)]
-        for strip in ("language_model.model.", "language_model.", "model."):
-            if base_key.startswith(strip):
-                candidates.append(self.EXPERTS_PATH_TPL.format(base=base_key[len(strip):]))
-        return list(dict.fromkeys(candidates))
-
-    def load_experts(self, base_key: str, device: str = "cpu"):
-        gate_name, up_name, down_name = self.PROJ_NAMES
-        prefix = None
         expert_count = 0
-        for cand in self._experts_prefix_candidates(base_key):
-            expert_count = 0
-            while self.has_tensor(f"{cand}.{expert_count}.{gate_name}.weight"):
-                expert_count += 1
-            if expert_count > 0:
-                prefix = cand
-                break
-        if prefix is None:
-            raise ValueError(
-                f"No MXFP8 experts found under any of: {self._experts_prefix_candidates(base_key)}"
-            )
+        while self.has_tensor(layout.weight_key(expert_count, 0)):
+            expert_count += 1
+
+        if gpu_experts_mask is None:
+            skipped_experts = [False] * expert_count
+        else:
+            skipped_experts = gpu_experts_mask.to(device="cpu", dtype=torch.bool).tolist()
+            if len(skipped_experts) != expert_count:
+                raise ValueError(
+                    "gpu_experts_mask length does not match MXFP8 expert count: "
+                    f"{len(skipped_experts)} != {expert_count}"
+                )
 
         gate_weights = [None] * expert_count
         up_weights = [None] * expert_count
@@ -1468,27 +1610,33 @@ class MXFP8SafeTensorLoader(SafeTensorLoader):
         down_scales = [None] * expert_count
 
         for exp_id in range(expert_count):
-            for proj, dst in (
-                (gate_name, gate_weights),
-                (up_name, up_weights),
-                (down_name, down_weights),
+            if skipped_experts[exp_id]:
+                continue
+            for proj_idx, dst in (
+                (0, gate_weights),
+                (1, up_weights),
+                (2, down_weights),
             ):
-                w = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight", device).contiguous()
+                w = self.load_tensor(layout.weight_key(exp_id, proj_idx), device).contiguous()
                 if w.dtype != torch.uint8:
                     w = w.view(torch.uint8)
                 dst[exp_id] = w
 
-            for proj, dst in (
-                (gate_name, gate_scales),
-                (up_name, up_scales),
-                (down_name, down_scales),
+            for proj_idx, dst in (
+                (0, gate_scales),
+                (1, up_scales),
+                (2, down_scales),
             ):
-                s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight_scale_inv", device).contiguous()
+                s = self.load_tensor(layout.block_scale_key(exp_id, proj_idx), device).contiguous()
                 if s.dtype != torch.uint8:
                     s = s.view(torch.uint8)
                 dst[exp_id] = s
 
-        print(f"[MXFP8SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
+        loaded_expert_count = expert_count - sum(skipped_experts)
+        print(
+            f"[MXFP8SafeTensorLoader] Loaded {loaded_expert_count}/{expert_count} "
+            f"CPU experts from {prefix}"
+        )
         return {
             "gate": gate_weights,
             "up": up_weights,

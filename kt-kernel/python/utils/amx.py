@@ -584,7 +584,9 @@ class AMXMoEWrapper(BaseMoEWrapper):
 class NativeMoEWrapper(BaseMoEWrapper):
     """Wrapper for native CPU/SYCL experts stored in compressed SafeTensor format."""
 
-    _native_loader_instance = None
+    # Loader instances keyed by weight method; per-layer quant autodetect can
+    # create more than one per model (e.g. NVFP4 layers plus an MXFP8 layer).
+    _native_loader_instances: dict = {}
 
     def __init__(
         self,
@@ -702,9 +704,10 @@ class NativeMoEWrapper(BaseMoEWrapper):
             swiglu_limit=swiglu_limit,
         )
 
-        if NativeMoEWrapper._native_loader_instance is None:
-            NativeMoEWrapper._native_loader_instance = NativeMoEWrapper._create_loader(method, weight_path)
-        self.loader = NativeMoEWrapper._native_loader_instance
+        loaders = NativeMoEWrapper._native_loader_instances
+        if loaders.get(method) is None:
+            loaders[method] = NativeMoEWrapper._create_loader(method, weight_path)
+        self.loader = loaders[method]
 
         self.gate_weights = None
         self.up_weights = None
@@ -734,11 +737,33 @@ class NativeMoEWrapper(BaseMoEWrapper):
         else:
             raise NotImplementedError(f"Unsupported method for NativeMoEWrapper: {method}")
 
+    def _get_loader(self, method: str = None):
+        """Return the loader instance for `method`, recreating it after a release."""
+        import time
+
+        method = method or self.method
+        loaders = NativeMoEWrapper._native_loader_instances
+        loader = loaders.get(method)
+        if loader is None:
+            t_recreate_start = time.time()
+            loader = NativeMoEWrapper._create_loader(method, self.weight_path)
+            loaders[method] = loader
+            t_recreate_elapsed = (time.time() - t_recreate_start) * 1000
+            logger.info(
+                "[KT] Recreated NativeMoEWrapper loader for layer %d (took %.1fms)",
+                self.layer_idx,
+                t_recreate_elapsed,
+            )
+        self.loader = loader
+        return loader
+
     @staticmethod
     def _release_loader(layer_idx: int = -1):
-        if NativeMoEWrapper._native_loader_instance is not None:
-            NativeMoEWrapper._native_loader_instance.close_all_handles()
-            NativeMoEWrapper._native_loader_instance = None
+        loaders = NativeMoEWrapper._native_loader_instances
+        if loaders:
+            for loader in loaders.values():
+                loader.close_all_handles()
+            loaders.clear()
             if layer_idx >= 0:
                 logger.info(
                     "[KT] Released NativeMoEWrapper loader after layer %d: " "safetensors mmap handles freed.",
@@ -763,18 +788,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
     def load_weights(self, physical_to_logical_map_cpu: torch.Tensor):
         import time
 
-        if NativeMoEWrapper._native_loader_instance is None:
-            t_recreate_start = time.time()
-            NativeMoEWrapper._native_loader_instance = NativeMoEWrapper._create_loader(self.method, self.weight_path)
-            self.loader = NativeMoEWrapper._native_loader_instance
-            t_recreate_elapsed = (time.time() - t_recreate_start) * 1000
-            logger.info(
-                "[KT] Recreated NativeMoEWrapper loader for layer %d (took %.1fms)",
-                self.layer_idx,
-                t_recreate_elapsed,
-            )
-        else:
-            self.loader = NativeMoEWrapper._native_loader_instance
+        loader = self._get_loader(self.method)
 
         t0 = time.time()
         _candidates = [
@@ -784,7 +798,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         ]
         weights = None
         gpu_logical_experts_mask = None
-        if self.method in ("MXFP4", "NVFP4") and self.num_gpu_experts:
+        if self.method in ("MXFP4", "NVFP4", "MXFP8") and self.num_gpu_experts:
             physical_gpu_experts = self.gpu_experts_mask.nonzero(as_tuple=False).flatten()
             gpu_logical_experts = physical_to_logical_map_cpu[physical_gpu_experts].to(torch.int64)
             if torch.any((gpu_logical_experts < 0) | (gpu_logical_experts >= self.num_experts)):
@@ -793,12 +807,12 @@ class NativeMoEWrapper(BaseMoEWrapper):
             gpu_logical_experts_mask[gpu_logical_experts] = True
         for base_key in _candidates:
             try:
-                if self.method in ("MXFP4", "NVFP4"):
-                    weights = self.loader.load_experts(
+                if self.method in ("MXFP4", "NVFP4", "MXFP8"):
+                    weights = loader.load_experts(
                         base_key, gpu_experts_mask=gpu_logical_experts_mask
                     )
                 else:
-                    weights = self.loader.load_experts(base_key)
+                    weights = loader.load_experts(base_key)
                 break
             except (ValueError, KeyError):
                 continue
@@ -852,7 +866,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 assert scale_sample.dtype == torch.bfloat16, "Expected bf16 scales for NVFP4"
             elif self.method == "MXFP8":
                 # ue8m0 scales stay as uint8; C++ convert_ue8m0_to_fp32 handles conversion.
-                assert self.gate_scales[0].dtype == torch.uint8, "Expected uint8 (ue8m0) scales for MXFP8"
+                assert scale_sample.dtype == torch.uint8, "Expected uint8 (ue8m0) scales for MXFP8"
 
         t2 = time.time()
 
@@ -968,7 +982,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         elif self.method == "MXFP8":
             # MXFP8: FP8 E4M3fn byte weights, ue8m0/uint8 per-32 group scale
             # (e.g. MiniMax-M3-Preview)
-            group_size = self.hidden_size // self.gate_scales[0].shape[1]
+            group_size = self.hidden_size // scale_sample.shape[1]
             moe_config.quant_config.bits = 8
             moe_config.quant_config.group_size = group_size
             moe_config.quant_config.zero_point = False

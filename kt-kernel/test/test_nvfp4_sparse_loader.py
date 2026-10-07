@@ -1,4 +1,4 @@
-"""NVFP4 loader: sparse GPU-expert skip and BF16 scale folding."""
+"""NVFP4 loader: naming variants, sparse GPU-expert skip, BF16 scale folding."""
 
 import pytest
 import torch
@@ -11,32 +11,59 @@ except ImportError:  # pragma: no cover
 
 from kt_kernel.utils.loader import NVFP4SafeTensorLoader
 
-PROJS = ("gate_proj", "up_proj", "down_proj")
+# variant: (experts prefix under base_key "model.layers.7", (gate, up, down), block scale suffix)
+NAMINGS = {
+    "hf_mlp": (
+        "model.layers.7.mlp.experts",
+        ("gate_proj", "up_proj", "down_proj"),
+        "weight_scale",
+    ),
+    "deepseek_v4": ("layers.7.ffn.experts", ("w1", "w3", "w2"), "scale"),
+    "mixtral": (
+        "model.layers.7.block_sparse_moe.experts",
+        ("w1", "w3", "w2"),
+        "weight_scale",
+    ),
+    "mistral": ("model.layers.7.experts", ("w1", "w3", "w2"), "weight_scale"),
+}
+GLOBAL_SUFFIXES = ("weight_scale_2", "scaling_factor", "scale_2")
+
+PROJS_HF = ("gate_proj", "up_proj", "down_proj")
 FP4_VALUES = (
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 )
 
 
-def make_checkpoint(tmp_path, expert_count=3, hidden=64, intermediate=128):
+def make_checkpoint(
+    tmp_path,
+    naming="hf_mlp",
+    global_suffix="weight_scale_2",
+    expert_count=3,
+    hidden=64,
+    intermediate=128,
+):
+    prefix, proj_names, block_suffix = NAMINGS[naming]
+    down_name = proj_names[2]
     tensors = {}
     for i in range(expert_count):
-        for proj in PROJS:
+        for proj in proj_names:
             rows, cols = (
                 (intermediate, hidden)
-                if proj != "down_proj"
+                if proj != down_name
                 else (hidden, intermediate)
             )
-            prefix = f"model.layers.7.mlp.experts.{i}.{proj}"
-            tensors[f"{prefix}.weight"] = torch.randint(
+            pfx = f"{prefix}.{i}.{proj}"
+            tensors[f"{pfx}.weight"] = torch.randint(
                 0, 256, (rows, cols // 2), dtype=torch.uint8
             )
-            tensors[f"{prefix}.weight_scale"] = (
+            tensors[f"{pfx}.{block_suffix}"] = (
                 torch.randn(rows, cols // 16).clamp(-4, 4).to(torch.float8_e4m3fn)
             )
-            tensors[f"{prefix}.weight_scale_2"] = torch.tensor(
-                0.0123, dtype=torch.float32
-            )
+            if global_suffix is not None:
+                tensors[f"{pfx}.{global_suffix}"] = torch.tensor(
+                    0.0123, dtype=torch.float32
+                )
     save_file(tensors, str(tmp_path / "model.safetensors"))
     return tmp_path
 
@@ -49,8 +76,9 @@ def unpack_fp4(packed, scales):
     return unscaled * scales
 
 
-def test_nvfp4_sparse_gpu_expert_skip(tmp_path):
-    make_checkpoint(tmp_path)
+@pytest.mark.parametrize("naming", sorted(NAMINGS))
+def test_nvfp4_sparse_gpu_expert_skip(tmp_path, naming):
+    make_checkpoint(tmp_path, naming=naming)
     loader = NVFP4SafeTensorLoader(str(tmp_path))
     mask = torch.tensor([False, True, False])
     weights = loader.load_experts("model.layers.7", gpu_experts_mask=mask)
@@ -75,25 +103,28 @@ def test_nvfp4_sparse_gpu_expert_skip(tmp_path):
         loader.load_experts("model.layers.7", gpu_experts_mask=torch.ones(5, dtype=torch.bool))
 
 
-def test_nvfp4_fold_matches_fp64(tmp_path):
-    make_checkpoint(tmp_path)
+@pytest.mark.parametrize("naming", ("hf_mlp", "deepseek_v4"))
+@pytest.mark.parametrize("global_suffix", ("weight_scale_2", "scaling_factor", None))
+def test_nvfp4_fold_matches_fp64(tmp_path, naming, global_suffix):
+    make_checkpoint(tmp_path, naming=naming, global_suffix=global_suffix)
     loader = NVFP4SafeTensorLoader(str(tmp_path))
     weights = loader.load_experts("model.layers.7")
 
     # The loader folds e4m3(block scale) * fp32(global) into one bf16 scale per
     # 16-K group. Against a float64 dequant of the same bytes the only error
-    # allowed is bf16 rounding of that fold.
+    # allowed is bf16 rounding of that fold. An absent global scale (checkpoints
+    # that baked it into the block scales) folds as a multiplication by 1.0.
+    prefix, proj_names, block_suffix = NAMINGS[naming]
+    gate_pfx = f"{prefix}.0.{proj_names[0]}"
     packed = weights["gate"][0]
     folded = weights["gate_scale"][0]
     rows, half_cols = packed.shape
     cols = half_cols * 2
-    block_scale_ref = (
-        loader.load_tensor("model.layers.7.mlp.experts.0.gate_proj.weight_scale")
-        .to(torch.float64)
-    )
-    global_ref = loader.load_tensor(
-        "model.layers.7.mlp.experts.0.gate_proj.weight_scale_2"
-    ).to(torch.float64).reshape(())
+    block_scale_ref = loader.load_tensor(f"{gate_pfx}.{block_suffix}").to(torch.float64)
+    if global_suffix is None:
+        global_ref = torch.ones((), dtype=torch.float64)
+    else:
+        global_ref = loader.load_tensor(f"{gate_pfx}.{global_suffix}").to(torch.float64).reshape(())
     scale_ref = block_scale_ref * global_ref
     torch.testing.assert_close(folded.float().to(torch.float64), scale_ref.to(torch.bfloat16).to(torch.float64))
 
