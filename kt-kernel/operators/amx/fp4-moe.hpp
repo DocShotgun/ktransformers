@@ -1071,8 +1071,11 @@ struct GemmKernel224MXFP4SmallKGroup {
           _tile_dpbf16ps(7, 1, 3);
         }
 
+        // BufferC tail blocks (n % N_BLOCK != 0) stride by their true width,
+        // not N_BLOCK, so tile stores must follow BufferCImpl::get_submat.
+        const int dst_stride_elems = std::min(N_BLOCK, n - (n_pos / N_BLOCK) * N_BLOCK);
         float* result = rows == 32 ? bc->get_submat(m, n, m_pos, n_pos) : &tail_c[0][0];
-        const int stride = rows == 32 ? N_BLOCK * sizeof(float) : 32 * sizeof(float);
+        const int stride = rows == 32 ? dst_stride_elems * sizeof(float) : 32 * sizeof(float);
         _tile_stored(4, result, stride);
         _tile_stored(5, result + 16, stride);
         _tile_stored(6, result + 16 * (stride / sizeof(float)), stride);
@@ -1080,7 +1083,7 @@ struct GemmKernel224MXFP4SmallKGroup {
         if (rows < 32) {
           float* destination = bc->get_submat(m, n, m_pos, n_pos);
           for (int row = 0; row < rows; ++row) {
-            std::memcpy(destination + static_cast<size_t>(row) * N_BLOCK, tail_c[row], 32 * sizeof(float));
+            std::memcpy(destination + static_cast<size_t>(row) * dst_stride_elems, tail_c[row], 32 * sizeof(float));
           }
         }
       }
@@ -1254,16 +1257,16 @@ inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
 #ifdef HAVE_AMX
   const char* amx_prefill = std::getenv("KT_MXFP4_PREFILL_AMX");
   if ((!amx_prefill || amx_prefill[0] != '0') &&
-      m >= 16 && n >= 512 && k >= 512 &&
-      n % GemmKernel224MXFP4SmallKGroup::N_BLOCK == 0 &&
+      m >= 16 && n >= GemmKernel224MXFP4SmallKGroup::N_STEP && k >= GemmKernel224MXFP4SmallKGroup::N_STEP &&
+      n % GemmKernel224MXFP4SmallKGroup::N_STEP == 0 &&
       k_group_size == 32 && k % 32 == 0 && bb->scale_e8_valid) {
     GemmKernel224MXFP4SmallKGroup::fp4_mat_mat_kgroup_amx(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth);
     return;
   }
   const char* nvfp4_amx = std::getenv("KT_NVFP4_PREFILL_AMX");
   if ((!nvfp4_amx || nvfp4_amx[0] != '0') &&
-      m >= 16 && n >= 512 && k >= 512 &&
-      n % GemmKernel224MXFP4SmallKGroup::N_BLOCK == 0 &&
+      m >= 16 && n >= GemmKernel224MXFP4SmallKGroup::N_STEP && k >= GemmKernel224MXFP4SmallKGroup::N_STEP &&
+      n % GemmKernel224MXFP4SmallKGroup::N_STEP == 0 &&
       k_group_size == 16 && k % 32 == 0) {
     GemmKernel224MXFP4SmallKGroup::fp4_mat_mat_kgroup_amx(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth);
     return;
