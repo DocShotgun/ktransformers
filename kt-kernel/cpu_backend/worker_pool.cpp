@@ -25,6 +25,8 @@
 thread_local int WorkerPool::thread_local_id = -1;
 
 InNumaPool::InNumaPool(int max_thread_num) {
+  // Never allocate a zero-worker pool: dispatch still indexes thread_state_[0].
+  max_thread_num = std::max(1, max_thread_num);
   printf("In Numa Worker Pool at NUMA %d, %d threads\n", numa_node_of_cpu(sched_getcpu()), max_thread_num);
   total_worker_count = max_thread_num;
   set_restricted_worker_count(total_worker_count);
@@ -39,6 +41,8 @@ InNumaPool::InNumaPool(int max_thread_num) {
 }
 
 InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
+  // Never allocate a zero-worker pool (see InNumaPool(int) ctor).
+  max_thread_num = std::max(1, max_thread_num);
   printf("===========In NumaPool============\n");
   hwloc_topology_t topology;
   hwloc_obj_t numa_obj, core_obj;
@@ -443,24 +447,31 @@ void WorkerPool::init(WorkerPoolConfig config) {
 WorkerPool::WorkerPool(WorkerPoolConfig config) : config(config) { init(config); }
 
 WorkerPool::WorkerPool(int total_threads) {
-  config.subpool_count = numa_num_configured_nodes();
+  config.subpool_count = std::max(1, std::min(numa_num_configured_nodes(), std::max(1, total_threads)));
   config.subpool_numa_map.resize(config.subpool_count);
   config.subpool_thread_count.resize(config.subpool_count);
   for (int i = 0; i < config.subpool_count; i++) {
     config.subpool_numa_map[i] = i;
-    config.subpool_thread_count[i] = total_threads / config.subpool_count;
+    // Spread remainder over subpools; integer truncation used to yield zero-thread
+    // subpools (ThreadState[0] pools) when total_threads < subpool_count.
+    config.subpool_thread_count[i] =
+        total_threads / config.subpool_count + (i < total_threads % config.subpool_count ? 1 : 0);
+    config.subpool_thread_count[i] = std::max(1, config.subpool_thread_count[i]);
   }
   init(config);
 }
 
 WorkerPool::WorkerPool(int total_threads, int single_numa_id) {
   set_to_numa(single_numa_id);
-  config.subpool_count = numa_num_configured_nodes();
+  config.subpool_count = std::max(1, std::min(numa_num_configured_nodes(), std::max(1, total_threads)));
   config.subpool_numa_map.resize(config.subpool_count);
   config.subpool_thread_count.resize(config.subpool_count);
   for (int i = 0; i < config.subpool_count; i++) {
     config.subpool_numa_map[i] = single_numa_id;
-    config.subpool_thread_count[i] = total_threads / config.subpool_count;
+    // See WorkerPool(int): spread remainder, never produce zero-thread subpools.
+    config.subpool_thread_count[i] =
+        total_threads / config.subpool_count + (i < total_threads % config.subpool_count ? 1 : 0);
+    config.subpool_thread_count[i] = std::max(1, config.subpool_thread_count[i]);
   }
   init(config);
 }
