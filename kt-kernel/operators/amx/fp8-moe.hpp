@@ -97,14 +97,25 @@ class AMX_FP8_MOE_TP : public AMX_MOE_BASE<T, AMX_FP8_MOE_TP<T>> {
     auto& bb = do_up ? up_bb_[expert_idx] : gate_bb_[expert_idx];
     auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
 
-    amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
+    // Prefill matmul tiles (AMX staging gated in amx::mat_mul_kgroup) beat the
+    // matvec inner loops once enough tokens share an expert batch.
+    if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
+      amx::mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
+    } else {
+      amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
+    }
   }
   void do_down_gemm(int expert_idx, int ith, int nth, int qlen) {
     auto& group_size = config_.quant_config.group_size;
     int m = m_local_num_[expert_idx];
 
-    amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
-                        down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
+    if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
+      amx::mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
+                          down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
+    } else {
+      amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
+                          down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
+    }
   }
 
 #ifdef DEBUG_FP8_MOE

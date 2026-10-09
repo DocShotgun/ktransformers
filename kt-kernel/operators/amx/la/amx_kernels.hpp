@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -3598,6 +3599,153 @@ struct GemmKernel224Int4SmallKGroup {
     else
       matmat_avx512<true>(m, n, k, n_start, n_end, ba, bb, bc);
   }
+
+  // ==========================================================================
+  // RAWINT4 -> AMX int8 prefill staging. Nibble x 16 signed int8 expansion
+  // (bit twin of compressed_int4_to_int8_avx512: (nibble ^ 8) << 4) packed
+  // once per 32-output-channel block into FP4-style VNNI quad scratch,
+  // _tile_dpbssd per 32-K scale group, then fp32 dual-scale fold + /16
+  // mirroring matmat_rows' store order ((as * bs) * float(dot_chunk),
+  // dst = acc / 16). k / 32 scale stride matches matmat_rows/matmat_cached.
+  // ==========================================================================
+
+  static constexpr int AMX_M_STEP = 32;        // fp4-style token tile (SmallKGroup M_STEP is 1)
+  static constexpr int AMX_TILE_M = 16;        // int8 A tile rows
+  static constexpr int AMX_TILE_N = 16;        // int32 C tile columns
+  static constexpr int AMX_TILE_K_BYTES = 64;  // 64 int8 k values per A tile row
+
+  static void configure_rawint4_amx() {
+    enable_amx();
+    TileConfig config;
+    // size is 16 x 64 bytes
+    for (int i = 0; i < 2; i++) config.set_row_col(i, AMX_TILE_M, AMX_TILE_K_BYTES);
+    // size is 16 x 64 bytes (VNNI_BLK = 4 quad words per k group)
+    for (int i = 2; i < 4; i++) config.set_row_col(i, AMX_TILE_K_BYTES / VNNI_BLK, AMX_TILE_N * VNNI_BLK);
+    // size is 16 x 16 int32
+    for (int i = 4; i < 8; i++) config.set_row_col(i, AMX_TILE_M, AMX_TILE_N * sizeof(int32_t));
+    config.set_config();
+  }
+
+  // Pack one 32-K scale-group chunk of a packed RAWINT4 row (16 bytes = 32
+  // nibbles) into VNNI quad words: word[slot * 32 + channel] holds k 4*slot..
+  // 4*slot+3 as nibble x 16 signed int8 bytes (low byte = lowest k).
+  static inline void pack_int4_chunk_amx(uint32_t* chunk_words, int channel, const uint8_t* packed_row) {
+    for (int quad = 0; quad < 8; ++quad) {
+      uint32_t word = 0;
+      for (int j = 0; j < 4; ++j) {
+        const int nibble_index = quad * 4 + j;
+        const uint8_t byte = packed_row[nibble_index / 2];
+        const uint8_t nibble = (nibble_index & 1) ? (byte >> 4) : (byte & 0x0F);
+        word |= static_cast<uint32_t>(static_cast<uint8_t>((nibble ^ 8) << 4)) << (8 * j);
+      }
+      chunk_words[quad * 32 + channel] = word;
+    }
+  }
+
+  // RowFn(n_begin, k_begin) -> packed nibble bytes of output row n_begin from
+  // k_begin (k_begin multiple of K_STEP); k_begin / 2 byte offset applied by
+  // the caller for blocked-B row tiles.
+  template <typename RowFn>
+  static void pack_int4_amx_b(int k, int n_pos, RowFn row_fn, uint32_t* packed) {
+    for (int chunk = 0; chunk < k / K_STEP; ++chunk) {
+      uint32_t* chunk_words = packed + static_cast<size_t>(chunk) * 16 * 32;
+      // Quad slots 8..15 stay zero: each dpbssd tile accumulates one 32-K
+      // scale group over its zero-padded 64-K width.
+      memset(chunk_words + 8 * 32, 0, 8 * 32 * sizeof(uint32_t));
+      for (int channel = 0; channel < N_STEP; ++channel) {
+        pack_int4_chunk_amx(chunk_words, channel, row_fn(n_pos + channel, chunk * K_STEP));
+      }
+    }
+  }
+
+  template <typename BufferAArg, typename BufferBArg, typename BufferCArg, typename RowFn>
+  static void integer_mat_mat_kgroup_amx_impl(int m, int n, int k, BufferAArg* ba, BufferBArg* bb, BufferCArg* bc,
+                                              int ith, int nth, RowFn row_fn) {
+    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    if (n_start >= n_end) return;
+    configure_rawint4_amx();
+
+    // Per-worker scratch is bounded by 32 output channels times K nibbles. No
+    // expanded copy of the full model is retained in host RAM.
+    thread_local std::vector<uint8_t> packed_storage;
+    packed_storage.resize(static_cast<size_t>(k / K_STEP) * 16 * 32 * sizeof(uint32_t) + 63);
+    auto* packed = reinterpret_cast<uint32_t*>((reinterpret_cast<uintptr_t>(packed_storage.data()) + 63) &
+                                               ~uintptr_t(63));
+    alignas(64) int8_t a_scratch[AMX_M_STEP * AMX_TILE_K_BYTES];
+    alignas(64) int32_t partial[AMX_M_STEP][N_STEP];
+    alignas(64) float acc[AMX_M_STEP][N_STEP];
+    alignas(64) float sb_col[N_STEP];
+
+    const int groups = k / 32;  // matmat_rows scale stride
+    for (int n_pos = n_start; n_pos < n_end; n_pos += N_STEP) {
+      pack_int4_amx_b(k, n_pos, row_fn, packed);
+      for (int m_pos = 0; m_pos < m; m_pos += AMX_M_STEP) {
+        for (int row = 0; row < AMX_M_STEP; ++row)
+          for (int column = 0; column < N_STEP; ++column) acc[row][column] = 0.0f;
+        for (int kk = 0; kk < k; kk += 32) {
+          const int chunk = kk / 32;
+          // Tail activation rows stay zero through staging padding below.
+          for (int row = 0; row < AMX_M_STEP; ++row) {
+            int8_t* dst = a_scratch + row * AMX_TILE_K_BYTES;
+            if (m_pos + row < m) {
+              memcpy(dst, ba->get_submat(m, k, m_pos + row, kk), 32);
+              memset(dst + 32, 0, 32);
+            } else {
+              memset(dst, 0, AMX_TILE_K_BYTES);
+            }
+          }
+          const uint32_t* b = packed + static_cast<size_t>(chunk) * 16 * 32;
+          _tile_zero(4);
+          _tile_zero(5);
+          _tile_zero(6);
+          _tile_zero(7);
+          _tile_loadd(0, a_scratch, AMX_TILE_K_BYTES);
+          _tile_loadd(1, a_scratch + 16 * AMX_TILE_K_BYTES, AMX_TILE_K_BYTES);
+          _tile_loadd(2, b, 128);
+          _tile_loadd(3, b + 16, 128);
+          _tile_dpbssd(4, 0, 2);
+          _tile_dpbssd(5, 0, 3);
+          _tile_dpbssd(6, 1, 2);
+          _tile_dpbssd(7, 1, 3);
+          _tile_stored(4, partial[0], N_STEP * sizeof(int32_t));
+          _tile_stored(5, partial[0] + AMX_TILE_N, N_STEP * sizeof(int32_t));
+          _tile_stored(6, partial[16], N_STEP * sizeof(int32_t));
+          _tile_stored(7, partial[16] + AMX_TILE_N, N_STEP * sizeof(int32_t));
+          for (int column = 0; column < N_STEP; ++column)
+            sb_col[column] = bb->d[size_t(n_pos + column) * groups + chunk];
+          const __m512 sb0 = _mm512_load_ps(sb_col);
+          const __m512 sb1 = _mm512_load_ps(sb_col + 16);
+          for (int row = 0; row < AMX_M_STEP; ++row) {
+            if (m_pos + row >= m) break;
+            const __m512 asv = _mm512_set1_ps(ba->d[size_t(m_pos + row) * groups + chunk]);
+            const __m512 s0 = _mm512_mul_ps(sb0, asv);
+            const __m512 s1 = _mm512_mul_ps(sb1, asv);
+            __m512 a0 = _mm512_load_ps(acc[row]);
+            __m512 a1 = _mm512_load_ps(acc[row] + 16);
+            a0 = _mm512_fmadd_ps(s0, _mm512_cvtepi32_ps(_mm512_load_si512(partial[row])), a0);
+            a1 = _mm512_fmadd_ps(s1, _mm512_cvtepi32_ps(_mm512_load_si512(partial[row] + 16)), a1);
+            _mm512_store_ps(acc[row], a0);
+            _mm512_store_ps(acc[row] + 16, a1);
+          }
+        }
+        const __m512 inv16 = _mm512_set1_ps(1.0f / 16);
+        for (int row = 0; row < AMX_M_STEP; ++row) {
+          if (m_pos + row >= m) break;
+          float* dst = bc->get_submat(m, n, m_pos + row, n_pos);
+          _mm512_storeu_ps(dst, _mm512_mul_ps(_mm512_load_ps(acc[row]), inv16));
+          _mm512_storeu_ps(dst + 16, _mm512_mul_ps(_mm512_load_ps(acc[row] + 16), inv16));
+        }
+      }
+    }
+  }
+
+  static inline void integer_mat_mat_kgroup_amx(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb,
+                                                BufferC* bc, int ith, int nth) {
+    integer_mat_mat_kgroup_amx_impl(
+        m, n, k, ba, bb, bc, ith, nth, [bb, n, k](int n_begin, int k_begin) -> const uint8_t* {
+          return bb->get_submat(n, k, n_begin, k_begin);
+        });
+  }
 };
 
 struct GemmKernel224Int4SmallKGroupBlocked : public GemmKernel224Int4SmallKGroup {
@@ -3798,6 +3946,15 @@ struct GemmKernel224Int4SmallKGroupBlocked : public GemmKernel224Int4SmallKGroup
     }
   }
 
+  static inline void integer_mat_mat_kgroup_amx(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb,
+                                                BufferC* bc, int ith, int nth) {
+    // Blocked-B row tiles are contiguous 64-K nibble blocks: 32-K chunks land
+    // at half-block byte offsets inside get_kblock().
+    integer_mat_mat_kgroup_amx_impl(
+        m, n, k, ba, bb, bc, ith, nth, [bb](int n_begin, int k_begin) -> const uint8_t* {
+          return bb->get_kblock(n_begin, k_begin & ~63) + (k_begin & 63) / 2;
+        });
+  }
 };
 
 inline void vec_mul_kgroup(int m, int n, int k, int k_group_size,
@@ -3811,6 +3968,17 @@ inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
                            std::shared_ptr<GemmKernel224Int4SmallKGroup::BufferA> ba,
                            std::shared_ptr<GemmKernel224Int4SmallKGroup::BufferB> bb,
                            std::shared_ptr<GemmKernel224Int4SmallKGroup::BufferC> bc, int ith, int nth) {
+#ifdef HAVE_AMX
+  // Prefill AMX tiles stage nibble x 16 int8 quads per 32-output-channel
+  // block; KT_RAWINT4_PREFILL_AMX=0 forces the AVX512 matmat for A/B checks.
+  const char* amx_prefill = std::getenv("KT_RAWINT4_PREFILL_AMX");
+  if ((!amx_prefill || amx_prefill[0] != '0') && AMX_AVAILABLE && m >= 16 &&
+      n % GemmKernel224Int4SmallKGroup::N_STEP == 0 && k % GemmKernel224Int4SmallKGroup::K_STEP == 0) {
+    GemmKernel224Int4SmallKGroup::integer_mat_mat_kgroup_amx(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith,
+                                                             nth);
+    return;
+  }
+#endif
   GemmKernel224Int4SmallKGroup::integer_mat_mat_kgroup(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
 }
 
@@ -3827,6 +3995,17 @@ inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
                            std::shared_ptr<GemmKernel224Int4SmallKGroupBlocked::BufferA> ba,
                            std::shared_ptr<GemmKernel224Int4SmallKGroupBlocked::BufferB> bb,
                            std::shared_ptr<GemmKernel224Int4SmallKGroupBlocked::BufferC> bc, int ith, int nth) {
+#ifdef HAVE_AMX
+  // Prefill AMX tiles stage nibble x 16 int8 quads per 32-output-channel
+  // block; KT_RAWINT4_PREFILL_AMX=0 forces the AVX512 matmat for A/B checks.
+  const char* amx_prefill = std::getenv("KT_RAWINT4_PREFILL_AMX");
+  if ((!amx_prefill || amx_prefill[0] != '0') && AMX_AVAILABLE && m >= 16 &&
+      n % GemmKernel224Int4SmallKGroupBlocked::N_STEP == 0 && k % GemmKernel224Int4SmallKGroupBlocked::K_STEP == 0) {
+    GemmKernel224Int4SmallKGroupBlocked::integer_mat_mat_kgroup_amx(m, n, k, k_group_size, ba.get(), bb.get(),
+                                                                    bc.get(), ith, nth);
+    return;
+  }
+#endif
   GemmKernel224Int4SmallKGroupBlocked::integer_mat_mat_kgroup(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith,
                                                               nth);
 }

@@ -5,7 +5,9 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
+#include <vector>
 
 #include "amx_config.hpp"
 #include "amx_raw_buffers.hpp"
@@ -330,6 +332,107 @@ struct GemmKernel224FP8 {
     __m512i bbf16_1 = _mm512_unpackhi_epi8(b_lo, b_hi);
     return {bbf16_0, bbf16_1};
   }
+
+  // ==========================================================================
+  // FP8 -> BF16 AMX prefill staging. Hosts without AMX-FP8 tiles widen each
+  // 32-output-channel FP8 weight block losslessly to BF16 in the FP4 VNNI
+  // scratch layout (pair-major uint32 words reused by every 32-token M tile),
+  // accumulate unscaled tile sums per k_group into the reduce buffer, and fold
+  // the 128x128 scales with apply_scale_kgroup exactly like the AVX path.
+  // ==========================================================================
+
+  // Scalar twin of fp8x64_to_bf16x64's lookup decode (bit-exact widening).
+  static inline uint16_t fp8_to_bf16_bits(uint8_t fp8) {
+    const uint8_t index = fp8 & 0x3F;
+    const bool hi_select = (fp8 & 0x40) != 0;
+    uint8_t hi = hi_select ? bf16_hi_1_val[index] : bf16_hi_0_val[index];
+    const uint8_t lo = hi_select ? bf16_lo_1_val[index] : bf16_lo_0_val[index];
+    hi |= fp8 & 0x80;
+    return static_cast<uint16_t>((static_cast<uint16_t>(hi) << 8) | lo);
+  }
+
+  static void configure_fp8_amx() {
+    enable_amx();
+    TileConfig config;
+    for (int tile = 0; tile < 8; ++tile) config.set_row_col(tile, 16, 64);
+    config.set_config();
+  }
+
+  // Expand one 32-output-channel FP8 tile to AMX's VNNI B layout: 16 k-pair
+  // rows of 32 adjacent BF16 pairs (word pair*32 + channel holds BF16 K
+  // 2pair / 2pair+1 of channel, matching pack_fp4_amx_b_scalar's scratch
+  // contract). Weight tiles keep BufferBFP8Impl's scramble (word 8*pair +
+  // mat_offset[row>>2], lane row&3); unpack once per n_pos block instead of
+  // decoding FP8 weights for every token tile.
+  static void pack_fp8_amx_b(int n, int k, int n_pos, BufferB* bb, uint32_t* packed) {
+    static constexpr int mat_offset[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+    const int chunk_count = k / K_STEP;
+    for (int chunk = 0; chunk < chunk_count; ++chunk) {
+      uint32_t* destination = packed + static_cast<size_t>(chunk) * 16 * 32;
+      const uint64_t* words = reinterpret_cast<const uint64_t*>(bb->get_submat(n, k, n_pos, chunk * K_STEP));
+      for (int pair = 0; pair < 16; ++pair) {
+        const uint64_t pair_words[8] = {words[8 * pair], words[8 * pair + 1], words[8 * pair + 2], words[8 * pair + 3],
+                                        words[8 * pair + 4], words[8 * pair + 5], words[8 * pair + 6],
+                                        words[8 * pair + 7]};
+        for (int channel = 0; channel < 32; ++channel) {
+          const uint16_t fp8_pair =
+              static_cast<uint16_t>(pair_words[mat_offset[channel >> 2]] >> (16 * (channel & 3)));
+          destination[pair * 32 + channel] =
+              static_cast<uint32_t>(fp8_to_bf16_bits(static_cast<uint8_t>(fp8_pair))) |
+              (static_cast<uint32_t>(fp8_to_bf16_bits(static_cast<uint8_t>(fp8_pair >> 8))) << 16);
+        }
+      }
+    }
+  }
+
+  static void fp8_mat_mat_kgroup_amx(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc,
+                                     int ith, int nth) {
+    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    if (n_start >= n_end) return;
+    configure_fp8_amx();
+
+    // Per-worker scratch is bounded by 32 BF16 output channels times K. No
+    // expanded copy of the full model is retained in host RAM.
+    thread_local std::vector<uint8_t> packed_storage;
+    packed_storage.resize(static_cast<size_t>(k) * 64 + 63);
+    auto* packed = reinterpret_cast<uint32_t*>((reinterpret_cast<uintptr_t>(packed_storage.data()) + 63) &
+                                               ~uintptr_t(63));
+    for (int n_pos = n_start; n_pos < n_end; n_pos += N_STEP) {
+      pack_fp8_amx_b(n, k, n_pos, bb, packed);
+      for (int m_pos = 0; m_pos < m; m_pos += M_STEP) {
+        float* result = bc->get_submat(m, n, m_pos, n_pos);
+        float* reduce_c = bc->get_reduce_submat(m, n, m_pos, n_pos);
+        for (int row = 0; row < M_STEP; ++row) {
+          for (int column = 0; column < N_STEP; ++column) result[row * N_STEP + column] = 0.0f;
+        }
+        for (int group_begin = 0; group_begin < k; group_begin += k_group_size) {
+          _tile_zero(4);
+          _tile_zero(5);
+          _tile_zero(6);
+          _tile_zero(7);
+          for (int chunk_begin = group_begin; chunk_begin < std::min(k, group_begin + k_group_size);
+               chunk_begin += K_STEP) {
+            // Tail activation rows stay zero through BufferABF16Impl padding.
+            const ggml_bf16_t* a = ba->get_submat(m, k, m_pos, chunk_begin);
+            const uint32_t* b = packed + static_cast<size_t>(chunk_begin / K_STEP) * 16 * 32;
+            _tile_loadd(0, a, K_STEP * sizeof(ggml_bf16_t));
+            _tile_loadd(1, a + 16 * K_STEP, K_STEP * sizeof(ggml_bf16_t));
+            _tile_loadd(2, b, 128);
+            _tile_loadd(3, b + 16, 128);
+            _tile_dpbf16ps(4, 0, 2);
+            _tile_dpbf16ps(5, 0, 3);
+            _tile_dpbf16ps(6, 1, 2);
+            _tile_dpbf16ps(7, 1, 3);
+          }
+          _tile_stored(4, reduce_c, N_STEP * sizeof(float));
+          _tile_stored(5, reduce_c + TILE_N, N_STEP * sizeof(float));
+          _tile_stored(6, reduce_c + 16 * N_STEP, N_STEP * sizeof(float));
+          _tile_stored(7, reduce_c + 16 * N_STEP + TILE_N, N_STEP * sizeof(float));
+          apply_scale_kgroup(m, n, m_pos, n_pos, group_begin, result, reduce_c, ba, bb, k, k_group_size);
+        }
+      }
+    }
+  }
   // Optimized AVX kernel: process entire k_group_size
   // Load all data first, then convert all, then compute all
   // This gives compiler more freedom to schedule instructions
@@ -613,6 +716,16 @@ inline void vec_mul_kgroup(int m, int n, int k, int k_group_size, std::shared_pt
 inline void mat_mul_kgroup(int m, int n, int k, int k_group_size, std::shared_ptr<GemmKernel224FP8::BufferA> ba,
                            std::shared_ptr<GemmKernel224FP8::BufferB> bb, std::shared_ptr<GemmKernel224FP8::BufferC> bc,
                            int ith, int nth) {
+#ifdef HAVE_AMX
+  // Prefill AMX tiles need a full 16-row staging guard plus FP8->BF16
+  // widening; KT_FP8_PREFILL_AMX=0 forces the AVX512-BF16 path for A/B checks.
+  const char* amx_prefill = std::getenv("KT_FP8_PREFILL_AMX");
+  if ((!amx_prefill || amx_prefill[0] != '0') && AMX_AVAILABLE && m >= 16 && n % GemmKernel224FP8::N_STEP == 0 &&
+      k % GemmKernel224FP8::K_STEP == 0 && k_group_size % GemmKernel224FP8::K_STEP == 0) {
+    GemmKernel224FP8::fp8_mat_mat_kgroup_amx(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
+    return;
+  }
+#endif
   float_mat_vec_kgroup<GemmKernel224FP8, false>(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
 }
 

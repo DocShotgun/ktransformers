@@ -13,6 +13,8 @@
 
 // #define DEBUG_BF16_MOE
 
+#include <cstdlib>
+
 #include "la/amx_kernels.hpp"  // For vec_mul/mat_mul
 #include "la/amx_raw_buffers.hpp"
 #include "la/amx_raw_kernels.hpp"
@@ -93,6 +95,15 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
   // CRTP virtual points - GEMM dispatch
   // ============================================================================
 
+  // Prefill AMX matmul tiles only pay off above one full 16-row tile; sparse
+  // routing can leave an expert below that even in a long prompt (same staging
+  // guard as fp4-moe.hpp mat_mul_kgroup). KT_BF16_PREFILL_AMX=0 forces the
+  // AVX512-BF16 matvec path for A/B checks.
+  bool prefill_amx_enabled(int qlen, int m) const {
+    const char* env = std::getenv("KT_BF16_PREFILL_AMX");
+    return (!env || env[0] != '0') && qlen > 4 * config_.expert_num / config_.num_experts_per_tok && m >= 16;
+  }
+
   void do_gate_up_gemm(bool do_up, int expert_idx, int ith, int nth, int qlen) {
     int m = m_local_num_[expert_idx];
     auto& ba = gate_up_ba_[expert_idx];
@@ -100,7 +111,7 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
     auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
 
     // Use vec_mul/mat_mul (no group_size)
-    if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
+    if (prefill_amx_enabled(qlen, m)) {
       amx::mat_mul(m, config_.intermediate_size, config_.hidden_size, ba, bb, bc, ith, nth);
     } else {
       amx::vec_mul(m, config_.intermediate_size, config_.hidden_size, ba, bb, bc, ith, nth);
@@ -110,7 +121,7 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
   void do_down_gemm(int expert_idx, int ith, int nth, int qlen) {
     int m = m_local_num_[expert_idx];
 
-    if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
+    if (prefill_amx_enabled(qlen, m)) {
       amx::mat_mul(m, config_.hidden_size, config_.intermediate_size, down_ba_[expert_idx], down_bb_[expert_idx],
                    down_bc_[expert_idx], ith, nth);
     } else {

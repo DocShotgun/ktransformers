@@ -74,11 +74,16 @@ struct BufferABF16Impl {
       for (int k_block_begin = 0; k_block_begin < k; k_block_begin += K_BLOCK) {
         int k_block_size = std::min(K_BLOCK, k - k_block_begin);
         for (int k_begin = 0; k_begin < k_block_size; k_begin += K_STEP) {
-          for (int i = 0; i < M_STEP && m_begin + i < m; i++) {
-            __m512i* s = (__m512i*)(src + (m_begin + i) * k + k_block_begin + k_begin);
+          for (int i = 0; i < M_STEP; i++) {
             __m512i* d =
                 (__m512i*)(a + k_block_begin * m_block_size + m_begin * k_block_size + k_begin * M_STEP + i * K_STEP);
-            avx512_copy_32xbf16(s, d);
+            if (m_begin + i < m) {
+              __m512i* s = (__m512i*)(src + (m_begin + i) * k + k_block_begin + k_begin);
+              avx512_copy_32xbf16(s, d);
+            } else {
+              // Zero-pad tail rows so AMX tiles never accumulate stale data.
+              _mm512_storeu_si512(d, _mm512_setzero_si512());
+            }
           }
         }
       }
