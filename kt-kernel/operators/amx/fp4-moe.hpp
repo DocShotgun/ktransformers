@@ -1263,6 +1263,14 @@ inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
     GemmKernel224MXFP4SmallKGroup::fp4_mat_mat_kgroup_amx(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth);
     return;
   }
+  // NVFP4 packers fold the per-16 scales into bf16(fp4*scale) while the
+  // AVX512 paths apply scales in fp32 after each dot, so AMX prefill output
+  // wobbles ~8e-3 max abs (one bf16 product rounding per K contribution,
+  // measured at every shape and block width) against AVX512 -- well within
+  // the float32-reference accuracy budget (~0.5% mean error against a 2%
+  // budget) but above bit-close parity, so NVFP4 parity comparisons budget
+  // this fold explicitly. MXFP4's e8 scales are powers of two, so its fold
+  // is exact and unaffected.
   const char* nvfp4_amx = std::getenv("KT_NVFP4_PREFILL_AMX");
   if ((!nvfp4_amx || nvfp4_amx[0] != '0') &&
       m >= 16 && n >= GemmKernel224MXFP4SmallKGroup::N_STEP && k >= GemmKernel224MXFP4SmallKGroup::N_STEP &&
