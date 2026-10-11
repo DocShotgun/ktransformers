@@ -584,7 +584,65 @@ struct GemmKernel224MXFP4SmallKGroup {
     const __m512i lut = _mm512_castsi256_si512(_mm256_load_si256(reinterpret_cast<const __m256i*>(fp4_bf16)));
     const __m512i nibble_mask = _mm512_set1_epi16(15);
     const bool natural_order = ba->natural_order;
-    for (int mi = 0; mi < m; ++mi) {
+    // Four tokens at a time: the weight tile for an (n_pos, group) pair is
+    // decoded once and consumed by every token in the block, so the inner
+    // loop is limited by the BF16 dots instead of the weight fetch.
+    constexpr int MB = 4;
+    int mi = 0;
+    for (; mi + MB <= m; mi += MB) {
+      const uint16_t* activation[MB];
+      float* output[MB];
+      for (int t = 0; t < MB; ++t) {
+        activation[t] = reinterpret_cast<const uint16_t*>(ba->get_submat(m, k, mi + t, 0));
+        output[t] = bc->get_submat(m, n, mi + t, n_start);
+      }
+      for (int n_pos = n_start; n_pos < n_end; n_pos += 32) {
+        const uint8_t* tile = bb->b + static_cast<size_t>(n_pos) * row_bytes;
+        __m512 sum0[MB];
+        __m512 sum1[MB];
+        for (int t = 0; t < MB; ++t) {
+          sum0[t] = _mm512_setzero_ps();
+          sum1[t] = _mm512_setzero_ps();
+        }
+        for (int group = 0; group < group_count; ++group) {
+          const uint8_t* group_scales = bb->scale_e8_kmajor + static_cast<size_t>(n_pos) * group_count + group * 32;
+          const __m512 scale0 = _mm512_castsi512_ps(_mm512_slli_epi32(
+              _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(group_scales))), 23));
+          const __m512 scale1 = _mm512_castsi512_ps(_mm512_slli_epi32(
+              _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(group_scales + 16))), 23));
+          const uint8_t* src = tile + static_cast<size_t>(group) * 16 * 32;
+          __m512 group0[MB];
+          __m512 group1[MB];
+          for (int t = 0; t < MB; ++t) {
+            group0[t] = _mm512_setzero_ps();
+            group1[t] = _mm512_setzero_ps();
+          }
+          for (int pair = 0; pair < 16; ++pair) {
+            const __m512i words = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
+            const __m512i low = _mm512_permutexvar_epi16(_mm512_and_si512(words, nibble_mask), lut);
+            const __m512i high = _mm512_permutexvar_epi16(_mm512_and_si512(_mm512_srli_epi16(words, 4), nibble_mask), lut);
+            for (int t = 0; t < MB; ++t) {
+              const uint16_t* a = activation[t] + static_cast<size_t>(group) * 32;
+              const uint16_t a0 = natural_order ? a[pair] : a[pair * 2];
+              const uint16_t a1 = natural_order ? a[16 + pair] : a[pair * 2 + 1];
+              const uint32_t pair_activation = static_cast<uint32_t>(a0) | (static_cast<uint32_t>(a1) << 16);
+              const __m512bh broadcast = (__m512bh)_mm512_set1_epi32(pair_activation);
+              group0[t] = _mm512_dpbf16_ps(group0[t], (__m512bh)low, broadcast);
+              group1[t] = _mm512_dpbf16_ps(group1[t], (__m512bh)high, broadcast);
+            }
+          }
+          for (int t = 0; t < MB; ++t) {
+            sum0[t] = _mm512_fmadd_ps(group0[t], scale0, sum0[t]);
+            sum1[t] = _mm512_fmadd_ps(group1[t], scale1, sum1[t]);
+          }
+        }
+        for (int t = 0; t < MB; ++t) {
+          _mm512_storeu_ps(output[t] + n_pos - n_start, sum0[t]);
+          _mm512_storeu_ps(output[t] + n_pos - n_start + 16, sum1[t]);
+        }
+      }
+    }
+    for (; mi < m; ++mi) {
       const auto* activation = reinterpret_cast<const uint16_t*>(ba->get_submat(m, k, mi, 0));
       float* output = bc->get_submat(m, n, mi, n_start);
       for (int n_pos = n_start; n_pos < n_end; n_pos += 32) {
@@ -635,7 +693,80 @@ struct GemmKernel224MXFP4SmallKGroup {
     const __m512i lut = _mm512_castsi256_si512(_mm256_load_si256(reinterpret_cast<const __m256i*>(fp4_bf16)));
     const __m512i nibble_mask = _mm512_set1_epi16(15);
     const bool natural_order = ba->natural_order;
-    for (int mi = 0; mi < m; ++mi) {
+    // Four tokens at a time: the weight tile for an (n_pos, group) pair is
+    // decoded once and consumed by every token in the block.
+    constexpr int MB = 4;
+    int mi = 0;
+    for (; mi + MB <= m; mi += MB) {
+      const uint16_t* activation[MB];
+      float* output[MB];
+      for (int t = 0; t < MB; ++t) {
+        activation[t] = reinterpret_cast<const uint16_t*>(ba->get_submat(m, k, mi + t, 0));
+        output[t] = bc->get_submat(m, n, mi + t, n_start);
+      }
+      for (int n_pos = n_start; n_pos < n_end; n_pos += 32) {
+        const uint8_t* tile = bb->b + static_cast<size_t>(n_pos) * row_bytes;
+        __m512 sum0[MB];
+        __m512 sum1[MB];
+        for (int t = 0; t < MB; ++t) {
+          sum0[t] = _mm512_setzero_ps();
+          sum1[t] = _mm512_setzero_ps();
+        }
+        for (int group = 0; group < group32_count; ++group) {
+          const ggml_bf16_t* scales =
+              bb->scale_nv_kmajor + static_cast<size_t>(n_pos) * group_count + group * 64;
+          const __m512i sv0 = _mm512_loadu_si512(scales);
+          const __m512i sv1 = _mm512_loadu_si512(scales + 32);
+          // 32 channels per k-group: lanes 0..15 hold channels 0..15, lanes
+          // 16..31 hold channels 16..31 (dpbf16 lane halves).
+          const __m512 s0a = _mm512_cvtpbh_ps((__m256bh)_mm512_castsi512_si256(sv0));
+          const __m512 s0b = _mm512_cvtpbh_ps((__m256bh)_mm512_extracti64x4_epi64(sv0, 1));
+          const __m512 s1a = _mm512_cvtpbh_ps((__m256bh)_mm512_castsi512_si256(sv1));
+          const __m512 s1b = _mm512_cvtpbh_ps((__m256bh)_mm512_extracti64x4_epi64(sv1, 1));
+          const uint8_t* src = tile + static_cast<size_t>(group) * 16 * 32;
+          __m512 g0h0[MB];
+          __m512 g0h1[MB];
+          __m512 g1h0[MB];
+          __m512 g1h1[MB];
+          for (int t = 0; t < MB; ++t) {
+            g0h0[t] = _mm512_setzero_ps();
+            g0h1[t] = _mm512_setzero_ps();
+            g1h0[t] = _mm512_setzero_ps();
+            g1h1[t] = _mm512_setzero_ps();
+          }
+          for (int pair = 0; pair < 16; ++pair) {
+            const __m512i words = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
+            const __m512i low = _mm512_permutexvar_epi16(_mm512_and_si512(words, nibble_mask), lut);
+            const __m512i high = _mm512_permutexvar_epi16(_mm512_and_si512(_mm512_srli_epi16(words, 4), nibble_mask), lut);
+            for (int t = 0; t < MB; ++t) {
+              const uint16_t* a = activation[t] + static_cast<size_t>(group) * 32;
+              const uint16_t a0 = natural_order ? a[pair] : a[pair * 2];
+              const uint16_t a1 = natural_order ? a[16 + pair] : a[pair * 2 + 1];
+              const uint32_t pair_activation = static_cast<uint32_t>(a0) | (static_cast<uint32_t>(a1) << 16);
+              const __m512bh broadcast = (__m512bh)_mm512_set1_epi32(pair_activation);
+              if (pair < 8) {
+                g0h0[t] = _mm512_dpbf16_ps(g0h0[t], (__m512bh)low, broadcast);
+                g1h0[t] = _mm512_dpbf16_ps(g1h0[t], (__m512bh)high, broadcast);
+              } else {
+                g0h1[t] = _mm512_dpbf16_ps(g0h1[t], (__m512bh)low, broadcast);
+                g1h1[t] = _mm512_dpbf16_ps(g1h1[t], (__m512bh)high, broadcast);
+              }
+            }
+          }
+          for (int t = 0; t < MB; ++t) {
+            sum0[t] = _mm512_fmadd_ps(s0a, g0h0[t], sum0[t]);
+            sum0[t] = _mm512_fmadd_ps(s1a, g0h1[t], sum0[t]);
+            sum1[t] = _mm512_fmadd_ps(s0b, g1h0[t], sum1[t]);
+            sum1[t] = _mm512_fmadd_ps(s1b, g1h1[t], sum1[t]);
+          }
+        }
+        for (int t = 0; t < MB; ++t) {
+          _mm512_storeu_ps(output[t] + n_pos - n_start, sum0[t]);
+          _mm512_storeu_ps(output[t] + n_pos - n_start + 16, sum1[t]);
+        }
+      }
+    }
+    for (; mi < m; ++mi) {
       const auto* activation = reinterpret_cast<const uint16_t*>(ba->get_submat(m, k, mi, 0));
       float* output = bc->get_submat(m, n, mi, n_start);
       for (int n_pos = n_start; n_pos < n_end; n_pos += 32) {
