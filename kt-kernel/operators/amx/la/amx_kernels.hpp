@@ -3626,32 +3626,37 @@ struct GemmKernel224Int4SmallKGroup {
     config.set_config();
   }
 
+  // Spread the four nibbles of `nibbles` over four bytes, low nibble first, and
+  // apply the same (nibble ^ 8) << 4 the AVX512 path uses. Padded to a whole
+  // word so the caller can widen with a plain store.
+  static inline uint32_t pack_int4_quads(uint16_t nibbles) {
+    uint32_t spread = nibbles;
+    spread = (spread & 0x000Fu) | ((spread & 0x00F0u) << 4) | ((spread & 0x0F00u) << 8) | ((spread & 0xF000u) << 12);
+    return (spread << 4) ^ 0x80808080u;
+  }
+
   // Pack one 32-K scale-group chunk of a packed RAWINT4 row (16 bytes = 32
   // nibbles) into VNNI quad words: word[slot * 32 + channel] holds k 4*slot..
   // 4*slot+3 as nibble x 16 signed int8 bytes (low byte = lowest k).
   static inline void pack_int4_chunk_amx(uint32_t* chunk_words, int channel, const uint8_t* packed_row) {
     for (int quad = 0; quad < 8; ++quad) {
-      uint32_t word = 0;
-      for (int j = 0; j < 4; ++j) {
-        const int nibble_index = quad * 4 + j;
-        const uint8_t byte = packed_row[nibble_index / 2];
-        const uint8_t nibble = (nibble_index & 1) ? (byte >> 4) : (byte & 0x0F);
-        word |= static_cast<uint32_t>(static_cast<uint8_t>((nibble ^ 8) << 4)) << (8 * j);
-      }
-      chunk_words[quad * 32 + channel] = word;
+      uint16_t nibbles;
+      memcpy(&nibbles, packed_row + 2 * quad, sizeof(nibbles));
+      chunk_words[quad * 32 + channel] = pack_int4_quads(nibbles);
     }
   }
 
   // RowFn(n_begin, k_begin) -> packed nibble bytes of output row n_begin from
   // k_begin (k_begin multiple of K_STEP); k_begin / 2 byte offset applied by
   // the caller for blocked-B row tiles.
+  //
+  // Only fills the low half of each 2 KiB tile block. The high half is the zero
+  // padding that keeps _tile_dpbssd off the high 32 K of its 64-K width, and
+  // this never writes it, so the caller only has to zero it once.
   template <typename RowFn>
   static void pack_int4_amx_b(int k, int n_pos, RowFn row_fn, uint32_t* packed) {
     for (int chunk = 0; chunk < k / K_STEP; ++chunk) {
       uint32_t* chunk_words = packed + static_cast<size_t>(chunk) * 16 * 32;
-      // Quad slots 8..15 stay zero: each dpbssd tile accumulates one 32-K
-      // scale group over its zero-padded 64-K width.
-      memset(chunk_words + 8 * 32, 0, 8 * 32 * sizeof(uint32_t));
       for (int channel = 0; channel < N_STEP; ++channel) {
         pack_int4_chunk_amx(chunk_words, channel, row_fn(n_pos + channel, chunk * K_STEP));
       }
@@ -3667,8 +3672,15 @@ struct GemmKernel224Int4SmallKGroup {
 
     // Per-worker scratch is bounded by 32 output channels times K nibbles. No
     // expanded copy of the full model is retained in host RAM.
+    //
+    // The padding half of the tile blocks has to read as zero, but
+    // pack_int4_amx_b never writes it, so it only needs clearing when the
+    // scratch is (re)allocated.
     thread_local std::vector<uint8_t> packed_storage;
-    packed_storage.resize(static_cast<size_t>(k / K_STEP) * 16 * 32 * sizeof(uint32_t) + 63);
+    const size_t packed_bytes = static_cast<size_t>(k / K_STEP) * 16 * 32 * sizeof(uint32_t) + 63;
+    if (packed_storage.size() < packed_bytes) {
+      packed_storage.assign(packed_bytes, 0);
+    }
     auto* packed = reinterpret_cast<uint32_t*>((reinterpret_cast<uintptr_t>(packed_storage.data()) + 63) &
                                                ~uintptr_t(63));
     alignas(64) int8_t a_scratch[AMX_M_STEP * AMX_TILE_K_BYTES];
