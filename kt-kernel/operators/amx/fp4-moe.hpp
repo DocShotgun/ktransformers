@@ -37,15 +37,29 @@ struct GemmKernel224MXFP4SmallKGroup {
   static const int N_STEP = 32;
   static const int K_STEP = 32;
 
+  // Storage panel of the C buffer: one (m, N_BLOCK) tile per panel, tasks
+  // must stay inside one panel.
   static inline const int N_BLOCK = 256;
   static inline const int K_BLOCK = 7168;
 
+  // Width of one N task. Decode activates few experts, so the gate/up
+  // projection (intermediate_size / tp_count wide) is cut into 64-wide
+  // tasks to cover a full 32-thread subpool; wide projections are 2x
+  // faster on whole panels and the AMX prefill kernel (m >= 16)
+  // re-streams the activation for every task, so both keep whole panels.
+  static int task_width(int n, int m) { return m >= 16 || n >= 8 * N_BLOCK ? N_BLOCK : 64; }
+
   static std::string name() { return "MXFP4_KGROUP"; }
-  static int recommended_nth(int n) { return (n + N_BLOCK - 1) / N_BLOCK; }
-  static std::pair<int, int> split_range_n(int n, int ith, int nth) {
-    int n_start = N_BLOCK * ith;
-    int n_end = std::min(n, N_BLOCK * (ith + 1));
-    return {n_start, n_end};
+  // Narrowest width task_width can return for this n, so the count covers
+  // every kernel; a wider split folds the surplus tasks away.
+  static int recommended_nth(int n) {
+    const int width = n >= 8 * N_BLOCK ? N_BLOCK : 64;
+    return (n + width - 1) / width;
+  }
+  static std::pair<int, int> split_range_n(int n, int ith, int nth, int m = 1) {
+    const int width = task_width(n, m);
+    const int n_start = std::min(n, width * ith);
+    return {n_start, std::min(n, n_start + width)};
   }
   static void config() {}
 
@@ -502,7 +516,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   // mat-vec: M 个独立 token，N 维 4 行一组累加，摊销 horizontal reduce。
   static void fp4_mat_vec_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
                                  int nth) {
-    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    auto [n_start, n_end] = split_range_n(n, ith, nth, m);
     if (n_start >= n_end) return;
     const int kg_count = k / 32;
     const int spb = 32 / k_group_size;  // scales per 32-K block (1 MXFP4, 2 NVFP4)
@@ -577,7 +591,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   // dot products consume those channel vectors during decode and
   // small-token prefill without reconstructing row-major weight rows.
   static void fp4_mat_vec_kmajor(int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith, int nth) {
-    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    auto [n_start, n_end] = split_range_n(n, ith, nth, m);
     if (n_start >= n_end) return;
     const int group_count = k / 32;
     const size_t row_bytes = static_cast<size_t>(k) / 2;
@@ -685,7 +699,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   // 8..15 land in those halves exactly, so each half accumulates separately
   // and folds its per-channel scale lane-wise from the transposed BF16 copy.
   static void fp4_mat_vec_kmajor_nvfp4(int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith, int nth) {
-    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    auto [n_start, n_end] = split_range_n(n, ith, nth, m);
     if (n_start >= n_end) return;
     const int group_count = k / 16;
     const int group32_count = k / 32;
@@ -1146,7 +1160,7 @@ struct GemmKernel224MXFP4SmallKGroup {
 
   static void fp4_mat_mat_kgroup_amx(int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
                                      int nth) {
-    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    auto [n_start, n_end] = split_range_n(n, ith, nth, m);
     if (n_start >= n_end) return;
     configure_fp4_amx();
 
@@ -1227,7 +1241,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   // M / N 尾巴回退到 mat-vec 单 token 内层 (V4 chunked-prefill 16/32/64 整数倍, 极少触发)。
   static void fp4_mat_mat_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
                                  int nth) {
-    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    auto [n_start, n_end] = split_range_n(n, ith, nth, m);
     if (n_start >= n_end) return;
     const int kg_count = k / 32;
     const int spb = 32 / k_group_size;  // scales per 32-K block (1 MXFP4, 2 NVFP4)

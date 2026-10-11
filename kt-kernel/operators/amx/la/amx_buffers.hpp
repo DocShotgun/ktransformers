@@ -1687,6 +1687,18 @@ struct BufferBInt4WithZeroLowKGroupImpl {
   }
 };
 
+// Kernels may specialize the N split on the token count (the FP4 kernels use
+// 64-wide tasks on the vector path and whole panels on AMX); kernels with a
+// single split signature ignore the token count.
+template <typename K>
+inline std::pair<int, int> split_range_n_for(int n, int ith, int nth, int m) {
+  if constexpr (requires { K::split_range_n(n, ith, nth, m); }) {
+    return K::split_range_n(n, ith, nth, m);
+  } else {
+    return K::split_range_n(n, ith, nth);
+  }
+}
+
 template <typename K>
 struct BufferCImpl {
   float* c;
@@ -1715,18 +1727,21 @@ struct BufferCImpl {
 
   void to_mat(int m, ggml_bf16_t* dst, int ith, int nth) {
     assert(m <= max_m);
-    auto [n_start, n_end] = K::split_range_n(n, ith, nth);
+    auto [n_start, n_end] = split_range_n_for<K>(n, ith, nth, m);
     int m_block_size = (m + M_STEP - 1) / M_STEP * M_STEP;
-    int n_block_begin = n_start;
-    int n_block_size = n_end - n_block_begin;
+    // Tasks are addressed inside one N_BLOCK panel (see get_submat), so the
+    // row stride is the panel width even when the task itself is narrower.
+    int n_block_begin = n_start / N_BLOCK * N_BLOCK;
+    int n_block_size = std::min(N_BLOCK, n - n_block_begin);
+    int n_offset = n_start - n_block_begin;
     for (int m_begin = 0; m_begin < m; m_begin += M_STEP) {
-      for (int n_begin = 0; n_begin < n_block_size; n_begin += N_STEP) {
+      for (int n_begin = 0; n_begin < n_end - n_start; n_begin += N_STEP) {
         for (int i = 0; i < M_STEP && m_begin + i < m; i++) {
-          __m512* x0 =
-              (__m512*)(c + m_block_size * n_block_begin + m_begin * n_block_size + n_begin * M_STEP + i * N_STEP);
-          __m512* x1 =
-              (__m512*)(c + m_block_size * n_block_begin + m_begin * n_block_size + n_begin * M_STEP + i * N_STEP + 16);
-          avx512_32xfp32_to_32xbf16(x0, x1, (__m512i*)(dst + (m_begin + i) * n + n_block_begin + n_begin));
+          __m512* x0 = (__m512*)(c + m_block_size * n_block_begin + m_begin * n_block_size +
+                                 (n_offset + n_begin) * M_STEP + i * N_STEP);
+          __m512* x1 = (__m512*)(c + m_block_size * n_block_begin + m_begin * n_block_size +
+                                 (n_offset + n_begin) * M_STEP + i * N_STEP + 16);
+          avx512_32xfp32_to_32xbf16(x0, x1, (__m512i*)(dst + (m_begin + i) * n + n_start + n_begin));
         }
       }
     }
@@ -1775,18 +1790,21 @@ struct BufferCReduceImpl {
 
   void to_mat(int m, ggml_bf16_t* dst, int ith, int nth) {
     assert(m <= max_m);
-    auto [n_start, n_end] = K::split_range_n(n, ith, nth);
+    auto [n_start, n_end] = split_range_n_for<K>(n, ith, nth, m);
     int m_block_size = (m + M_STEP - 1) / M_STEP * M_STEP;
-    int n_block_begin = n_start;
-    int n_block_size = n_end - n_block_begin;
+    // Tasks are addressed inside one N_BLOCK panel (see get_submat), so the
+    // row stride is the panel width even when the task itself is narrower.
+    int n_block_begin = n_start / N_BLOCK * N_BLOCK;
+    int n_block_size = std::min(N_BLOCK, n - n_block_begin);
+    int n_offset = n_start - n_block_begin;
     for (int m_begin = 0; m_begin < m; m_begin += M_STEP) {
-      for (int n_begin = 0; n_begin < n_block_size; n_begin += N_STEP) {
+      for (int n_begin = 0; n_begin < n_end - n_start; n_begin += N_STEP) {
         for (int i = 0; i < M_STEP && m_begin + i < m; i++) {
-          __m512* x0 =
-              (__m512*)(c + m_block_size * n_block_begin + m_begin * n_block_size + n_begin * M_STEP + i * N_STEP);
-          __m512* x1 =
-              (__m512*)(c + m_block_size * n_block_begin + m_begin * n_block_size + n_begin * M_STEP + i * N_STEP + 16);
-          avx512_32xfp32_to_32xbf16(x0, x1, (__m512i*)(dst + (m_begin + i) * n + n_block_begin + n_begin));
+          __m512* x0 = (__m512*)(c + m_block_size * n_block_begin + m_begin * n_block_size +
+                                 (n_offset + n_begin) * M_STEP + i * N_STEP);
+          __m512* x1 = (__m512*)(c + m_block_size * n_block_begin + m_begin * n_block_size +
+                                 (n_offset + n_begin) * M_STEP + i * N_STEP + 16);
+          avx512_32xfp32_to_32xbf16(x0, x1, (__m512i*)(dst + (m_begin + i) * n + n_start + n_begin));
         }
       }
     }
