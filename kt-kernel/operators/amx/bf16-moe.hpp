@@ -100,8 +100,8 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
   // guard as fp4-moe.hpp mat_mul_kgroup). KT_BF16_PREFILL_AMX=0 forces the
   // AVX512-BF16 matvec path for A/B checks.
   bool prefill_amx_enabled(int qlen, int m) const {
-    const char* env = std::getenv("KT_BF16_PREFILL_AMX");
-    return (!env || env[0] != '0') && qlen > 4 * config_.expert_num / config_.num_experts_per_tok && m >= 16;
+    static const bool enabled = cached_env_flag("KT_BF16_PREFILL_AMX");
+    return enabled && qlen > 4 * config_.expert_num / config_.num_experts_per_tok && m >= 16;
   }
 
   void do_gate_up_gemm(bool do_up, int expert_idx, int ith, int nth, int qlen) {

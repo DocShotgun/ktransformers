@@ -719,8 +719,8 @@ inline void mat_mul_kgroup(int m, int n, int k, int k_group_size, std::shared_pt
 #ifdef HAVE_AMX
   // Prefill AMX tiles need a full 16-row staging guard plus FP8->BF16
   // widening; KT_FP8_PREFILL_AMX=0 forces the AVX512-BF16 path for A/B checks.
-  const char* amx_prefill = std::getenv("KT_FP8_PREFILL_AMX");
-  if ((!amx_prefill || amx_prefill[0] != '0') && AMX_AVAILABLE && m >= 16 && n % GemmKernel224FP8::N_STEP == 0 &&
+  static const bool amx_prefill = cached_env_flag("KT_FP8_PREFILL_AMX");
+  if (amx_prefill && AMX_AVAILABLE && m >= 16 && n % GemmKernel224FP8::N_STEP == 0 &&
       k % GemmKernel224FP8::K_STEP == 0 && k_group_size % GemmKernel224FP8::K_STEP == 0) {
     GemmKernel224FP8::fp8_mat_mat_kgroup_amx(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
     return;

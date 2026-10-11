@@ -13,12 +13,23 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <type_traits>
 
 // #define FORWARD_TIME_PROFILE
 // #define FORWARD_TIME_REPORT
+
+// Kernel selection runs once per (expert, N-block) task, which is tens of
+// thousands of times per layer, so the KT_*_PREFILL_AMX style flags cannot be
+// read on every dispatch. Resolve each one on first use and cache it for the
+// life of the process: set them before the first forward, as with every other
+// process-level knob.
+inline bool cached_env_flag(const char* name) {
+  const char* value = std::getenv(name);
+  return value == nullptr || value[0] != '0';
+}
 
 #define ASSERT_RELEASE(x, text)                                                            \
   do {                                                                                     \

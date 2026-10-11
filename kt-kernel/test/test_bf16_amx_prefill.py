@@ -1,20 +1,19 @@
 """Check BF16 AMX prefill against the AVX512 matvec path."""
 
+import os
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-import kt_kernel
+import amx_backend
+import kt_kernel  # noqa: F401
 
 
-@pytest.mark.parametrize("expert_counts", [(33, 31), (63, 1)])
-def test_bf16_amx_prefill_matches_avx512(monkeypatch, expert_counts):
+def _run(backend, expert_counts):
+    """Run one prefill backend and return its outputs plus the fp32 reference."""
+    os.environ["KT_BF16_PREFILL_AMX"] = backend
     ext = kt_kernel.kt_kernel_ext
-    if not hasattr(ext.moe, "AMXBF16_MOE"):
-        pytest.skip("AMX BF16 extension is unavailable")
-    with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
-        if "amx_bf16" not in cpuinfo.read():
-            pytest.skip("AMX BF16 is unavailable")
 
     torch.manual_seed(13)
     experts, hidden, intermediate, qlen = 2, 1024, 1024, 64
@@ -55,11 +54,10 @@ def test_bf16_amx_prefill_matches_avx512(monkeypatch, expert_counts):
     inputs = (torch.randn(qlen, hidden) * 0.1).to(torch.bfloat16).contiguous()
     batch_size = torch.tensor([qlen], dtype=torch.int32)
 
-    def forward(backend, target_moe=moe):
-        monkeypatch.setenv("KT_BF16_PREFILL_AMX", backend)
+    def forward():
         output = torch.empty(qlen, hidden, dtype=torch.bfloat16)
         pool.submit(
-            target_moe.forward_task(
+            moe.forward_task(
                 batch_size.data_ptr(),
                 1,
                 ids.data_ptr(),
@@ -72,10 +70,7 @@ def test_bf16_amx_prefill_matches_avx512(monkeypatch, expert_counts):
         pool.sync()
         return output
 
-    expected = forward("0")
-    actual = forward("1")
-    assert torch.isfinite(actual).all()
-    torch.testing.assert_close(actual, expected, atol=5e-4, rtol=5e-3)
+    result = {"prefill": forward()}
 
     reference = torch.zeros(qlen, hidden, dtype=torch.float32)
     for expert in range(experts):
@@ -86,12 +81,41 @@ def test_bf16_amx_prefill_matches_avx512(monkeypatch, expert_counts):
         down_result = (activated @ down[expert].float().T).bfloat16().float()
         reference[selected] = weights[selected] * down_result
 
-    error = (actual.float() - reference).abs()
-    assert error.mean() < reference.abs().mean() * 0.02
-
     # One-token decode keeps using the matvec path regardless of the gate.
     batch_size[0] = 1
-    decoded = forward("1")[:1]
-    assert torch.isfinite(decoded).all()
-    decode_error = (decoded.float() - reference[:1]).abs()
+    result["decode"] = forward()[:1]
+    return result, reference
+
+
+def child_main():
+    amx_backend.child_main(_run)
+
+
+@pytest.mark.parametrize("expert_counts", [(33, 31), (63, 1)])
+def test_bf16_amx_prefill_matches_avx512(tmp_path, expert_counts):
+    ext = kt_kernel.kt_kernel_ext
+    if not hasattr(ext.moe, "AMXBF16_MOE"):
+        pytest.skip("AMX BF16 extension is unavailable")
+    with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
+        if "amx_bf16" not in cpuinfo.read():
+            pytest.skip("AMX BF16 is unavailable")
+
+    # Kernel selection is cached per process, so each backend gets its own.
+    results = {
+        backend: amx_backend.run_backend(
+            __name__, backend, tmp_path, expert_counts=expert_counts
+        )
+        for backend in ("0", "1")
+    }
+    fallback, reference = results["0"]
+    actual = results["1"][0]
+
+    assert torch.isfinite(actual["prefill"]).all()
+    torch.testing.assert_close(actual["prefill"], fallback["prefill"], atol=5e-4, rtol=5e-3)
+
+    error = (actual["prefill"].float() - reference).abs()
+    assert error.mean() < reference.abs().mean() * 0.02
+
+    assert torch.isfinite(actual["decode"]).all()
+    decode_error = (actual["decode"].float() - reference[:1]).abs()
     assert decode_error.mean() < reference[:1].abs().mean() * 0.02

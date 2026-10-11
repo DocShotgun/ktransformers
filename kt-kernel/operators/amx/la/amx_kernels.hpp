@@ -3971,8 +3971,8 @@ inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
 #ifdef HAVE_AMX
   // Prefill AMX tiles stage nibble x 16 int8 quads per 32-output-channel
   // block; KT_RAWINT4_PREFILL_AMX=0 forces the AVX512 matmat for A/B checks.
-  const char* amx_prefill = std::getenv("KT_RAWINT4_PREFILL_AMX");
-  if ((!amx_prefill || amx_prefill[0] != '0') && AMX_AVAILABLE && m >= 16 &&
+  static const bool amx_prefill = cached_env_flag("KT_RAWINT4_PREFILL_AMX");
+  if (amx_prefill && AMX_AVAILABLE && m >= 16 &&
       n % GemmKernel224Int4SmallKGroup::N_STEP == 0 && k % GemmKernel224Int4SmallKGroup::K_STEP == 0) {
     GemmKernel224Int4SmallKGroup::integer_mat_mat_kgroup_amx(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith,
                                                              nth);
@@ -3998,8 +3998,8 @@ inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
 #ifdef HAVE_AMX
   // Prefill AMX tiles stage nibble x 16 int8 quads per 32-output-channel
   // block; KT_RAWINT4_PREFILL_AMX=0 forces the AVX512 matmat for A/B checks.
-  const char* amx_prefill = std::getenv("KT_RAWINT4_PREFILL_AMX");
-  if ((!amx_prefill || amx_prefill[0] != '0') && AMX_AVAILABLE && m >= 16 &&
+  static const bool amx_prefill = cached_env_flag("KT_RAWINT4_PREFILL_AMX");
+  if (amx_prefill && AMX_AVAILABLE && m >= 16 &&
       n % GemmKernel224Int4SmallKGroupBlocked::N_STEP == 0 && k % GemmKernel224Int4SmallKGroupBlocked::K_STEP == 0) {
     GemmKernel224Int4SmallKGroupBlocked::integer_mat_mat_kgroup_amx(m, n, k, k_group_size, ba.get(), bb.get(),
                                                                     bc.get(), ith, nth);

@@ -1450,8 +1450,8 @@ inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
   }
 #endif
 #ifdef HAVE_AMX
-  const char* amx_prefill = std::getenv("KT_MXFP4_PREFILL_AMX");
-  if ((!amx_prefill || amx_prefill[0] != '0') &&
+  static const bool amx_prefill = cached_env_flag("KT_MXFP4_PREFILL_AMX");
+  if (amx_prefill &&
       m >= 16 && n >= GemmKernel224MXFP4SmallKGroup::N_STEP && k >= GemmKernel224MXFP4SmallKGroup::N_STEP &&
       n % GemmKernel224MXFP4SmallKGroup::N_STEP == 0 &&
       k_group_size == 32 && k % 32 == 0 && bb->scale_e8_valid) {
@@ -1466,8 +1466,8 @@ inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
   // budget) but above bit-close parity, so NVFP4 parity comparisons budget
   // this fold explicitly. MXFP4's e8 scales are powers of two, so its fold
   // is exact and unaffected.
-  const char* nvfp4_amx = std::getenv("KT_NVFP4_PREFILL_AMX");
-  if ((!nvfp4_amx || nvfp4_amx[0] != '0') &&
+  static const bool nvfp4_amx = cached_env_flag("KT_NVFP4_PREFILL_AMX");
+  if (nvfp4_amx &&
       m >= 16 && n >= GemmKernel224MXFP4SmallKGroup::N_STEP && k >= GemmKernel224MXFP4SmallKGroup::N_STEP &&
       n % GemmKernel224MXFP4SmallKGroup::N_STEP == 0 &&
       k_group_size == 16 && k % 32 == 0) {

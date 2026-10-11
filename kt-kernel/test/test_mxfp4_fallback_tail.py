@@ -5,22 +5,19 @@ comparison tests only exercise a single prompt length, so sweep the shapes that
 land in the tails here and check the fallback against the AMX kernel.
 """
 
+import os
+
 import pytest
 import torch
 
-import kt_kernel
+import amx_backend
+import kt_kernel  # noqa: F401
 
 
-@pytest.mark.parametrize("weight_layout", ["0", "1"])
-@pytest.mark.parametrize("qlen", [17, 18, 19, 20, 33, 63, 65, 67])
-def test_mxfp4_fallback_tile_tails(monkeypatch, qlen, weight_layout):
-    monkeypatch.setenv("KT_MXFP4_KMAJOR_WEIGHTS", weight_layout)
+def _run(backend, qlen, weight_layout):
+    os.environ["KT_MXFP4_KMAJOR_WEIGHTS"] = weight_layout
+    os.environ["KT_MXFP4_PREFILL_AMX"] = backend
     ext = kt_kernel.kt_kernel_ext
-    if not hasattr(ext.moe, "AMXFP4_KGroup_MOE"):
-        pytest.skip("AMX MXFP4 extension is unavailable")
-    with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
-        if "amx_bf16" not in cpuinfo.read():
-            pytest.skip("AMX BF16 is unavailable")
 
     torch.manual_seed(qlen * 7 + int(weight_layout))
     experts, hidden, intermediate = 2, 256, 512
@@ -56,24 +53,45 @@ def test_mxfp4_fallback_tile_tails(monkeypatch, qlen, weight_layout):
     inputs = (torch.randn(qlen, hidden) * 0.1).to(torch.bfloat16).contiguous()
     batch_size = torch.tensor([qlen], dtype=torch.int32)
 
-    def forward(backend):
-        monkeypatch.setenv("KT_MXFP4_PREFILL_AMX", backend)
-        output = torch.empty(qlen, hidden, dtype=torch.bfloat16)
-        pool.submit(
-            moe.forward_task(
-                batch_size.data_ptr(),
-                1,
-                ids.data_ptr(),
-                weights.data_ptr(),
-                inputs.data_ptr(),
-                output.data_ptr(),
-                False,
-            )
+    output = torch.empty(qlen, hidden, dtype=torch.bfloat16)
+    pool.submit(
+        moe.forward_task(
+            batch_size.data_ptr(),
+            1,
+            ids.data_ptr(),
+            weights.data_ptr(),
+            inputs.data_ptr(),
+            output.data_ptr(),
+            False,
         )
-        pool.sync()
-        return output
+    )
+    pool.sync()
+    return output
 
-    expected = forward("1")
-    actual = forward("0")
+
+def child_main():
+    amx_backend.child_main(_run)
+
+
+@pytest.mark.parametrize("weight_layout", ["0", "1"])
+@pytest.mark.parametrize("qlen", [17, 18, 19, 20, 33, 63, 65, 67])
+def test_mxfp4_fallback_tile_tails(tmp_path, qlen, weight_layout):
+    ext = kt_kernel.kt_kernel_ext
+    if not hasattr(ext.moe, "AMXFP4_KGroup_MOE"):
+        pytest.skip("AMX MXFP4 extension is unavailable")
+    with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
+        if "amx_bf16" not in cpuinfo.read():
+            pytest.skip("AMX BF16 is unavailable")
+
+    # Kernel selection is cached per process, so each backend gets its own.
+    results = {
+        backend: amx_backend.run_backend(
+            __name__, backend, tmp_path, qlen=qlen, weight_layout=weight_layout
+        )
+        for backend in ("0", "1")
+    }
+    expected = results["1"]
+    actual = results["0"]
+
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, atol=5e-4, rtol=5e-3)
