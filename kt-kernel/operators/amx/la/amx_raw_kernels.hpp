@@ -348,20 +348,31 @@ struct GemmKernel224FP8 {
     config.set_config();
   }
 
+  // Expand one 32-output-channel FP8 tile to AMX's VNNI B layout: 16 k-pair
+  // rows of 32 adjacent BF16 pairs (word pair*32 + channel holds BF16 K
+  // 2pair / 2pair+1 of channel, matching pack_fp4_amx_b_scalar's scratch
+  // contract). Weight tiles keep BufferBFP8Impl's scramble (word 8*pair +
+  // mat_offset[row>>2], lane row&3); unpack once per n_pos block instead of
+  // decoding FP8 weights for every token tile.
+  //
   // _mm512_unpack{lo,hi}_epi8 inside fp8x64_to_bf16x64 interleaves within each
   // 128-bit lane, which looks like it needs a compensating shuffle. It does not:
   // the required input permutation works out to the identity, because the
   // mat_offset scramble that BufferBFP8Impl::from_mat applies is exactly the
   // inverse of that interleave. So the staged bytes go in unpermuted and the
   // whole 32-output-channel tile is one load + one widen per 64 weights.
-  static void pack_fp8_amx_b(int n, int k, int n_pos, BufferB* bb, uint32_t* packed) {
+  //
+  // Templated on the buffer so the per-channel kernel, whose BufferB differs
+  // only in how it stores scales, can share the tile walk.
+  template <typename B>
+  static void pack_fp8_amx_b(int n, int k, int n_pos, B* bb, uint32_t* packed) {
     const int chunk_count = k / K_STEP;
     for (int chunk = 0; chunk < chunk_count; ++chunk) {
       uint32_t* destination = packed + static_cast<size_t>(chunk) * 16 * 32;
       const char* source = reinterpret_cast<const char*>(bb->get_submat(n, k, n_pos, chunk * K_STEP));
       for (int pair = 0; pair < 16; ++pair) {
         const __m512i raw = _mm512_loadu_si512(source + 64 * pair);
-        auto [lo, hi] = fp8x64_to_bf16x64(raw);
+        auto [lo, hi] = GemmKernel224FP8::fp8x64_to_bf16x64(raw);
         _mm512_storeu_si512(destination + pair * 32, lo);
         _mm512_storeu_si512(destination + pair * 32 + 16, hi);
       }
@@ -791,6 +802,57 @@ struct GemmKernel224FP8PerChannel {
     }
   }
 
+  // ==========================================================================
+  // FP8 -> BF16 AMX prefill staging, per-channel scales.
+  //
+  // Same widening and packed-B tile layout as GemmKernel224FP8, but a single
+  // scale covers the whole K extent, so the accumulators are never drained
+  // mid-K: the tile registers hold the full dot product and the scale is
+  // folded once at the end by apply_scale_perchannel, exactly as the AVX path
+  // does. That makes this kernel strictly simpler than the block-wise one --
+  // there is no reduce buffer and no k_group loop.
+  // ==========================================================================
+  static void fp8_perchannel_mat_mat_kgroup_amx(int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
+                                                int nth) {
+    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    if (n_start >= n_end) return;
+    GemmKernel224FP8::configure_fp8_amx();
+
+    // Per-worker scratch is bounded by 32 BF16 output channels times K.
+    thread_local std::vector<uint8_t> packed_storage;
+    packed_storage.resize(static_cast<size_t>(k) * 64 + 63);
+    auto* packed = reinterpret_cast<uint32_t*>((reinterpret_cast<uintptr_t>(packed_storage.data()) + 63) &
+                                               ~uintptr_t(63));
+    for (int n_pos = n_start; n_pos < n_end; n_pos += N_STEP) {
+      GemmKernel224FP8::pack_fp8_amx_b(n, k, n_pos, bb, packed);
+      for (int m_pos = 0; m_pos < m; m_pos += M_STEP) {
+        _tile_zero(4);
+        _tile_zero(5);
+        _tile_zero(6);
+        _tile_zero(7);
+        for (int chunk_begin = 0; chunk_begin < k; chunk_begin += K_STEP) {
+          // Tail activation rows stay zero through BufferABF16Impl padding.
+          const ggml_bf16_t* a = ba->get_submat(m, k, m_pos, chunk_begin);
+          const uint32_t* b = packed + static_cast<size_t>(chunk_begin / K_STEP) * 16 * 32;
+          _tile_loadd(0, a, K_STEP * sizeof(ggml_bf16_t));
+          _tile_loadd(1, a + 16 * K_STEP, K_STEP * sizeof(ggml_bf16_t));
+          _tile_loadd(2, b, 128);
+          _tile_loadd(3, b + 16, 128);
+          _tile_dpbf16ps(4, 0, 2);
+          _tile_dpbf16ps(5, 0, 3);
+          _tile_dpbf16ps(6, 1, 2);
+          _tile_dpbf16ps(7, 1, 3);
+        }
+        float* result = bc->get_submat(m, n, m_pos, n_pos);
+        _tile_stored(4, result, N_STEP * sizeof(float));
+        _tile_stored(5, result + TILE_N, N_STEP * sizeof(float));
+        _tile_stored(6, result + 16 * N_STEP, N_STEP * sizeof(float));
+        _tile_stored(7, result + 16 * N_STEP + TILE_N, N_STEP * sizeof(float));
+        apply_scale_perchannel(m, n, m_pos, n_pos, result, bb);
+      }
+    }
+  }
+
   // AVX kernel for per-channel FP8 GEMM - processes entire K dimension
   static void avx_kernel_4(int m, int n, int k, int m_begin, int n_begin, int k_block_begin, float* c, BufferA* ba,
                            BufferB* bb) {
@@ -934,6 +996,23 @@ void float_mat_vec_perchannel(int m, int n, int k, typename K::BufferA* ba, type
 inline void vec_mul_perchannel(int m, int n, int k, std::shared_ptr<GemmKernel224FP8PerChannel::BufferA> ba,
                                std::shared_ptr<GemmKernel224FP8PerChannel::BufferB> bb,
                                std::shared_ptr<GemmKernel224FP8PerChannel::BufferC> bc, int ith, int nth) {
+  float_mat_vec_perchannel<GemmKernel224FP8PerChannel>(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth);
+}
+
+inline void mat_mul_perchannel(int m, int n, int k, std::shared_ptr<GemmKernel224FP8PerChannel::BufferA> ba,
+                               std::shared_ptr<GemmKernel224FP8PerChannel::BufferB> bb,
+                               std::shared_ptr<GemmKernel224FP8PerChannel::BufferC> bc, int ith, int nth) {
+#ifdef HAVE_AMX
+  // Same staging contract as the block-wise FP8 kernel: AMX tiles need a full
+  // 16-row guard and the FP8->BF16 widening. KT_FP8_PERCHANNEL_PREFILL_AMX=0
+  // forces the AVX512-BF16 path for A/B checks.
+  static const bool amx_prefill = cached_env_flag("KT_FP8_PERCHANNEL_PREFILL_AMX");
+  if (amx_prefill && AMX_AVAILABLE && m >= 16 && n % GemmKernel224FP8PerChannel::N_STEP == 0 &&
+      k % GemmKernel224FP8PerChannel::K_STEP == 0) {
+    GemmKernel224FP8PerChannel::fp8_perchannel_mat_mat_kgroup_amx(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth);
+    return;
+  }
+#endif
   float_mat_vec_perchannel<GemmKernel224FP8PerChannel>(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth);
 }
 

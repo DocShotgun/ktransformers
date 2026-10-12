@@ -95,16 +95,26 @@ class AMX_FP8_PERCHANNEL_MOE_TP : public AMX_MOE_BASE<T, AMX_FP8_PERCHANNEL_MOE_
     auto& bb = do_up ? up_bb_[expert_idx] : gate_bb_[expert_idx];
     auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
 
-    // Per-channel: use vec_mul_perchannel instead of vec_mul_kgroup
-    amx::float_mat_vec_perchannel<T>(m, config_.intermediate_size, config_.hidden_size, ba.get(), bb.get(), bc.get(),
-                                     ith, nth);
+    // Prefill matmul tiles (AMX staging gated in amx::mat_mul_perchannel) beat
+    // the matvec inner loops once enough tokens share an expert batch.
+    if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
+      amx::mat_mul_perchannel(m, config_.intermediate_size, config_.hidden_size, ba, bb, bc, ith, nth);
+    } else {
+      amx::float_mat_vec_perchannel<T>(m, config_.intermediate_size, config_.hidden_size, ba.get(), bb.get(), bc.get(),
+                                       ith, nth);
+    }
   }
 
   void do_down_gemm(int expert_idx, int ith, int nth, int qlen) {
     int m = m_local_num_[expert_idx];
 
-    amx::float_mat_vec_perchannel<T>(m, config_.hidden_size, config_.intermediate_size, down_ba_[expert_idx].get(),
-                                     down_bb_[expert_idx].get(), down_bc_[expert_idx].get(), ith, nth);
+    if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
+      amx::mat_mul_perchannel(m, config_.hidden_size, config_.intermediate_size, down_ba_[expert_idx],
+                              down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
+    } else {
+      amx::float_mat_vec_perchannel<T>(m, config_.hidden_size, config_.intermediate_size, down_ba_[expert_idx].get(),
+                                       down_bb_[expert_idx].get(), down_bc_[expert_idx].get(), ith, nth);
+    }
   }
 
   // Fast 64-byte (512-bit) memcpy using AVX512
