@@ -341,16 +341,6 @@ struct GemmKernel224FP8 {
   // the 128x128 scales with apply_scale_kgroup exactly like the AVX path.
   // ==========================================================================
 
-  // Scalar twin of fp8x64_to_bf16x64's lookup decode (bit-exact widening).
-  static inline uint16_t fp8_to_bf16_bits(uint8_t fp8) {
-    const uint8_t index = fp8 & 0x3F;
-    const bool hi_select = (fp8 & 0x40) != 0;
-    uint8_t hi = hi_select ? bf16_hi_1_val[index] : bf16_hi_0_val[index];
-    const uint8_t lo = hi_select ? bf16_lo_1_val[index] : bf16_lo_0_val[index];
-    hi |= fp8 & 0x80;
-    return static_cast<uint16_t>((static_cast<uint16_t>(hi) << 8) | lo);
-  }
-
   static void configure_fp8_amx() {
     enable_amx();
     TileConfig config;
@@ -358,29 +348,22 @@ struct GemmKernel224FP8 {
     config.set_config();
   }
 
-  // Expand one 32-output-channel FP8 tile to AMX's VNNI B layout: 16 k-pair
-  // rows of 32 adjacent BF16 pairs (word pair*32 + channel holds BF16 K
-  // 2pair / 2pair+1 of channel, matching pack_fp4_amx_b_scalar's scratch
-  // contract). Weight tiles keep BufferBFP8Impl's scramble (word 8*pair +
-  // mat_offset[row>>2], lane row&3); unpack once per n_pos block instead of
-  // decoding FP8 weights for every token tile.
+  // _mm512_unpack{lo,hi}_epi8 inside fp8x64_to_bf16x64 interleaves within each
+  // 128-bit lane, which looks like it needs a compensating shuffle. It does not:
+  // the required input permutation works out to the identity, because the
+  // mat_offset scramble that BufferBFP8Impl::from_mat applies is exactly the
+  // inverse of that interleave. So the staged bytes go in unpermuted and the
+  // whole 32-output-channel tile is one load + one widen per 64 weights.
   static void pack_fp8_amx_b(int n, int k, int n_pos, BufferB* bb, uint32_t* packed) {
-    static constexpr int mat_offset[8] = {0, 2, 4, 6, 1, 3, 5, 7};
     const int chunk_count = k / K_STEP;
     for (int chunk = 0; chunk < chunk_count; ++chunk) {
       uint32_t* destination = packed + static_cast<size_t>(chunk) * 16 * 32;
-      const uint64_t* words = reinterpret_cast<const uint64_t*>(bb->get_submat(n, k, n_pos, chunk * K_STEP));
+      const char* source = reinterpret_cast<const char*>(bb->get_submat(n, k, n_pos, chunk * K_STEP));
       for (int pair = 0; pair < 16; ++pair) {
-        const uint64_t pair_words[8] = {words[8 * pair], words[8 * pair + 1], words[8 * pair + 2], words[8 * pair + 3],
-                                        words[8 * pair + 4], words[8 * pair + 5], words[8 * pair + 6],
-                                        words[8 * pair + 7]};
-        for (int channel = 0; channel < 32; ++channel) {
-          const uint16_t fp8_pair =
-              static_cast<uint16_t>(pair_words[mat_offset[channel >> 2]] >> (16 * (channel & 3)));
-          destination[pair * 32 + channel] =
-              static_cast<uint32_t>(fp8_to_bf16_bits(static_cast<uint8_t>(fp8_pair))) |
-              (static_cast<uint32_t>(fp8_to_bf16_bits(static_cast<uint8_t>(fp8_pair >> 8))) << 16);
-        }
+        const __m512i raw = _mm512_loadu_si512(source + 64 * pair);
+        auto [lo, hi] = fp8x64_to_bf16x64(raw);
+        _mm512_storeu_si512(destination + pair * 32, lo);
+        _mm512_storeu_si512(destination + pair * 32 + 16, hi);
       }
     }
   }
