@@ -241,11 +241,12 @@ class KExpertsCPUBuffer:
 
         ``submit_with_cuda_stream`` is fire-and-forget: it defers the task enqueue
         to the CUDA host-callback thread, and the task then executes on the CPU
-        worker pool. Every task argument pointer (qlen, expert ids, weights,
+        worker pool. Every tensor-backed task argument (expert ids, weights,
         input, output) points into the pinned tensors of a buffer tuple, so a
-        tuple must outlive all tasks built against it. Fence each submit stream
-        (covered backward through its queued host callbacks) and drain the CPU
-        task queue before any tuple is dropped.
+        tuple must outlive all tasks built against it. (The scalar qlen is
+        copied into the task at submit time.) Fence each submit stream (covered
+        backward through its queued host callbacks) and drain the CPU task queue
+        before any tuple is dropped.
         """
         submitters = list(cls.pending_submitters.values())
         cls.pending_submitters.clear()

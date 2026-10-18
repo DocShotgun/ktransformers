@@ -66,7 +66,7 @@ void TaskQueue::sync(size_t allow_n_pending) {
   // The caller is usually waiting on the tail of a task it has just submitted
   // (one forward per layer during decode), so spin for a short while before
   // going to sleep: the wake-up would otherwise cost a futex round trip on the
-  // critical path.
+  // critical path. The spin is unconditional; only the duration is bounded.
   if (pending.load(std::memory_order_acquire) > allow_n_pending) {
     auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(kSpinUs);
     while (pending.load(std::memory_order_acquire) > allow_n_pending

@@ -466,9 +466,10 @@ struct GemmKernel224MXFP4SmallKGroup {
 
     // NVFP4 per-16 scales arrive folded to BF16 by the loader (exact for the
     // e4m3 x fp32 products it generates). Compact the FP32 slots to BF16
-    // in-place -- forward compression stays overlap-safe, byte 2i is always
-    // written below the first byte of every not-yet-read float j > i -- and
-    // place a transposed per-(group, 32-channel) BF16 copy in the freed tail.
+    // in-place -- forward compression stays overlap-safe, bytes 2i and 2i+1
+    // are always written below the first byte of every not-yet-read float
+    // j > i -- and place a transposed per-(group, 32-channel) BF16 copy in
+    // the freed tail.
     // Non-BF16-representable scales (e.g. a future fp34 loader) keep the FP32
     // fallback untouched.
     void finalize_scale_nv() {

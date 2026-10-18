@@ -23,8 +23,9 @@
 
 // Kernel selection runs once per (expert, N-block) task, which is tens of
 // thousands of times per layer, so the KT_*_PREFILL_AMX style flags cannot be
-// read on every dispatch. Resolve each one on first use and cache it for the
-// life of the process: set them before the first forward, as with every other
+// read on every dispatch. Callers must hoist this into a function-local
+// `static const bool` (see the dispatches below) so the environment is read
+// once; set the flags before the first forward, as with every other
 // process-level knob.
 inline bool cached_env_flag(const char* name) {
   const char* value = std::getenv(name);

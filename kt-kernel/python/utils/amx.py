@@ -797,6 +797,12 @@ class NativeMoEWrapper(BaseMoEWrapper):
             f"model.language_model.layers.{self.layer_idx}",
         ]
         weights = None
+        # The loaders below iterate experts in checkpoint order, which is the
+        # *logical* order: TP_MOE::load_weights indexes the pointer arrays
+        # with expert_map(physical_to_logical_map, slot). gpu_experts_mask is
+        # indexed by physical slot, so translate it once here. With an
+        # identity map (the common case) this is a no-op; with EPLB placement
+        # it is what keeps the skipped slots and the loaded weights aligned.
         gpu_logical_experts_mask = None
         if self.method in ("MXFP4", "NVFP4", "MXFP8") and self.num_gpu_experts:
             physical_gpu_experts = self.gpu_experts_mask.nonzero(as_tuple=False).flatten()
