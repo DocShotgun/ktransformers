@@ -18,6 +18,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstring>
+#include <memory>
 
 #include "cpu_backend/cpuinfer.h"
 #include "cpu_backend/worker_pool.h"
@@ -243,10 +244,15 @@ class MOEBindings {
       // time, or it reads whatever memory holds by then.
       int qlen_value;
     };
-    static void inner(void* args) {
-      Args* args_ = (Args*)args;
-      args_->cpuinfer->enqueue(&TP_MOE<T>::forward_binding, args_->moe, (intptr_t)&args_->qlen_value, args_->k,
-                               args_->expert_ids, args_->weights, args_->input, args_->output, args_->incremental);
+    static void inner(void* raw) {
+      // The task outlives this call, so move the argument block into the
+      // closure. qlen_value is copied into the block at build time; every
+      // other pointer is owned by the caller's buffer tuple.
+      std::shared_ptr<Args> args(static_cast<Args*>(raw));
+      args->cpuinfer->enqueue([args]() {
+        args->moe->forward_binding((intptr_t)&args->qlen_value, args->k, args->expert_ids, args->weights, args->input,
+                                   args->output, args->incremental);
+      });
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
                                                             intptr_t expert_ids, intptr_t weights, intptr_t input,
@@ -312,11 +318,12 @@ class MOESFTBindings {
       intptr_t output;
       bool save_for_backward;
     };
-    static void inner(void* args) {
-      Args* args_ = (Args*)args;
-      args_->cpuinfer->enqueue(&TP_MOE_SFT<T>::forward_sft_binding, args_->moe, args_->qlen, args_->k,
-                               args_->expert_ids, args_->weights, args_->input, args_->output,
-                               args_->save_for_backward);
+    static void inner(void* raw) {
+      std::shared_ptr<Args> args(static_cast<Args*>(raw));
+      args->cpuinfer->enqueue([args]() {
+        args->moe->forward_sft_binding(args->qlen, args->k, args->expert_ids, args->weights, args->input,
+                                       args->output, args->save_for_backward);
+      });
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE_SFT<T>> moe, intptr_t qlen, int k,
                                                             intptr_t expert_ids, intptr_t weights, intptr_t input,

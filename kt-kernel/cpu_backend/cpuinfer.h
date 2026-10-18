@@ -79,6 +79,10 @@ class CPUInfer {
     task_queue_->enqueue([=]() { std::invoke(f, *obj, args...); });
   }
 
+  // Adopt a fully-formed task. The forward bindings use this to move their
+  // argument block into the closure instead of leaking it.
+  void enqueue(std::function<void()> task) { task_queue_->enqueue(std::move(task)); }
+
   void submit(std::pair<intptr_t, intptr_t> params) {
     void (*func)(void*) = (void (*)(void*))params.first;
     void* args = (void*)params.second;
