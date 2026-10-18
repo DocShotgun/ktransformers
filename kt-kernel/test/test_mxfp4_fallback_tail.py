@@ -14,13 +14,13 @@ import amx_backend
 import kt_kernel  # noqa: F401
 
 
-def _run(backend, qlen, weight_layout):
+def _run(backend, qlen, weight_layout, hidden=256, intermediate=512):
     os.environ["KT_MXFP4_KMAJOR_WEIGHTS"] = weight_layout
     os.environ["KT_MXFP4_PREFILL_AMX"] = backend
     ext = kt_kernel.kt_kernel_ext
 
     torch.manual_seed(qlen * 7 + int(weight_layout))
-    experts, hidden, intermediate = 2, 256, 512
+    experts = 2
     packed = [
         torch.randint(0, 256, (experts, intermediate, hidden // 2), dtype=torch.uint8).contiguous()
         for _ in range(3)
@@ -92,6 +92,47 @@ def test_mxfp4_fallback_tile_tails(tmp_path, qlen, weight_layout):
     }
     expected = results["1"]
     actual = results["0"]
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=5e-4, rtol=5e-3)
+
+
+@pytest.mark.parametrize(
+    "qlen,hidden,intermediate",
+    [
+        # N panel tail: per-TP intermediate is 288 = 256 + 32, so the last
+        # N_BLOCK panel is partial.
+        (17, 256, 1152),
+        # K spans more than one K_BLOCK (8192 > 7168): exercises the aliased
+        # row-major BufferA and the AMX K-block stride.
+        (40, 8192, 128),
+        # Same K span on the vector path (both experts stay below the AMX
+        # threshold), which used to index the tiled staging layout as a row.
+        (8, 8192, 128),
+    ],
+)
+def test_mxfp4_shape_tails(tmp_path, qlen, hidden, intermediate):
+    ext = kt_kernel.kt_kernel_ext
+    if not hasattr(ext.moe, "AMXFP4_KGroup_MOE"):
+        pytest.skip("AMX MXFP4 extension is unavailable")
+    with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
+        if "amx_bf16" not in cpuinfo.read():
+            pytest.skip("AMX BF16 is unavailable")
+
+    results = {
+        backend: amx_backend.run_backend(
+            __name__,
+            backend,
+            tmp_path,
+            qlen=qlen,
+            weight_layout="1",
+            hidden=hidden,
+            intermediate=intermediate,
+        )
+        for backend in ("0", "1")
+    }
+    actual = results["0"]
+    expected = results["1"]
 
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, atol=5e-4, rtol=5e-3)
