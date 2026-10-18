@@ -42,7 +42,12 @@ class TaskQueue {
   std::atomic<size_t> pending;
   std::thread workerThread;
   std::mutex mtx;
-  std::condition_variable cv;
+  // Separate waiters: enqueue() only ever wakes the worker and the worker
+  // only ever wakes sync(). Sharing one condition variable let a sync()
+  // waiter consume the worker's notification (or vice versa), leaving the
+  // other side asleep until the next enqueue.
+  std::condition_variable worker_cv;
+  std::condition_variable sync_cv;
   std::exception_ptr first_exception;
 
   void worker();

@@ -25,7 +25,11 @@
 
 namespace {
 // How long the worker spins for a follow-up task before going to sleep.
-constexpr int64_t kSpinUs = 100;
+constexpr int64_t kWorkerSpinUs = 100;
+// How long sync() spins for the tail of the task it just submitted. Decode
+// needs the round trip hidden (~4 us); prefill would otherwise burn the full
+// budget on every layer because its task is much longer than the spin.
+constexpr int64_t kSyncSpinUs = 10;
 }  // namespace
 
 TaskQueue::TaskQueue() : done(false), pending(0) {
@@ -40,7 +44,8 @@ TaskQueue::~TaskQueue() {
     std::lock_guard<std::mutex> lock(mtx);
     done.store(true, std::memory_order_release);
   }
-  cv.notify_all();
+  worker_cv.notify_all();
+  sync_cv.notify_all();
   if (workerThread.joinable()) workerThread.join();
 
   Node* node = head.load(std::memory_order_relaxed);
@@ -59,7 +64,7 @@ void TaskQueue::enqueue(std::function<void()> task) {
   {
     std::lock_guard<std::mutex> lock(mtx);
   }
-  cv.notify_one();
+  worker_cv.notify_one();
 }
 
 void TaskQueue::sync(size_t allow_n_pending) {
@@ -68,7 +73,7 @@ void TaskQueue::sync(size_t allow_n_pending) {
   // going to sleep: the wake-up would otherwise cost a futex round trip on the
   // critical path. The spin is unconditional; only the duration is bounded.
   if (pending.load(std::memory_order_acquire) > allow_n_pending) {
-    auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(kSpinUs);
+    auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(kSyncSpinUs);
     while (pending.load(std::memory_order_acquire) > allow_n_pending
            && !done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < spin_until) {
       KT_CPU_PAUSE();
@@ -77,7 +82,7 @@ void TaskQueue::sync(size_t allow_n_pending) {
   std::exception_ptr task_exception;
   {
     std::unique_lock<std::mutex> lock(mtx);
-    cv.wait(lock, [&] {
+    sync_cv.wait(lock, [&] {
       return pending.load(std::memory_order_acquire) <= allow_n_pending
           || done.load(std::memory_order_acquire);
     });
@@ -110,13 +115,13 @@ void TaskQueue::worker() {
         }
         pending.fetch_sub(1, std::memory_order_acq_rel);
       }
-      cv.notify_all();
+      sync_cv.notify_all();
     } else {
       // Decode submits one task per layer, so blocking here makes every task
       // pay a futex wake and a context switch before the worker starts.  Spin
       // for a short while first, like the worker pools do, so back-to-back
       // submissions hand the task over without sleeping.
-      auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(kSpinUs);
+      auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(kWorkerSpinUs);
       while (curr->next.load(std::memory_order_acquire) == nullptr) {
         if (std::chrono::steady_clock::now() >= spin_until) {
           break;
@@ -127,7 +132,7 @@ void TaskQueue::worker() {
         continue;
       }
       std::unique_lock<std::mutex> lock(mtx);
-      cv.wait(lock, [&] {
+      worker_cv.wait(lock, [&] {
         return curr->next.load(std::memory_order_acquire) != nullptr
             || done.load(std::memory_order_acquire);
       });
