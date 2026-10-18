@@ -200,33 +200,54 @@ struct GemmKernel224MXFP4SmallKGroup {
     using Base::k;
     using Base::max_m;
 
-    // Prefill aliases the expert-grouped BF16 rows below. Only one row per
-    // active expert needs staging for decode or a one-token prefill route.
-    static size_t required_size(int max_m, int k) {
-      return Base::required_size(k <= K_BLOCK ? 1 : max_m, k);
-    }
+    // Prefill aliases the expert-grouped BF16 rows below; only decode stages
+    // a single row in the pool.
+    static size_t required_size(int /*max_m*/, int k) { return Base::required_size(1, k); }
 
     bool natural_order = false;
+    // True while `a` aliases the caller's row-major prefill rows instead of
+    // the tiled staging pool.
+    bool row_major = false;
+    ggml_bf16_t* pool = nullptr;
 
-    BufferA(int max_m_, int k_, void* ptr) : Base(max_m_, k_, ptr) {}
+    BufferA(int max_m_, int k_, void* ptr) : Base(max_m_, k_, ptr), pool(a) {}
 
     void set_data(void* ptr) {
       Base::set_data(ptr);
+      pool = a;
+      row_major = false;
       natural_order = false;
     }
 
     void from_mat(int m, ggml_bf16_t* src, int ith, int nth) {
-      // With M_STEP=1 and a single K block, BufferA's layout is the same
-      // row-major BF16 layout already produced by the expert gather. Avoid
-      // copying every prefill activation into the staging arena twice (gate
-      // and down). Decode still uses its separately allocated, permuted tile.
-      if (m > 1 && k <= K_BLOCK) {
+      // The expert gather already produces row-major BF16, which is exactly
+      // the layout every kernel consumes (the K-block tiling only exists to
+      // make Base::from_mat's staging copy cheap). Alias it for every
+      // multi-token call instead of copying it into the staging arena.
+      if (m > 1) {
         assert(m <= max_m && ith == 0 && nth == 1);
         a = src;
+        row_major = true;
       } else {
+        // Restore the staging pointer if the previous call aliased a prefill
+        // buffer; set_data() usually did it already, but from_mat() must not
+        // depend on that.
+        if (row_major) a = pool;
         Base::from_mat(m, src, ith, nth);
+        row_major = false;
       }
       natural_order = false;
+    }
+
+    // Row stride of the aliased prefill buffer, or of one K block of the
+    // tiled decode buffer. The AMX kernel walks both with the same code.
+    int k_block_stride(int k_block_begin) const {
+      return row_major ? k : std::min(K_BLOCK, k - k_block_begin);
+    }
+
+    ggml_bf16_t* get_submat(int m, int k_, int m_begin, int k_begin) {
+      if (row_major) return a + static_cast<size_t>(m_begin) * k + k_begin;
+      return Base::get_submat(m, k_, m_begin, k_begin);
     }
 
     void from_mat_natural(int m, ggml_bf16_t* src, int ith, int nth) {
@@ -234,6 +255,8 @@ struct GemmKernel224MXFP4SmallKGroup {
       assert(m <= max_m);
       assert(ith == 0 && nth == 1);
       assert(k % 32 == 0);
+      if (row_major) a = pool;
+      row_major = false;
       for (int mi = 0; mi < m; ++mi) {
         const __m512bh* src_row = reinterpret_cast<const __m512bh*>(src + static_cast<size_t>(mi) * k);
         __m512bh* dst_row = reinterpret_cast<__m512bh*>(get_submat(m, k, mi, 0));
@@ -1243,7 +1266,7 @@ struct GemmKernel224MXFP4SmallKGroup {
         for (int group = 0; group < group_count; ++group) {
           auto* a = ba->get_submat(m, k, m_pos, group * 32);
           const int k_block_start = (group * 32 / K_BLOCK) * K_BLOCK;
-          const int a_stride = std::min(K_BLOCK, k - k_block_start);
+          const int a_stride = ba->k_block_stride(k_block_start);
           if (rows < 32) {
             for (int row = 0; row < rows; ++row) {
               std::memcpy(tail_a[row], a + static_cast<size_t>(row) * a_stride,
