@@ -502,7 +502,9 @@ struct GemmKernel224MXFP4SmallKGroup {
         return destination;
       }
       if (!scale_e8_valid) return Base::get_scale(n_, n_begin, k_, k_begin);
-      constexpr int max_group_count = K_BLOCK / 32;
+      // Group-16 (NVFP4) buffers with power-of-two scales take this path too,
+      // so size for the smallest supported group, not MXFP4's 32.
+      constexpr int max_group_count = K_BLOCK / 16;
       const int group_count = k_ / k_group_size;
       assert(group_count <= max_group_count);
       alignas(64) thread_local float scratch[4][max_group_count];
