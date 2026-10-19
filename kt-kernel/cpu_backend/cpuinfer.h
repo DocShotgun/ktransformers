@@ -13,6 +13,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -112,9 +113,14 @@ class CPUInfer {
     args->cpuinfer->task_queue_->sync(args->allow_n_pending);
   }
 
+  static void sync_and_delete_(void* sync_args) {
+    std::unique_ptr<SyncArgs> args(static_cast<SyncArgs*>(sync_args));
+    sync_(args.get());
+  }
+
   void sync(size_t allow_n_pending = 0) {
-    SyncArgs* args = new SyncArgs{this, allow_n_pending};
-    sync_(args);
+    SyncArgs args{this, allow_n_pending};
+    sync_(&args);
   }
 #ifndef KTRANSFORMERS_CPU_ONLY
   void sync_with_cuda_stream(intptr_t user_cuda_stream, size_t allow_n_pending = 0) {
@@ -122,7 +128,7 @@ class CPUInfer {
     defined(KTRANSFORMERS_USE_MUSA) || defined(KTRANSFORMERS_USE_ROCM) || defined(KTRANSFORMERS_USE_MACA) || \
     defined(KTRANSFORMERS_USE_ASCEND_NPU)
     SyncArgs* args = new SyncArgs{this, allow_n_pending};
-    cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&sync_, (void*)args);
+    cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&sync_and_delete_, (void*)args);
 #endif
   }
 #endif
