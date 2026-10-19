@@ -774,25 +774,25 @@ class TP_MOE_SFT : public TP_MOE<T> {
     auto& tp_configs_ref = this->tp_configs;
 
     auto merge_fn = [this, output, incremental, &tp_count_ref, &local_output_numa_ref, &tp_configs_ref](int token_nth) {
-      float* merge_to = local_output_numa_ref[0] + token_nth * tp_configs_ref[0].hidden_size;
-      if (incremental) {
-        for (int e = 0; e < config.hidden_size; e += 32) {
-          __m512 x0, x1;
-          avx512_32xbf16_to_32xfp32((__m512i*)((ggml_bf16_t*)output + token_nth * config.hidden_size + e), &x0, &x1);
-          *((__m512*)(merge_to + e)) = _mm512_add_ps(*((__m512*)(merge_to + e)), x0);
-          *((__m512*)(merge_to + e + 16)) = _mm512_add_ps(*((__m512*)(merge_to + e + 16)), x1);
-        }
-      }
-      for (int i = 1; i < tp_count_ref; i++) {
-        float* merge_from = local_output_numa_ref[i] + token_nth * tp_configs_ref[i].hidden_size;
-        for (int e = 0; e < tp_configs_ref[i].hidden_size; e += 16) {
-          *((__m512*)(merge_to + e)) = _mm512_add_ps(*((__m512*)(merge_to + e)), *((__m512*)(merge_from + e)));
-        }
-      }
+      const float* base = local_output_numa_ref[0] + (size_t)token_nth * tp_configs_ref[0].hidden_size;
+      ggml_bf16_t* dst = (ggml_bf16_t*)output + (size_t)token_nth * config.hidden_size;
+      // Accumulate in registers and convert once; see AMX_MOE_BASE.
       for (int e = 0; e < config.hidden_size; e += 32) {
-        __m512 x0 = *(__m512*)(merge_to + e);
-        __m512 x1 = *(__m512*)(merge_to + e + 16);
-        avx512_32xfp32_to_32xbf16(&x0, &x1, (__m512i*)((ggml_bf16_t*)output + token_nth * config.hidden_size + e));
+        __m512 x0, x1;
+        if (incremental) {
+          avx512_32xbf16_to_32xfp32((__m512i*)(dst + e), &x0, &x1);
+          x0 = _mm512_add_ps(x0, _mm512_loadu_ps(base + e));
+          x1 = _mm512_add_ps(x1, _mm512_loadu_ps(base + e + 16));
+        } else {
+          x0 = _mm512_loadu_ps(base + e);
+          x1 = _mm512_loadu_ps(base + e + 16);
+        }
+        for (int i = 1; i < tp_count_ref; i++) {
+          const float* src = local_output_numa_ref[i] + (size_t)token_nth * tp_configs_ref[i].hidden_size;
+          x0 = _mm512_add_ps(x0, _mm512_loadu_ps(src + e));
+          x1 = _mm512_add_ps(x1, _mm512_loadu_ps(src + e + 16));
+        }
+        avx512_32xfp32_to_32xbf16(&x0, &x1, (__m512i*)(dst + e));
       }
     };
 

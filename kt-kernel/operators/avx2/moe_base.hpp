@@ -633,28 +633,25 @@ class TP_MOE<AVX2_MOE_BASE<T, Derived>> : public TP_MOE_Common<AVX2_MOE_BASE<T, 
     auto& tp_configs = this->tp_configs;
 
     auto merge_fn = [this, output, incremental, &config, &tp_count, &local_output_numa, &tp_configs](int token_nth) {
-      float* merge_to = local_output_numa[0] + token_nth * tp_configs[0].hidden_size;
-      if (incremental) {
-        // Convert BF16 output to FP32 and add — AVX2 (16 BF16 at a time)
-        for (int e = 0; e < config.hidden_size; e += 16) {
-          __m256 x0, x1;
-          avx2::load_16xbf16_to_2x8xfp32((ggml_bf16_t*)output + token_nth * config.hidden_size + e, &x0, &x1);
-          *((__m256*)(merge_to + e)) = _mm256_add_ps(*((__m256*)(merge_to + e)), x0);
-          *((__m256*)(merge_to + e + 8)) = _mm256_add_ps(*((__m256*)(merge_to + e + 8)), x1);
-        }
-      }
-      // Sum across TP parts
-      for (int i = 1; i < tp_count; i++) {
-        float* merge_from = local_output_numa[i] + token_nth * tp_configs[i].hidden_size;
-        for (int e = 0; e < tp_configs[i].hidden_size; e += 8) {
-          *((__m256*)(merge_to + e)) = _mm256_add_ps(*((__m256*)(merge_to + e)), *((__m256*)(merge_from + e)));
-        }
-      }
-      // Convert FP32 -> BF16 output
+      const float* base = local_output_numa[0] + (size_t)token_nth * tp_configs[0].hidden_size;
+      ggml_bf16_t* dst = (ggml_bf16_t*)output + (size_t)token_nth * config.hidden_size;
+      // Accumulate in registers and convert once; see the AVX-512 version.
       for (int e = 0; e < config.hidden_size; e += 16) {
-        __m256 x0 = *(__m256*)(merge_to + e);
-        __m256 x1 = *(__m256*)(merge_to + e + 8);
-        avx2::store_2x8xfp32_to_16xbf16(&x0, &x1, (ggml_bf16_t*)output + token_nth * config.hidden_size + e);
+        __m256 x0, x1;
+        if (incremental) {
+          avx2::load_16xbf16_to_2x8xfp32(dst + e, &x0, &x1);
+          x0 = _mm256_add_ps(x0, _mm256_loadu_ps(base + e));
+          x1 = _mm256_add_ps(x1, _mm256_loadu_ps(base + e + 8));
+        } else {
+          x0 = _mm256_loadu_ps(base + e);
+          x1 = _mm256_loadu_ps(base + e + 8);
+        }
+        for (int i = 1; i < tp_count; i++) {
+          const float* src = local_output_numa[i] + (size_t)token_nth * tp_configs[i].hidden_size;
+          x0 = _mm256_add_ps(x0, _mm256_loadu_ps(src + e));
+          x1 = _mm256_add_ps(x1, _mm256_loadu_ps(src + e + 8));
+        }
+        avx2::store_2x8xfp32_to_16xbf16(&x0, &x1, dst + e);
       }
     };
 
