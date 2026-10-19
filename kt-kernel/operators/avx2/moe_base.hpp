@@ -344,16 +344,23 @@ class AVX2_MOE_BASE {
     pool->do_work_stealing_job(
         qlen, nullptr,
         [this, output, k, expert_ids, weights](int i) {
+          std::vector<const ggml_bf16_t*> sources;
+          std::vector<float> route_weights;
+          sources.reserve(k);
+          route_weights.reserve(k);
+          for (int j = 0; j < k; j++) {
+            const int64_t expert = expert_ids[i * k + j];
+            if (config_.should_skip_expert(expert)) continue;
+            sources.push_back(m_local_down_output_ptr_[expert] + m_local_pos_[i][j] * config_.hidden_size);
+            route_weights.push_back(weights[i * k + j]);
+          }
           for (int e = 0; e < config_.hidden_size; e += 16) {
             __m256 x0 = _mm256_setzero_ps();
             __m256 x1 = _mm256_setzero_ps();
-            for (int j = 0; j < k; j++) {
-              if (config_.should_skip_expert(expert_ids[i * k + j])) continue;
-              __m256 weight = _mm256_set1_ps(weights[i * k + j]);
+            for (size_t j = 0; j < sources.size(); j++) {
+              __m256 weight = _mm256_set1_ps(route_weights[j]);
               __m256 d0, d1;
-              avx2::load_16xbf16_to_2x8xfp32(
-                  m_local_down_output_ptr_[expert_ids[i * k + j]] + m_local_pos_[i][j] * config_.hidden_size + e, &d0,
-                  &d1);
+              avx2::load_16xbf16_to_2x8xfp32(sources[j] + e, &d0, &d1);
               x0 = _mm256_fmadd_ps(d0, weight, x0);
               x1 = _mm256_fmadd_ps(d1, weight, x1);
             }
@@ -487,15 +494,22 @@ class AVX2_MOE_BASE {
     }
 
     // Weighted sum — AVX2 (16 BF16 at a time)
+    std::vector<const ggml_bf16_t*> sources;
+    std::vector<float> route_weights;
+    sources.reserve(k);
+    route_weights.reserve(k);
+    for (int j = 0; j < k; j++) {
+      if (config_.should_skip_expert(expert_ids[j])) continue;
+      sources.push_back(m_local_down_output_ptr_[expert_ids[j]] + m_local_pos_[0][j] * config_.hidden_size);
+      route_weights.push_back(weights[j]);
+    }
     for (int e = 0; e < config_.hidden_size; e += 16) {
       __m256 x0 = _mm256_setzero_ps();
       __m256 x1 = _mm256_setzero_ps();
-      for (int j = 0; j < k; j++) {
-        if (config_.should_skip_expert(expert_ids[j])) continue;
-        __m256 weight = _mm256_set1_ps(weights[j]);
+      for (size_t j = 0; j < sources.size(); j++) {
+        __m256 weight = _mm256_set1_ps(route_weights[j]);
         __m256 d0, d1;
-        avx2::load_16xbf16_to_2x8xfp32(
-            m_local_down_output_ptr_[expert_ids[j]] + m_local_pos_[0][j] * config_.hidden_size + e, &d0, &d1);
+        avx2::load_16xbf16_to_2x8xfp32(sources[j] + e, &d0, &d1);
         x0 = _mm256_fmadd_ps(d0, weight, x0);
         x1 = _mm256_fmadd_ps(d1, weight, x1);
       }

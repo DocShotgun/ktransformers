@@ -427,18 +427,29 @@ class AMX_MOE_BASE {
     pool->do_work_stealing_job(
         qlen, nullptr,
         [this, output, k, expert_ids, weights](int i) {
+          // Resolve the routing once per token: the hidden loop below would
+          // otherwise reload expert_ids/weights and re-test should_skip for
+          // every 32-element chunk (output may alias them as far as the
+          // compiler knows).
+          std::vector<const ggml_bf16_t*> sources;
+          std::vector<float> route_weights;
+          sources.reserve(k);
+          route_weights.reserve(k);
+          for (int j = 0; j < k; j++) {
+            const int64_t expert = expert_ids[i * k + j];
+            if (config_.should_skip_expert(expert)) {
+              continue;
+            }
+            sources.push_back(m_local_down_output_ptr_[expert] + m_local_pos_[i][j] * config_.hidden_size);
+            route_weights.push_back(weights[i * k + j]);
+          }
           for (int e = 0; e < config_.hidden_size; e += 32) {
             __m512 x0 = _mm512_setzero_ps();
             __m512 x1 = _mm512_setzero_ps();
-            for (int j = 0; j < k; j++) {
-              if (config_.should_skip_expert(expert_ids[i * k + j])) {
-                continue;
-              }
-              __m512 weight = _mm512_set1_ps(weights[i * k + j]);
+            for (size_t j = 0; j < sources.size(); j++) {
               __m512 down_output0, down_output1;
-              avx512_32xbf16_to_32xfp32((__m512i*)(m_local_down_output_ptr_[expert_ids[i * k + j]] +
-                                                   m_local_pos_[i][j] * config_.hidden_size + e),
-                                        &down_output0, &down_output1);
+              avx512_32xbf16_to_32xfp32((__m512i*)(sources[j] + e), &down_output0, &down_output1);
+              const __m512 weight = _mm512_set1_ps(route_weights[j]);
               x0 = _mm512_fmadd_ps(down_output0, weight, x0);
               x1 = _mm512_fmadd_ps(down_output1, weight, x1);
             }
@@ -631,18 +642,24 @@ class AMX_MOE_BASE {
     }
 #endif
 
+    std::vector<const ggml_bf16_t*> sources;
+    std::vector<float> route_weights;
+    sources.reserve(k);
+    route_weights.reserve(k);
+    for (int j = 0; j < k; j++) {
+      if (config_.should_skip_expert(expert_ids[j])) {
+        continue;
+      }
+      sources.push_back(m_local_down_output_ptr_[expert_ids[j]] + m_local_pos_[0][j] * config_.hidden_size);
+      route_weights.push_back(weights[j]);
+    }
     for (int e = 0; e < config_.hidden_size; e += 32) {
       __m512 x0 = _mm512_setzero_ps();
       __m512 x1 = _mm512_setzero_ps();
-      for (int j = 0; j < k; j++) {
-        if (config_.should_skip_expert(expert_ids[j])) {
-          continue;
-        }
-        __m512 weight = _mm512_set1_ps(weights[j]);
+      for (size_t j = 0; j < sources.size(); j++) {
+        __m512 weight = _mm512_set1_ps(route_weights[j]);
         __m512 down_output0, down_output1;
-        avx512_32xbf16_to_32xfp32(
-            (__m512i*)(m_local_down_output_ptr_[expert_ids[j]] + m_local_pos_[0][j] * config_.hidden_size + e),
-            &down_output0, &down_output1);
+        avx512_32xbf16_to_32xfp32((__m512i*)(sources[j] + e), &down_output0, &down_output1);
         x0 = _mm512_fmadd_ps(down_output0, weight, x0);
         x1 = _mm512_fmadd_ps(down_output1, weight, x1);
       }
