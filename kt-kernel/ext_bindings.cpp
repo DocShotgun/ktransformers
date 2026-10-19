@@ -228,8 +228,8 @@ class MOEBindings {
   };
   class ForwardBindings {
    public:
-    struct Args {
-      CPUInfer* cpuinfer;
+    struct Args : HostCallbackArgs {
+      static void destroy(void* args) { delete static_cast<Args*>(args); }
       TP_MOE<T>* moe;
       intptr_t qlen;
       int k;
@@ -244,21 +244,39 @@ class MOEBindings {
       // time, or it reads whatever memory holds by then.
       int qlen_value;
     };
-    static void inner(void* raw) {
-      // The task outlives this call, so move the argument block into the
-      // closure. qlen_value is copied into the block at build time; every
-      // other pointer is owned by the caller's buffer tuple.
-      std::shared_ptr<Args> args(static_cast<Args*>(raw));
-      args->cpuinfer->enqueue([args]() {
-        args->moe->forward_binding((intptr_t)&args->qlen_value, args->k, args->expert_ids, args->weights, args->input,
-                                   args->output, args->incremental);
-      });
+    static void inner(void* args) {
+      Args* args_ = static_cast<Args*>(args);
+      if (args_->captured) {
+        // The CUDA graph re-invokes this callback with the same block on every
+        // replay. CPUInfer owns the block for the lifetime of the graph.
+        args_->cpuinfer->enqueue([args_]() {
+          args_->moe->forward_binding((intptr_t)&args_->qlen_value, args_->k, args_->expert_ids, args_->weights,
+                                      args_->input, args_->output, args_->incremental);
+        });
+      } else {
+        // The worker reads qlen_value asynchronously; hand it the block and
+        // let the closure free it once the task is done.
+        std::shared_ptr<Args> owned(args_);
+        args_->cpuinfer->enqueue([owned]() {
+          owned->moe->forward_binding((intptr_t)&owned->qlen_value, owned->k, owned->expert_ids, owned->weights,
+                                      owned->input, owned->output, owned->incremental);
+        });
+      }
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
                                                             intptr_t expert_ids, intptr_t weights, intptr_t input,
                                                             intptr_t output, bool incremental = false) {
       int qlen_value = qlen ? *reinterpret_cast<int*>(qlen) : 0;
-      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, weights, input, output, incremental, qlen_value};
+      Args* args = new Args{{nullptr, false, &Args::destroy},
+                            moe.get(),
+                            qlen,
+                            k,
+                            expert_ids,
+                            weights,
+                            input,
+                            output,
+                            incremental,
+                            qlen_value};
       return std::make_pair((intptr_t)&inner, (intptr_t)args);
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
@@ -307,8 +325,8 @@ class MOESFTBindings {
 
   class ForwardSFTBindings {
    public:
-    struct Args {
-      CPUInfer* cpuinfer;
+    struct Args : HostCallbackArgs {
+      static void destroy(void* args) { delete static_cast<Args*>(args); }
       TP_MOE_SFT<T>* moe;
       intptr_t qlen;
       int k;
@@ -318,17 +336,27 @@ class MOESFTBindings {
       intptr_t output;
       bool save_for_backward;
     };
-    static void inner(void* raw) {
-      std::shared_ptr<Args> args(static_cast<Args*>(raw));
-      args->cpuinfer->enqueue([args]() {
-        args->moe->forward_sft_binding(args->qlen, args->k, args->expert_ids, args->weights, args->input,
-                                       args->output, args->save_for_backward);
-      });
+    static void inner(void* args) {
+      Args* args_ = static_cast<Args*>(args);
+      args_->cpuinfer->enqueue(&TP_MOE_SFT<T>::forward_sft_binding, args_->moe, args_->qlen, args_->k,
+                               args_->expert_ids, args_->weights, args_->input, args_->output,
+                               args_->save_for_backward);
+      if (!args_->captured) {
+        delete args_;
+      }
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE_SFT<T>> moe, intptr_t qlen, int k,
                                                             intptr_t expert_ids, intptr_t weights, intptr_t input,
                                                             intptr_t output, bool save_for_backward) {
-      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, weights, input, output, save_for_backward};
+      Args* args = new Args{{nullptr, false, &Args::destroy},
+                            moe.get(),
+                            qlen,
+                            k,
+                            expert_ids,
+                            weights,
+                            input,
+                            output,
+                            save_for_backward};
       return std::make_pair((intptr_t)&inner, (intptr_t)args);
     }
   };

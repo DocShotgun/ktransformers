@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -35,6 +36,23 @@
 #include "llama.cpp/ggml-impl.h"
 #include "task_queue.h"
 #include "worker_pool.h"
+
+class CPUInfer;
+
+// Common header for every host-callback argument block.
+//
+// The block is allocated by the *_task() binding on the Python thread and
+// handed to CPUInfer::submit()/submit_with_cuda_stream().  `captured` is set
+// by CPUInfer when the stream is being captured: a CUDA graph re-invokes the
+// host callback with the same block on every replay, so the block must stay
+// alive for as long as the graph does.  In that case CPUInfer owns the block
+// and `release` frees it at teardown.  Otherwise the callback owns it and
+// releases it once the task has been enqueued.
+struct HostCallbackArgs {
+  CPUInfer* cpuinfer;
+  bool captured;
+  void (*release)(void*);
+};
 
 class CPUInfer {
  public:
@@ -68,6 +86,16 @@ class CPUInfer {
     printf("CPUInfer[0x%lx]: Goodbye\n", (intptr_t)this);
     delete backend_;
     delete task_queue_;
+    // Argument blocks for captured graphs are owned by us: the graph can
+    // replay the callback at any time, so they are only safe to free once the
+    // graph is gone.  That is not observable here, but by the time the
+    // CPUInfer is destroyed the graph is dead too.
+    std::vector<std::function<void()>> captured;
+    {
+      std::lock_guard<std::mutex> lock(captured_args_mutex_);
+      captured.swap(captured_args_);
+    }
+    captured.clear();
   }
 
   CPUInfer(const CPUInfer&) = delete;
@@ -80,8 +108,8 @@ class CPUInfer {
     task_queue_->enqueue([=]() { std::invoke(f, *obj, args...); });
   }
 
-  // Adopt a fully-formed task. The forward bindings use this to move their
-  // argument block into the closure instead of leaking it.
+  // Adopt a fully-formed task. The forward bindings use this to keep their
+  // argument block alive until the worker has consumed it.
   void enqueue(std::function<void()> task) { task_queue_->enqueue(std::move(task)); }
 
   void submit(std::pair<intptr_t, intptr_t> params) {
@@ -96,8 +124,15 @@ class CPUInfer {
     defined(KTRANSFORMERS_USE_MUSA) || defined(KTRANSFORMERS_USE_ROCM) || defined(KTRANSFORMERS_USE_MACA) || \
     defined(KTRANSFORMERS_USE_ASCEND_NPU)
     void (*func)(void*) = (void (*)(void*))params.first;
-    void* args = (void*)params.second;
-    *((CPUInfer**)args) = this;
+    auto* args = static_cast<HostCallbackArgs*>((void*)params.second);
+    args->cpuinfer = this;
+    // A captured stream will replay the callback with this same block.  Keep
+    // it alive for the lifetime of the graph instead of freeing it in the
+    // callback, or the second replay is a double free.
+    args->captured = stream_is_capturing(user_cuda_stream);
+    if (args->captured) {
+      keep_alive([args]() { args->release(args); });
+    }
     cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)func, args);
 #endif
   }
@@ -106,6 +141,7 @@ class CPUInfer {
   struct SyncArgs {
     CPUInfer* cpuinfer;
     size_t allow_n_pending;
+    bool captured;
   };
 
   static void sync_(void* sync_args) {
@@ -113,13 +149,17 @@ class CPUInfer {
     args->cpuinfer->task_queue_->sync(args->allow_n_pending);
   }
 
-  static void sync_and_delete_(void* sync_args) {
-    std::unique_ptr<SyncArgs> args(static_cast<SyncArgs*>(sync_args));
-    sync_(args.get());
+  static void sync_and_release_(void* sync_args) {
+    SyncArgs* args = (SyncArgs*)sync_args;
+    // Captured blocks are owned by CPUInfer; eager blocks are freed here even
+    // if sync_() rethrows a worker exception.
+    std::unique_ptr<SyncArgs> owned(args->captured ? nullptr : args);
+    sync_(args);
   }
 
   void sync(size_t allow_n_pending = 0) {
-    SyncArgs args{this, allow_n_pending};
+    // Synchronous: the argument lives on the stack.
+    SyncArgs args{this, allow_n_pending, false};
     sync_(&args);
   }
 #ifndef KTRANSFORMERS_CPU_ONLY
@@ -127,14 +167,54 @@ class CPUInfer {
 #if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS) || \
     defined(KTRANSFORMERS_USE_MUSA) || defined(KTRANSFORMERS_USE_ROCM) || defined(KTRANSFORMERS_USE_MACA) || \
     defined(KTRANSFORMERS_USE_ASCEND_NPU)
-    SyncArgs* args = new SyncArgs{this, allow_n_pending};
-    cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&sync_and_delete_, (void*)args);
+    auto* args = new SyncArgs{this, allow_n_pending, false};
+    args->captured = stream_is_capturing(user_cuda_stream);
+    if (args->captured) {
+      keep_alive([args]() { delete args; });
+    }
+    cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&sync_and_release_, (void*)args);
 #endif
   }
 #endif
+
  public:
   WorkerPool* backend_;
   TaskQueue* task_queue_;
+
+ private:
+  // True when `user_cuda_stream` is being captured into a CUDA graph.  The
+  // host callback of a captured stream is re-invoked on every replay, so its
+  // argument block must outlive the callback.
+  static bool stream_is_capturing(intptr_t user_stream) {
+#if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS)
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    return cudaStreamIsCapturing((cudaStream_t)user_stream, &status) == cudaSuccess &&
+           status != cudaStreamCaptureStatusNone;
+#elif defined(KTRANSFORMERS_USE_ROCM)
+    hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+    return hipStreamIsCapturing((hipStream_t)user_stream, &status) == hipSuccess &&
+           status != hipStreamCaptureStatusNone;
+#elif defined(KTRANSFORMERS_USE_MUSA)
+    musaStreamCaptureStatus status = musaStreamCaptureStatusNone;
+    return musaStreamIsCapturing((musaStream_t)user_stream, &status) == musaSuccess &&
+           status != musaStreamCaptureStatusNone;
+#elif defined(KTRANSFORMERS_USE_MACA)
+    mcStreamCaptureStatus status = mcStreamCaptureStatusNone;
+    return mcStreamIsCapturing((mcStream_t)user_stream, &status) == mcSuccess &&
+           status != mcStreamCaptureStatusNone;
+#else
+    (void)user_stream;
+    return false;  // Ascend ACL has no stream capture.
+#endif
+  }
+
+  void keep_alive(std::function<void()> release) {
+    std::lock_guard<std::mutex> lock(captured_args_mutex_);
+    captured_args_.push_back(std::move(release));
+  }
+
+  std::vector<std::function<void()>> captured_args_;
+  std::mutex captured_args_mutex_;
 };
 
 #endif
