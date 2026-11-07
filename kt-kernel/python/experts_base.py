@@ -159,6 +159,24 @@ def _wait_device(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _wait_cuda_stream_on_host(cuda_stream, device: torch.device) -> None:
+    """Block the host until everything queued so far on a CUDA submit stream ran.
+
+    Only that stream is waited on, not the whole device. No-op off CUDA and
+    during graph capture, where a host wait would raise (see ``_wait_device``).
+    """
+    if device.type != "cuda" or torch.cuda.is_current_stream_capturing() or _sglang_is_capture_mode():
+        return
+    stream = (
+        cuda_stream
+        if isinstance(cuda_stream, torch.cuda.Stream)
+        else torch.cuda.ExternalStream(int(cuda_stream), device=device)
+    )
+    event = torch.cuda.Event()
+    event.record(stream)
+    event.synchronize()
+
+
 def generate_gpu_experts_masks(
     activation_freq: torch.Tensor,
     num_gpu_experts: int,
@@ -236,7 +254,7 @@ class KExpertsCPUBuffer:
         cls.pending_submitters[(id(cpu_infer), stream_key)] = (cpu_infer, cuda_stream)
 
     @classmethod
-    def _quiesce(cls) -> None:
+    def _quiesce(cls, device: torch.device) -> None:
         """Block until every submitted expert task has actually executed.
 
         ``submit_with_cuda_stream`` is fire-and-forget: it defers the task enqueue
@@ -245,8 +263,10 @@ class KExpertsCPUBuffer:
         input, output) points into the pinned tensors of a buffer tuple, so a
         tuple must outlive all tasks built against it. (The scalar qlen is
         copied into the task at submit time.) Fence each submit stream (covered
-        backward through its queued host callbacks) and drain the CPU task queue
-        before any tuple is dropped.
+        backward through its queued host callbacks), wait on the host for the
+        stream to pass that fence, and drain the CPU task queue before any tuple
+        is dropped. The pinned allocator only guards a block until its last copy,
+        and the next tuple's torch.zeros writes reused blocks from the host.
         """
         submitters = list(cls.pending_submitters.values())
         cls.pending_submitters.clear()
@@ -254,6 +274,7 @@ class KExpertsCPUBuffer:
         for cpu_infer, cuda_stream in submitters:
             if cuda_stream is not None:
                 cpu_infer.sync_with_cuda_stream(cuda_stream, 0)
+                _wait_cuda_stream_on_host(cuda_stream, device)
             cpuinfer_seen[id(cpu_infer)] = cpu_infer
         # Belt for host-side submits (no stream fence involved): drain the queue
         # directly so no enqueue-eagerly task survives either.
@@ -278,7 +299,7 @@ class KExpertsCPUBuffer:
         # memory: garbage qlen merges, stale dst writes, SIGSEGV or silent
         # corruption). Drain them first; after this point no task can reference
         # the old tuple.
-        cls._quiesce()
+        cls._quiesce(hidden_states.device)
 
         input_tensor_cpu = [
             torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
