@@ -1,9 +1,11 @@
 """Check NVFP4 AMX, vector, and weight-layout numerical agreement.
 
-NVFP4 shares MXFP4's E2M1 nibble packing but carries one E4M3x-global scale
-per 16 K values (folded to bf16 by the loader) instead of one ue8m0 scale per
-32. All AMX prefill / AVX512 decode / weight-layout combinations must agree
-with a float32 dequantization reference.
+NVFP4 shares MXFP4's E2M1 nibble packing but carries one E4M3 block scale per
+16 K values times a per-tensor fp32 global, instead of one ue8m0 scale per 32.
+The block scales go in as exact bf16 e4m3 values and the globals separately
+(MOEConfig.*_global_scales), as the AMX wrapper loads real checkpoints. All AMX
+prefill / AVX512 decode / weight-layout combinations must agree with a float32
+dequantization reference, and AMX with AVX512 to bit-close parity.
 """
 
 import os
@@ -30,14 +32,31 @@ def make_nvfp4_rows(experts, rows, cols):
     packed = torch.randint(
         0, 256, (experts, rows, cols // 2), dtype=torch.uint8
     ).contiguous()
-    # bf16-folded scales must survive the kernel's exact-roundtrip validation,
-    # and should not degrade into powers of two (which would let an e8 path
-    # mask NVFP4-specific bugs).
-    scales = (
-        (torch.rand(experts, rows, cols // 16) * 1.5 + 0.25)
-        * (2.0 ** torch.randint(-6, -3, (experts, rows, cols // 16)))
-    ).to(torch.bfloat16).contiguous()
-    return packed, scales
+    # Real e4m3 block scales (exact in bf16) and non-power-of-two globals, like
+    # GLM-5.3's; powers of two would let an e8 path mask NVFP4-specific bugs.
+    block = (
+        (torch.rand(experts, rows, cols // 16) * 216 + 8)
+        .to(torch.float8_e4m3fn)
+        .float()
+        .to(torch.bfloat16)
+        .contiguous()
+    )
+    globals_ = ((torch.rand(experts) * 0.5 + 0.75) * 2.0**-11).tolist()
+    return packed, block, globals_
+
+
+def assert_amx_matches_avx512(actual, expected):
+    """AMX vs AVX512 at the shared FP4 parity tolerance (atol 5e-4, rtol 5e-3).
+
+    bf16(fp4 * e4m3) is exact, so both paths compute the same products; they sum
+    them in different orders, so a rare bf16 rounding flip in an intermediate
+    (<= 0.03% of outputs measured, one bf16 step) is the only allowed deviation.
+    Folding the global into the block scales breaks ~35% of outputs and 3e-2.
+    """
+    diff = (actual.float() - expected.float()).abs()
+    outside = diff > 5e-4 + 5e-3 * expected.float().abs()
+    assert outside.float().mean().item() <= 1e-3, f"{int(outside.sum())} outputs outside tolerance"
+    assert diff.max().item() <= 1.6e-2, f"max abs diff {diff.max().item():.3e}"
 
 
 def _run(backend, expert_counts, weight_layout, hidden, intermediate):
@@ -48,11 +67,12 @@ def _run(backend, expert_counts, weight_layout, hidden, intermediate):
 
     torch.manual_seed(17)
     experts, qlen = 2, 64
-    gate_packed, gate_scale = make_nvfp4_rows(experts, intermediate, hidden)
-    up_packed, up_scale = make_nvfp4_rows(experts, intermediate, hidden)
-    down_packed, down_scale = make_nvfp4_rows(experts, hidden, intermediate)
+    gate_packed, gate_scale, gate_global = make_nvfp4_rows(experts, intermediate, hidden)
+    up_packed, up_scale, up_global = make_nvfp4_rows(experts, intermediate, hidden)
+    down_packed, down_scale, down_global = make_nvfp4_rows(experts, hidden, intermediate)
     packed = [gate_packed, up_packed, down_packed]
     scales = [gate_scale, up_scale, down_scale]
+    global_scales = [gate_global, up_global, down_global]
 
     pool = ext.CPUInfer(16)
     config = ext.moe.MOEConfig(experts, 1, hidden, intermediate, 0)
@@ -66,6 +86,7 @@ def _run(backend, expert_counts, weight_layout, hidden, intermediate):
     config.quant_config.bits = 4
     config.quant_config.group_size = 16
     config.quant_config.zero_point = False
+    config.gate_global_scales, config.up_global_scales, config.down_global_scales = global_scales
     config.pool = pool.backend_
     moe = ext.moe.AMXFP4_KGroup_MOE(config)
     mapping = torch.arange(experts, dtype=torch.int64)
@@ -104,11 +125,8 @@ def _run(backend, expert_counts, weight_layout, hidden, intermediate):
     result["decode"] = forward(moe)[:1]
 
     if weight_layout == "1":
-        # Both layouts must agree on the same random weights and routes.
-        # Each layout folds scales identically -- bf16(fp4*scale) -- through
-        # independent packers, so agreement is near bit-close; keep a small
-        # slack budget for independent fold-path assembly while each layout
-        # separately tracks the float32 reference in the test body.
+        # Both layouts must agree on the same random weights and routes; each
+        # also tracks the float32 reference separately in the test body.
         os.environ["KT_NVFP4_KMAJOR_WEIGHTS"] = "0"
         row_moe = ext.moe.AMXFP4_KGroup_MOE(config)
         pool.submit(row_moe.load_weights_task(mapping.data_ptr()))
@@ -123,7 +141,7 @@ def _run(backend, expert_counts, weight_layout, hidden, intermediate):
         result["small_prefill"] = forward(moe)[:8]
         result["row_small_prefill"] = forward(row_moe)[:8]
 
-    return result, packed, scales, inputs, ids, weights
+    return result, packed, scales, global_scales, inputs, ids, weights
 
 
 def child_main():
@@ -156,22 +174,17 @@ def test_nvfp4_amx_prefill_matches_avx512(
         )
         for backend in ("0", "1")
     }
-    fallback, packed, scales, inputs, ids, weights = results["0"]
+    fallback, packed, scales, global_scales, inputs, ids, weights = results["0"]
     amx = results["1"][0]
 
     actual = amx["prefill"]
     assert torch.isfinite(actual).all()
-    # NVFP4 AMX folds the per-16 scales into bf16(fp4*scale) while the AVX512
-    # path applies scales in fp32 after each dot: one bf16 product rounding per
-    # K contribution accumulates to ~8e-3 max abs at qlen 64 / k <= 1152 (and
-    # grows with k). Budget that fold explicitly here; the float32-reference
-    # check below remains the accuracy standard (~0.5% mean error measured
-    # against a 2% budget).
-    torch.testing.assert_close(actual, fallback["prefill"], atol=2e-2, rtol=5e-3)
+    assert_amx_matches_avx512(actual, fallback["prefill"])
 
     qlen = inputs.shape[0]
     gate, up, down = [
-        unpack_nvfp4(weight, scale) for weight, scale in zip(packed, scales)
+        unpack_nvfp4(weight, scale) * torch.tensor(glob).view(-1, 1, 1)
+        for weight, scale, glob in zip(packed, scales, global_scales)
     ]
     reference = torch.zeros(qlen, hidden, dtype=torch.float32)
     for expert in range(2):

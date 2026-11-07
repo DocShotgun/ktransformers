@@ -287,8 +287,9 @@ struct GemmKernel224MXFP4SmallKGroup {
     bool scale_e8_valid = false;
     bool scale_e8_vector_safe = false;
     bool kmajor_weights = false;
-    // NVFP4 (k_group_size 16) scales arrive folded to BF16 by the loader.
-    // After validation, compact the FP32 slots to BF16 in-place and keep a
+    // NVFP4 (k_group_size 16) scales arrive as BF16: exact e4m3 block scales
+    // when the global is applied separately (gate/up/down_global_scale), or
+    // block x global rounded to BF16 when folded. After validation, compact the FP32 slots to BF16 in-place and keep a
     // transposed per-(group, 32-channel) BF16 copy in the freed tail; the
     // compact copy (n*k/16 bf16) plus the kmajor copy (n*k/16 bf16) exactly
     // fill the FP32 slot area (n*k/16 fp32), so host RAM is unchanged.
@@ -464,9 +465,8 @@ struct GemmKernel224MXFP4SmallKGroup {
       }
     }
 
-    // NVFP4 per-16 scales arrive folded to BF16 by the loader (exact for the
-    // e4m3 x fp32 products it generates). Compact the FP32 slots to BF16
-    // in-place -- forward compression stays overlap-safe, bytes 2i and 2i+1
+    // NVFP4 per-16 scales arrive as BF16 values (see scale_nv_compact). Compact
+    // the FP32 slots to BF16 in-place -- forward compression stays overlap-safe, bytes 2i and 2i+1
     // are always written below the first byte of every not-yet-read float
     // j > i -- and place a transposed per-(group, 32-channel) BF16 copy in
     // the freed tail.
@@ -1484,14 +1484,9 @@ inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
     GemmKernel224MXFP4SmallKGroup::fp4_mat_mat_kgroup_amx(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth);
     return;
   }
-  // NVFP4 packers fold the per-16 scales into bf16(fp4*scale) while the
-  // AVX512 paths apply scales in fp32 after each dot, so AMX prefill output
-  // wobbles ~8e-3 max abs (one bf16 product rounding per K contribution,
-  // measured at every shape and block width) against AVX512 -- well within
-  // the float32-reference accuracy budget (~0.5% mean error against a 2%
-  // budget) but above bit-close parity, so NVFP4 parity comparisons budget
-  // this fold explicitly. MXFP4's e8 scales are powers of two, so its fold
-  // is exact and unaffected.
+  // The NVFP4 packers fold the per-16 scale into bf16(fp4 * scale). That is
+  // exact for e4m3 block scales (at most 6 significant bits), i.e. whenever the
+  // global scale is applied separately; folded block x global scales round it.
   static const bool nvfp4_amx = cached_env_flag("KT_NVFP4_PREFILL_AMX");
   if (nvfp4_amx &&
       m >= 16 && n >= GemmKernel224MXFP4SmallKGroup::N_STEP && k >= GemmKernel224MXFP4SmallKGroup::N_STEP &&
@@ -1543,6 +1538,43 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
   bool should_allocate_expert_weights(int expert_idx) const {
     return !config_.should_skip_expert(expert_idx);
   }
+
+  float gate_global_scale(int expert_idx) const { return gate_global_.empty() ? 1.0f : gate_global_[expert_idx]; }
+  float up_global_scale(int expert_idx) const { return up_global_.empty() ? 1.0f : up_global_[expert_idx]; }
+  float down_global_scale(int expert_idx) const { return down_global_.empty() ? 1.0f : down_global_[expert_idx]; }
+
+ private:
+  // config_.*_global_scales by physical expert; empty when none were given.
+  std::vector<float> gate_global_;
+  std::vector<float> up_global_;
+  std::vector<float> down_global_;
+
+  void resolve_global_scales(const uint64_t* physical_to_logical_map) {
+    const auto& gate = config_.gate_global_scales;
+    const auto& up = config_.up_global_scales;
+    const auto& down = config_.down_global_scales;
+    gate_global_.clear();
+    up_global_.clear();
+    down_global_.clear();
+    if (gate.empty() && up.empty() && down.empty()) return;
+    if (config_.quant_config.group_size != 16)
+      throw std::runtime_error("FP4 global scales are only valid for NVFP4 (group_size 16)");
+    if (gate.size() != up.size() || gate.size() != down.size())
+      throw std::runtime_error("FP4 gate/up/down global scale counts differ");
+    gate_global_.assign(config_.expert_num, 1.0f);
+    up_global_.assign(config_.expert_num, 1.0f);
+    down_global_.assign(config_.expert_num, 1.0f);
+    for (int expert = 0; expert < config_.expert_num; ++expert) {
+      if (config_.should_skip_expert(expert)) continue;
+      const uint64_t logical = expert_map(physical_to_logical_map, expert);
+      if (logical >= gate.size()) throw std::runtime_error("FP4 global scale missing for a CPU expert");
+      gate_global_[expert] = gate[logical];
+      up_global_[expert] = up[logical];
+      down_global_[expert] = down[logical];
+    }
+  }
+
+ public:
 
   ~AMX_FP4_MOE_TP() = default;
 
@@ -1648,6 +1680,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     if (quant_config.group_size == 0 || quant_config.zero_point)
       throw std::runtime_error("FP4 (MXFP4/NVFP4) MoE only support KGroup FP4.");
     if (config_.gate_scale == nullptr) throw std::runtime_error("FP4 (MXFP4/NVFP4) MoE only support load native weight.");
+    resolve_global_scales(physical_to_logical_map);
 
     int nth = T::recommended_nth(config_.intermediate_size);
     pool->do_work_stealing_job(
@@ -2005,6 +2038,12 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
     if (w13_weight_ptrs.size() != gpu_tp_count || w13_scale_ptrs.size() != gpu_tp_count ||
         w2_weight_ptrs.size() != gpu_tp_count || w2_scale_ptrs.size() != gpu_tp_count)
       throw std::runtime_error("Pointer arrays size must match gpu_tp_count");
+    // GPU-resident experts have no CPU weight buffers.
+    if (this->config.should_skip_expert(expert_id))
+      throw std::runtime_error("write_weight_scale_to_buffer: expert is not CPU-resident");
+    // The exported block scales would lack the global factor the GPU expects.
+    if (!this->config.gate_global_scales.empty())
+      throw std::runtime_error("write_weight_scale_to_buffer: NVFP4 with separate global scales is unsupported");
 
     this->config.pool->dispense_backend()->do_numa_job([&, this](int i) {
       this->tps[i]->write_weights_to_buffer(gpu_tp_count, this->tp_count, expert_id, this->config, w13_weight_ptrs,

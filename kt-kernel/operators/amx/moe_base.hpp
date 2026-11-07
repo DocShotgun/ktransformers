@@ -441,7 +441,7 @@ class AMX_MOE_BASE {
               continue;
             }
             sources.push_back(m_local_down_output_ptr_[expert] + m_local_pos_[i][j] * config_.hidden_size);
-            route_weights.push_back(weights[i * k + j]);
+            route_weights.push_back(weights[i * k + j] * derived_const()->down_global_scale(expert));
           }
           for (int e = 0; e < config_.hidden_size; e += 32) {
             __m512 x0 = _mm512_setzero_ps();
@@ -651,7 +651,7 @@ class AMX_MOE_BASE {
         continue;
       }
       sources.push_back(m_local_down_output_ptr_[expert_ids[j]] + m_local_pos_[0][j] * config_.hidden_size);
-      route_weights.push_back(weights[j]);
+      route_weights.push_back(weights[j] * derived_const()->down_global_scale(expert_ids[j]));
     }
     for (int e = 0; e < config_.hidden_size; e += 32) {
       __m512 x0 = _mm512_setzero_ps();
@@ -710,6 +710,23 @@ class AMX_MOE_BASE {
     return true;
   }
 
+  // Per-tensor multipliers for the gate/up GEMM outputs (applied before the
+  // activation and its clamp) and the down output (folded into the routing
+  // weight), by physical expert. Exactly 1.0f, a bit-exact no-op, unless a
+  // backend keeps NVFP4 global scales out of its block scales.
+  float gate_global_scale(int expert_idx) const {
+    (void)expert_idx;
+    return 1.0f;
+  }
+  float up_global_scale(int expert_idx) const {
+    (void)expert_idx;
+    return 1.0f;
+  }
+  float down_global_scale(int expert_idx) const {
+    (void)expert_idx;
+    return 1.0f;
+  }
+
   void derived_init() {
     // Default implementation does nothing - derived classes can override
   }
@@ -744,6 +761,8 @@ class AMX_MOE_BASE {
       int expert_idx = m_expert_id_map_[task_id / nth];
       int ith = task_id % nth;
       auto [n_start, n_end] = T::split_range_n(config_.intermediate_size, ith, nth);
+      const __m512 gate_scale = _mm512_set1_ps(derived_const()->gate_global_scale(expert_idx));
+      const __m512 up_scale = _mm512_set1_ps(derived_const()->up_global_scale(expert_idx));
       for (int i = 0; i < m_local_num_[expert_idx]; i++) {
         ggml_bf16_t* gate_output_ptr = &m_local_gate_output_ptr_[expert_idx][i * config_.intermediate_size];
         ggml_bf16_t* up_output_ptr = &m_local_up_output_ptr_[expert_idx][i * config_.intermediate_size];
@@ -752,6 +771,10 @@ class AMX_MOE_BASE {
           __m512 gate_val0, gate_val1, up_val0, up_val1;
           avx512_32xbf16_to_32xfp32((__m512i*)(gate_output_ptr + j), &gate_val0, &gate_val1);
           avx512_32xbf16_to_32xfp32((__m512i*)(up_output_ptr + j), &up_val0, &up_val1);
+          gate_val0 = _mm512_mul_ps(gate_val0, gate_scale);
+          gate_val1 = _mm512_mul_ps(gate_val1, gate_scale);
+          up_val0 = _mm512_mul_ps(up_val0, up_scale);
+          up_val1 = _mm512_mul_ps(up_val1, up_scale);
           __m512 result0 = amx::act_fn(gate_val0, up_val0, config_.swiglu_limit, config_.swiglu_alpha);
           __m512 result1 = amx::act_fn(gate_val1, up_val1, config_.swiglu_limit, config_.swiglu_alpha);
           avx512_32xfp32_to_32xbf16(&result0, &result1, (__m512i*)(destination_ptr + j));

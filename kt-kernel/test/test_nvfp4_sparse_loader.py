@@ -136,3 +136,26 @@ def test_nvfp4_fold_matches_fp64(tmp_path, naming, global_suffix):
     ) @ activation
     cosine = F.cosine_similarity(reference, folded_out, dim=0)
     assert cosine >= 0.99999
+
+@pytest.mark.parametrize("global_suffix", ("weight_scale_2", None))
+def test_nvfp4_unfolded_scales_are_exact(tmp_path, global_suffix):
+    """fold_global_scale=False must return the e4m3 block scales bit-exactly
+    plus one fp32 global per expert, so a backend applying the global in fp32
+    reproduces e4m3 * global with no bf16 rounding of the product."""
+    make_checkpoint(tmp_path, global_suffix=global_suffix)
+    loader = NVFP4SafeTensorLoader(str(tmp_path))
+    mask = torch.tensor([False, True, False])
+    weights = loader.load_experts("model.layers.7", gpu_experts_mask=mask, fold_global_scale=False)
+
+    prefix, proj_names, block_suffix = NAMINGS["hf_mlp"]
+    for proj_idx, key in enumerate(("gate", "up", "down")):
+        assert weights[f"{key}_global"][1] is None
+        for expert in (0, 2):
+            pfx = f"{prefix}.{expert}.{proj_names[proj_idx]}"
+            block = loader.load_tensor(f"{pfx}.{block_suffix}").to(torch.float32)
+            scale = weights[f"{key}_scale"][expert]
+            assert scale.dtype == torch.bfloat16
+            assert torch.equal(scale.float(), block)
+            # The checkpoint stores the global as float32; an absent one is 1.0.
+            expected_global = torch.tensor(0.0123, dtype=torch.float32).item() if global_suffix else 1.0
+            assert weights[f"{key}_global"][expert] == expected_global

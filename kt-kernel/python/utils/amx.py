@@ -811,9 +811,20 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 raise ValueError("physical_to_logical_map_cpu contains an invalid GPU expert mapping")
             gpu_logical_experts_mask = torch.zeros(self.num_experts, dtype=torch.bool)
             gpu_logical_experts_mask[gpu_logical_experts] = True
+        # AMX FP4 applies NVFP4 global scales in fp32 (exact block scales); other
+        # FP4 backends need them folded into the block scales by the loader.
+        nvfp4_separate_globals = (
+            self.method == "NVFP4" and AMXFP4_KGroup_MOE is not None and _select_mxfp4_backend() is AMXFP4_KGroup_MOE
+        )
         for base_key in _candidates:
             try:
-                if self.method in ("MXFP4", "NVFP4", "MXFP8"):
+                if self.method == "NVFP4":
+                    weights = loader.load_experts(
+                        base_key,
+                        gpu_experts_mask=gpu_logical_experts_mask,
+                        fold_global_scale=not nvfp4_separate_globals,
+                    )
+                elif self.method in ("MXFP4", "MXFP8"):
                     weights = loader.load_experts(
                         base_key, gpu_experts_mask=gpu_logical_experts_mask
                     )
@@ -965,9 +976,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
             self.moe = backend_cls(moe_config)
         elif self.method == "NVFP4":
             # NVFP4: same E2M1 nibble packing as MXFP4, but a per-16 block scale
-            # in E4M3 times a per-tensor global scale. The loader has already
-            # folded both into one bf16 scale per group, so the FP4 kernel runs
-            # this unchanged -- only group_size differs (16 vs 32).
+            # in E4M3 times a per-tensor global scale; only group_size differs
+            # (16 vs 32). AMX FP4 gets exact block scales plus the globals
+            # (applied in fp32); other backends get them folded by the loader.
             group_size = self.hidden_size // scale_sample.shape[1]
             if group_size != 16:
                 raise RuntimeError(
@@ -984,6 +995,13 @@ class NativeMoEWrapper(BaseMoEWrapper):
                     "No FP4 backend available for NVFP4 after runtime selection. "
                     "Compile with AVX512_BF16 (AMXFP4_KGroup_MOE) or AVX2 (AVX2MXFP4_MOE)."
                 )
+            if nvfp4_separate_globals:
+                if backend_cls is not AMXFP4_KGroup_MOE:
+                    raise RuntimeError("NVFP4 scales were loaded unfolded for AMX FP4, but another backend was selected")
+                # Indexed by logical expert like the scale pointers; GPU experts load none.
+                moe_config.gate_global_scales = [1.0 if g is None else g for g in weights["gate_global"]]
+                moe_config.up_global_scales = [1.0 if g is None else g for g in weights["up_global"]]
+                moe_config.down_global_scales = [1.0 if g is None else g for g in weights["down_global"]]
             self.moe = backend_cls(moe_config)
         elif self.method == "MXFP8":
             # MXFP8: FP8 E4M3fn byte weights, ue8m0/uint8 per-32 group scale

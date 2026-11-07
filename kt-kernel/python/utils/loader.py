@@ -1478,10 +1478,11 @@ class NVFP4SafeTensorLoader(SafeTensorLoader):
 
         scale[n, g] = float(e4m3(weight_scale[n, g])) * weight_scale_2
 
-    bf16 is lossy for E4M3 products (8 mantissa bits down to 7), which is what
-    the kernel's own group-32 MXFP4 path already accepts; measured against a
-    float64 dequant of the same bytes the end-to-end error is bf16-rounding
-    only (cosine 0.999993 on Ornith-1.5-35B-A3B-NVFP4).
+    bf16 is lossy for E4M3 x fp32 products (up to ~0.3% per group on GLM-5.3
+    checkpoints, whose globals are not powers of two). With
+    `fold_global_scale=False` the block scales are returned as exact bf16 e4m3
+    values and the globals separately (`*_global`, one float per expert), for
+    backends that apply them in fp32 (AMX FP4 via `MOEConfig.*_global_scales`).
     """
 
     @staticmethod
@@ -1495,6 +1496,7 @@ class NVFP4SafeTensorLoader(SafeTensorLoader):
         base_key: str,
         device: str = "cpu",
         gpu_experts_mask: torch.Tensor | None = None,
+        fold_global_scale: bool = True,
     ):
         layout = resolve_experts_layout(self, base_key, family="nvfp4")
         if layout is None:
@@ -1521,14 +1523,17 @@ class NVFP4SafeTensorLoader(SafeTensorLoader):
         gate_scales = [None] * expert_count
         up_scales = [None] * expert_count
         down_scales = [None] * expert_count
+        gate_globals = [None] * expert_count
+        up_globals = [None] * expert_count
+        down_globals = [None] * expert_count
 
         for exp_id in range(expert_count):
             if skipped_experts[exp_id]:
                 continue
-            for proj_idx, wdst, sdst in (
-                (0, gate_weights, gate_scales),
-                (1, up_weights, up_scales),
-                (2, down_weights, down_scales),
+            for proj_idx, wdst, sdst, gdst in (
+                (0, gate_weights, gate_scales, gate_globals),
+                (1, up_weights, up_scales, up_globals),
+                (2, down_weights, down_scales, down_globals),
             ):
                 w = self.load_tensor(layout.weight_key(exp_id, proj_idx), device).contiguous()
                 if w.dtype != torch.uint8:
@@ -1542,14 +1547,19 @@ class NVFP4SafeTensorLoader(SafeTensorLoader):
                     if gs_key is not None
                     else torch.ones((), dtype=torch.float32, device=device)
                 )
-                sdst[exp_id] = self._fold_scales_to_bf16(bs, gs)
+                if fold_global_scale:
+                    sdst[exp_id] = self._fold_scales_to_bf16(bs, gs)
+                else:
+                    # e4m3 has 4 significant bits, so this bf16 copy is exact.
+                    sdst[exp_id] = bs.to(torch.float32).to(torch.bfloat16).contiguous()
+                    gdst[exp_id] = float(gs.to(torch.float32).reshape(()))
 
         loaded_expert_count = expert_count - sum(skipped_experts)
         print(
             f"[NVFP4SafeTensorLoader] Loaded {loaded_expert_count}/{expert_count} "
             f"CPU experts from {prefix}"
         )
-        return {
+        result = {
             "gate": gate_weights,
             "up": up_weights,
             "down": down_weights,
@@ -1557,6 +1567,9 @@ class NVFP4SafeTensorLoader(SafeTensorLoader):
             "up_scale": up_scales,
             "down_scale": down_scales,
         }
+        if not fold_global_scale:
+            result.update(gate_global=gate_globals, up_global=up_globals, down_global=down_globals)
+        return result
 
 
 class MXFP8SafeTensorLoader(SafeTensorLoader):

@@ -336,6 +336,13 @@ struct GeneralMOEConfig {
   // both gate and up (±swiglu_limit). 0.0f = disabled (standard silu path).
   float swiglu_alpha = 0.0f;
 
+  // NVFP4 per-tensor global scales, one per logical expert, applied in fp32
+  // outside the GEMMs so the per-16 block scales stay exact e4m3 values. Empty
+  // means the globals are already folded into the block scales. AMX FP4 only.
+  std::vector<float> gate_global_scales;
+  std::vector<float> up_global_scales;
+  std::vector<float> down_global_scales;
+
   GeneralMOEConfig() {}
 
   GeneralMOEConfig(int expert_num, int routed_expert_num, int hidden_size, int intermediate_size)

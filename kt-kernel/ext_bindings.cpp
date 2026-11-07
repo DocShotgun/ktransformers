@@ -963,6 +963,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       // V4-Flash 2604B SwiGLU clamp limit (0.0 = disabled). See common.hpp.
       .def_readwrite("swiglu_limit", &GeneralMOEConfig::swiglu_limit)
       .def_readwrite("swiglu_alpha", &GeneralMOEConfig::swiglu_alpha)
+      .def_readwrite("gate_global_scales", &GeneralMOEConfig::gate_global_scales)
+      .def_readwrite("up_global_scales", &GeneralMOEConfig::up_global_scales)
+      .def_readwrite("down_global_scales", &GeneralMOEConfig::down_global_scales)
 
       ;
 
