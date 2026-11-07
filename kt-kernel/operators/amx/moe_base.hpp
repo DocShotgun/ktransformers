@@ -777,10 +777,12 @@ class AMX_MOE_BASE {
 // TP_MOE specialization for AMX_MOE_BASE derived classes
 // ============================================================================
 
+// Parts must be constructed as Derived (as the AVX2 TP does): derived() casts
+// to it, so building only the base is UB once Derived has data members.
 template <class T, class Derived>
-class TP_MOE<AMX_MOE_BASE<T, Derived>> : public TP_MOE_Common<AMX_MOE_BASE<T, Derived>> {
+class TP_MOE<AMX_MOE_BASE<T, Derived>> : public TP_MOE_Common<AMX_MOE_BASE<T, Derived>, Derived> {
  public:
-  using TP_MOE_Common<AMX_MOE_BASE<T, Derived>>::TP_MOE_Common;
+  using TP_MOE_Common<AMX_MOE_BASE<T, Derived>, Derived>::TP_MOE_Common;
 
   // Default load_weights implementation - can be overridden by derived TP_MOE classes
   void load_weights() override { throw std::runtime_error("Not Implemented"); }
