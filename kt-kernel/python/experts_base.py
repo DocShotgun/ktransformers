@@ -159,38 +159,6 @@ def _wait_device(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def _is_capturing(device: torch.device) -> bool:
-    """True inside a graph capture on ``device``'s current stream or sglang's."""
-    if _sglang_is_capture_mode():
-        return True
-    if device.type == "cuda":
-        return torch.cuda.is_current_stream_capturing()
-    if device.type == "npu":
-        try:
-            return bool(torch.npu.is_current_stream_capturing())
-        except Exception:
-            return False
-    return False
-
-
-def _wait_cuda_stream_on_host(cuda_stream, device: torch.device) -> None:
-    """Block the host until everything queued so far on a CUDA submit stream ran.
-
-    Only that stream is waited on, not the whole device. No-op off CUDA and
-    during graph capture, where a host wait would raise (see ``_wait_device``).
-    """
-    if device.type != "cuda" or torch.cuda.is_current_stream_capturing() or _sglang_is_capture_mode():
-        return
-    stream = (
-        cuda_stream
-        if isinstance(cuda_stream, torch.cuda.Stream)
-        else torch.cuda.ExternalStream(int(cuda_stream), device=device)
-    )
-    event = torch.cuda.Event()
-    event.record(stream)
-    event.synchronize()
-
-
 def generate_gpu_experts_masks(
     activation_freq: torch.Tensor,
     num_gpu_experts: int,
@@ -246,126 +214,136 @@ def generate_gpu_experts_masks(
 
 
 class KExpertsCPUBuffer:
-    """
-    CPU buffer management for expert computation.
+    """Pinned buffers that carry one MoE layer's tokens to the CPU experts, and the
+    device buffer the result comes back to.
 
-    Manages pinned memory buffers for efficient GPU-CPU data transfer.
+    Each (hidden size, top-k) has one host arena and each (hidden size, device,
+    dtype) one device arena, ``buffer_depth`` slots deep and ``max_rows`` tall;
+    every batch gets ``[:rows]`` views of them. Arenas are never freed, because
+    captured graphs bake their pointers and CPU tasks run after the host has moved
+    on. Reuse needs no host wait: each access is ordered on the submit stream (D2H
+    copy, host callback enqueues the task, task, sync callback, H2D copy).
     """
 
-    capture_bs: List = list()
-    capture_buffers: Dict = dict()
-    temp_bs: int = 0
-    temp_buffer: tuple = tuple()
     buffer_depth: int = 2
+    # Kept for callers that report their capture sizes (sglang's decode runner);
+    # every size shares the arenas, so nothing is keyed by it.
+    capture_bs: List = list()
 
-    # (cpuinfer, stream) pairs with submits whose deferred tasks may still
-    # reference temp_buffer. Cleared by _quiesce(); see get_buffer below.
-    pending_submitters: Dict = dict()
+    _host_arenas: Dict[tuple, dict] = {}
+    _device_arenas: Dict[tuple, dict] = {}
+    # Per-row-count qlen scalars, one per slot. SFT tasks read them when they run,
+    # so they must stay put.
+    _qlen: Dict[int, List[torch.Tensor]] = {}
+    _views: Dict[tuple, tuple] = {}
+    # Outgrown arenas: captured graphs and queued tasks may still point into them.
+    _retired: List[dict] = []
 
     @classmethod
-    def _note_pending_submitter(cls, cpu_infer, cuda_stream) -> None:
-        stream_key = cuda_stream if isinstance(cuda_stream, int) else id(cuda_stream)
-        cls.pending_submitters[(id(cpu_infer), stream_key)] = (cpu_infer, cuda_stream)
+    def reserve(
+        cls,
+        max_rows: int,
+        hidden_size: int,
+        num_experts_per_tok: int,
+        device: Optional[torch.device] = None,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        """Allocate the arenas for up to ``max_rows`` rows now rather than at the
+        first forward, so that the caller's memory planning accounts for them."""
+        cls._host_arena(hidden_size, num_experts_per_tok, max_rows)
+        if device is not None:
+            cls._device_arena(hidden_size, device, dtype, max_rows)
 
     @classmethod
-    def _quiesce(cls, device: torch.device) -> None:
-        """Block until every submitted expert task has actually executed.
+    def _host_arena(cls, hidden_size: int, num_experts_per_tok: int, rows: int) -> dict:
+        key = (hidden_size, num_experts_per_tok)
+        arena = cls._host_arenas.get(key)
+        if arena is not None and arena["max_rows"] >= rows:
+            return arena
+        if arena is not None:
+            # At least doubling bounds the retired arenas below one final arena
+            # for callers that never reserve.
+            rows = max(rows, 2 * arena["max_rows"])
+            cls._retired.append(arena)
+            cls._views.clear()
 
-        ``submit_with_cuda_stream`` is fire-and-forget: it defers the task enqueue
-        to the CUDA host-callback thread, and the task then executes on the CPU
-        worker pool. Every tensor-backed task argument (expert ids, weights,
-        input, output) points into the pinned tensors of a buffer tuple, so a
-        tuple must outlive all tasks built against it. (The scalar qlen is
-        copied into the task at submit time.) Fence each submit stream (covered
-        backward through its queued host callbacks), wait on the host for the
-        stream to pass that fence, and drain the CPU task queue before any tuple
-        is dropped. The pinned allocator only guards a block until its last copy,
-        and the next tuple's torch.zeros writes reused blocks from the host.
-        """
-        submitters = list(cls.pending_submitters.values())
-        cls.pending_submitters.clear()
-        cpuinfer_seen = dict()
-        for cpu_infer, cuda_stream in submitters:
-            if cuda_stream is not None:
-                cpu_infer.sync_with_cuda_stream(cuda_stream, 0)
-                _wait_cuda_stream_on_host(cuda_stream, device)
-            cpuinfer_seen[id(cpu_infer)] = cpu_infer
-        # Belt for host-side submits (no stream fence involved): drain the queue
-        # directly so no enqueue-eagerly task survives either.
-        for cpu_infer in cpuinfer_seen.values():
-            cpu_infer.sync(0)
+        def pinned(shape, dtype):
+            return [torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True) for _ in range(cls.buffer_depth)]
+
+        deferred_ids = pinned((rows, num_experts_per_tok), torch.long)
+        for slot in deferred_ids:
+            slot.fill_(-1)
+        arena = {
+            "max_rows": rows,
+            "input": pinned((rows, hidden_size), torch.bfloat16),
+            "immediate_ids": pinned((rows, num_experts_per_tok), torch.long),
+            "deferred_ids": deferred_ids,
+            "weights": pinned((rows, num_experts_per_tok), torch.float32),
+            "output": pinned((rows, hidden_size), torch.bfloat16),
+        }
+        cls._host_arenas[key] = arena
+        return arena
+
+    @classmethod
+    def _device_arena(cls, hidden_size: int, device: torch.device, dtype: torch.dtype, rows: int) -> dict:
+        key = (hidden_size, torch.device(device), dtype)
+        arena = cls._device_arenas.get(key)
+        if arena is not None and arena["max_rows"] >= rows:
+            return arena
+        if arena is not None:
+            rows = max(rows, 2 * arena["max_rows"])
+            cls._retired.append(arena)
+            cls._views.clear()
+        arena = {
+            "max_rows": rows,
+            "output": [
+                torch.empty((rows, hidden_size), device=device, dtype=dtype) for _ in range(cls.buffer_depth)
+            ],
+        }
+        cls._device_arenas[key] = arena
+        return arena
+
+    @classmethod
+    def _qlen_tensors(cls, rows: int) -> List[torch.Tensor]:
+        tensors = cls._qlen.get(rows)
+        if tensors is None:
+            tensors = [
+                torch.full((1,), rows, device="cpu", dtype=torch.int32, pin_memory=True)
+                for _ in range(cls.buffer_depth)
+            ]
+            cls._qlen[rows] = tensors
+        return tensors
 
     @classmethod
     def get_buffer(cls, hidden_states: torch.Tensor, num_experts_per_tok):
         hidden_size = hidden_states.shape[-1]
-        batch_size = hidden_states.shape[0]
-
-        pin_memory = True
-
-        # A graph captured here bakes in this tuple's pointers, so the tuple must
-        # outlive the graph. Batch sizes outside capture_bs (sglang's decoder
-        # tail graphs, for one) are captured too, so keep any tuple handed out
-        # during a capture, not only the preset sizes.
-        capturing = _is_capturing(hidden_states.device)
-
-        if batch_size in cls.capture_buffers:
-            return cls.capture_buffers[batch_size]
-        if batch_size == cls.temp_bs:
-            if capturing:
-                cls.capture_buffers[batch_size] = cls.temp_buffer
-            return cls.temp_buffer
-
-        # Batch size changed -> the previous temp tuple is about to be dropped,
-        # but fire-and-forget tasks built against it may not have executed yet
-        # (and their exec-time qlen/dst reads and writes then hit freed pinned
-        # memory: garbage qlen merges, stale dst writes, SIGSEGV or silent
-        # corruption). Drain them first; after this point no task can reference
-        # the old tuple.
-        cls._quiesce(hidden_states.device)
-
-        input_tensor_cpu = [
-            torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
-            for _ in range(cls.buffer_depth)
-        ]
-        immediate_experts_ids_cpu = [
-            torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.long, pin_memory=pin_memory)
-            for _ in range(cls.buffer_depth)
-        ]
-        deferred_experts_ids_cpu = [
-            torch.full((batch_size, num_experts_per_tok), -1, device="cpu", dtype=torch.long, pin_memory=pin_memory)
-            for _ in range(cls.buffer_depth)
-        ]
-        weights_cpu = [
-            torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.float32, pin_memory=pin_memory)
-            for _ in range(cls.buffer_depth)
-        ]
-        output_cpu = [
-            torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
-            for _ in range(cls.buffer_depth)
-        ]
-        bsz_tensor_cpu = [
-            torch.full((1,), batch_size, device="cpu", dtype=torch.int32, pin_memory=pin_memory)
-            for _ in range(cls.buffer_depth)
-        ]
-        output_gpu = [
-            torch.zeros((batch_size, hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
-            for _ in range(cls.buffer_depth)
-        ]
-
-        cur_buffer = (
-            input_tensor_cpu,
-            immediate_experts_ids_cpu,
-            deferred_experts_ids_cpu,
-            weights_cpu,
-            output_cpu,
-            bsz_tensor_cpu,
-            output_gpu,
+        rows = hidden_states.shape[0]
+        key = (hidden_size, num_experts_per_tok, hidden_states.device, hidden_states.dtype, rows)
+        views = cls._views.get(key)
+        if views is not None:
+            return views
+        host = cls._host_arena(hidden_size, num_experts_per_tok, rows)
+        device = cls._device_arena(hidden_size, hidden_states.device, hidden_states.dtype, rows)
+        views = (
+            [t[:rows] for t in host["input"]],
+            [t[:rows] for t in host["immediate_ids"]],
+            [t[:rows] for t in host["deferred_ids"]],
+            [t[:rows] for t in host["weights"]],
+            [t[:rows] for t in host["output"]],
+            cls._qlen_tensors(rows),
+            [t[:rows] for t in device["output"]],
         )
-        if batch_size in cls.capture_bs or capturing:
-            cls.capture_buffers[batch_size] = cur_buffer
-        cls.temp_bs = batch_size
-        cls.temp_buffer = cur_buffer
-        return cur_buffer
+        cls._views[key] = views
+        return views
+
+    @classmethod
+    def clear(cls) -> None:
+        """Drop every arena. Only safe once no graph or task can still use them."""
+        cls._host_arenas.clear()
+        cls._device_arenas.clear()
+        cls._qlen.clear()
+        cls._views.clear()
+        cls._retired.clear()
 
 
 class _MoEBase:
@@ -461,6 +439,9 @@ class BaseMoEWrapper(_MoEBase, ABC):
     """
 
     _layer_has_pending_deferred: Dict[int, bool] = {}
+    # Buffer slot -> layer whose submit_forward() there has no sync_forward() yet.
+    # Two forwards interleaving on one slot would overwrite each other's inputs.
+    _slot_in_flight: Dict[int, int] = {}
 
     def __init__(
         self,
@@ -525,7 +506,24 @@ class BaseMoEWrapper(_MoEBase, ABC):
         # This will be lazily initialized when needed
         self._gpu_experts_mask_gpu: Optional[torch.Tensor] = None
         self.weight_path = weight_path
+        # The C++ MoE buffers are sized by it (MOEConfig.max_len), so chunked
+        # prefill must be on.
+        if chunked_prefill_size is None or chunked_prefill_size <= 0:
+            raise ValueError(
+                f"kt-kernel needs a positive chunked_prefill_size (got {chunked_prefill_size}); "
+                "chunked prefill cannot be disabled with KT experts"
+            )
         self.chunked_prefill_size = chunked_prefill_size
+        # Allocate the CPU transfer buffers now, inside the caller's memory
+        # planning, instead of at the first forward. Pinning needs a CUDA
+        # context, so reserve only where one already exists (sglang).
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            KExpertsCPUBuffer.reserve(
+                chunked_prefill_size,
+                hidden_size,
+                num_experts_per_tok,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
         self.cpu_save = cpu_save
         self.max_deferred_experts_per_token = (
             int(max_deferred_experts_per_token) if max_deferred_experts_per_token is not None else 0
@@ -755,8 +753,6 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 self.cpu_infer.submit_with_cuda_stream(cuda_stream, deferred_task)
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
-        KExpertsCPUBuffer._note_pending_submitter(self.cpu_infer, cuda_stream)
-
     def run_pinned_forward_sync(
         self,
         hidden_states: torch.Tensor,
@@ -813,9 +809,6 @@ class BaseMoEWrapper(_MoEBase, ABC):
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
         allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
         self.cpu_infer.sync(allow_pending)
-        # Host-side submits only (cuda_stream intentionally unused above); a
-        # partial drain (allow_pending == 1) can leave a deferred task queued.
-        KExpertsCPUBuffer._note_pending_submitter(self.cpu_infer, None)
 
     def submit_forward(
         self,
@@ -833,9 +826,17 @@ class BaseMoEWrapper(_MoEBase, ABC):
             topk_weights: Top-k expert weights [batch_size, num_experts_per_tok]
             cuda_stream: CUDA stream for synchronization
         """
+        slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
+        busy_layer = BaseMoEWrapper._slot_in_flight.get(slot)
+        if busy_layer is not None:
+            raise RuntimeError(
+                f"KT MoE layer {self.layer_idx} submitted into CPU buffer slot {slot} while layer "
+                f"{busy_layer}'s forward there was not synced yet; KT forwards must not interleave"
+            )
         _immediate_ids, deferred_ids, _buffers, current_slot, next_slot = self._prepare_forward_cpu_buffers(
             hidden_states, topk_ids, topk_weights
         )
+        BaseMoEWrapper._slot_in_flight[slot] = self.layer_idx
         (
             input_tensor_cpu,
             immediate_experts_ids_cpu,
@@ -906,8 +907,6 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 self.cpu_infer.submit_with_cuda_stream(cuda_stream, deferred_task)
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
-        KExpertsCPUBuffer._note_pending_submitter(self.cpu_infer, cuda_stream)
-
     def copy_forward_output_to_device(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Copy pinned CPU output to the device tensor (CPU work already finished)."""
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -967,6 +966,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 self.cpu_infer.sync(allow_pending)
             else:
                 self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
+        BaseMoEWrapper._slot_in_flight.pop(current_slot, None)
 
         return self.copy_forward_output_to_device(hidden_states)
 
@@ -995,10 +995,10 @@ class BaseMoEWrapper(_MoEBase, ABC):
     @staticmethod
     def set_capture_batch_sizes(capture_bs: List[int]):
         """
-        Set batch sizes to capture and cache buffers for.
+        Record the batch sizes the caller captures graphs for.
 
-        This allows pre-allocation of CPU buffers for specific batch sizes,
-        improving performance by avoiding buffer re-allocation during inference.
+        Kept for API compatibility: every batch size shares the same CPU transfer
+        buffers, which BaseMoEWrapper reserves for chunked_prefill_size rows.
 
         Args:
             capture_bs: List of batch sizes to capture (e.g., [1, 2, 4, 8, 16])
@@ -1023,10 +1023,8 @@ class BaseMoEWrapper(_MoEBase, ABC):
         """
         Clear all cached buffers.
 
-        This frees up memory by clearing the buffer cache. Useful when you want
-        to reset the buffer state or free memory.
+        This frees up memory by clearing the buffer cache. Only safe once no
+        captured graph or queued CPU task can still use the buffers.
         """
-        KExpertsCPUBuffer.capture_buffers.clear()
-        KExpertsCPUBuffer.temp_bs = 0
-        KExpertsCPUBuffer.temp_buffer = tuple()
+        KExpertsCPUBuffer.clear()
 

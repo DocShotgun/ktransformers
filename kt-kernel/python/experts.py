@@ -267,10 +267,10 @@ class KTMoEWrapper:
     @staticmethod
     def set_capture_batch_sizes(capture_bs: List[int]):
         """
-        Set batch sizes to capture and cache buffers for.
+        Record the batch sizes the caller captures graphs for.
 
-        This allows pre-allocation of CPU buffers for specific batch sizes,
-        improving performance by avoiding buffer re-allocation during inference.
+        Kept for API compatibility: every batch size shares the same CPU transfer
+        buffers, which BaseMoEWrapper reserves for chunked_prefill_size rows.
 
         Args:
             capture_bs: List of batch sizes to capture (e.g., [1, 2, 4, 8, 16])
@@ -292,8 +292,8 @@ class KTMoEWrapper:
         """
         Clear all cached buffers.
 
-        This frees up memory by clearing the buffer cache. Useful when you want
-        to reset the buffer state or free memory.
+        This frees up memory by clearing the buffer cache. Only safe once no
+        captured graph or queued CPU task can still use the buffers.
         """
         BaseMoEWrapper.clear_buffer_cache()
 
