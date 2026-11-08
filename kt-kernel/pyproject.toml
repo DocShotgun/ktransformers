@@ -21,10 +21,10 @@ classifiers = [
 requires-python = ">=3.11"
 dependencies = [
   # Core dependencies
-  # Pinned, not a range: must match the sglang fork's torch pin (2.13.0), since the
+  # Pinned, not a range: must match the sglang fork's torch pin (2.14.1), since the
   # extension is built against it. Upstream ktransformers pins 2.9.1 for its
   # sglang-kt / accelerate-kt / transformers-kt stack and the Ascend images.
-  "torch==2.13.0",
+  "torch==2.14.1",
   "safetensors>=0.4.0",
   "numpy>=1.24.0",
   # triton has no aarch64 wheels; the Ascend build does not use it.
