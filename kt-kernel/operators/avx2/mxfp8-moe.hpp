@@ -336,6 +336,9 @@ class AVX2_MXFP8_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP8_MOE_TP<T>> {
            quant_config.group_size, config_.swiglu_alpha, config_.swiglu_limit);
   }
 
+  // GPU-resident experts get no CPU weight buffers; every loop below skips them.
+  bool should_allocate_expert_weights(int expert_idx) const { return !config_.should_skip_expert(expert_idx); }
+
   ~AVX2_MXFP8_MOE_TP() = default;
 
   // CRTP buffer creation
@@ -390,6 +393,7 @@ class AVX2_MXFP8_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP8_MOE_TP<T>> {
         nth * config_.expert_num, nullptr,
         [this, nth, physical_to_logical_map](int task_id) {
           uint64_t expert_idx = task_id / nth;
+          if (config_.should_skip_expert(expert_idx)) return;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           int ith = task_id % nth;
           size_t weight_offset = (size_t)logical_expert_id * config_.intermediate_size * config_.hidden_size;
@@ -403,6 +407,7 @@ class AVX2_MXFP8_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP8_MOE_TP<T>> {
         nth * config_.expert_num, nullptr,
         [this, nth, physical_to_logical_map](int task_id) {
           uint64_t expert_idx = task_id / nth;
+          if (config_.should_skip_expert(expert_idx)) return;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           int ith = task_id % nth;
           size_t weight_offset = (size_t)logical_expert_id * config_.hidden_size * config_.intermediate_size;
@@ -415,6 +420,7 @@ class AVX2_MXFP8_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP8_MOE_TP<T>> {
         config_.expert_num, nullptr,
         [this, physical_to_logical_map](int task_id) {
           uint64_t expert_idx = task_id;
+          if (config_.should_skip_expert(expert_idx)) return;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           size_t scale_count =
               ((size_t)config_.intermediate_size * config_.hidden_size) / config_.quant_config.group_size;
@@ -630,6 +636,8 @@ class TP_MOE<AVX2_MXFP8_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP8_M
       pool->get_subpool(i)->do_work_stealing_job(
           tpc.expert_num, nullptr,
           [&](int expert_id_) {
+            // GPU-resident experts arrive with null pointers.
+            if (tpc.should_skip_expert(expert_id_)) return;
             const size_t expert_id = expert_map(physical_to_logical_map, expert_id_);
 
             uint8_t* gate_dst = (uint8_t*)tpc.gate_proj + expert_id * tp_weight_elems;
@@ -729,6 +737,9 @@ class TP_MOE<AVX2_MXFP8_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP8_M
         w2_weight_ptrs.size()  != (size_t)gpu_tp_count ||
         w2_scale_ptrs.size()   != (size_t)gpu_tp_count)
       throw std::runtime_error("Pointer arrays size must match gpu_tp_count");
+    // GPU-resident experts have no CPU weight buffers.
+    if (this->config.should_skip_expert(expert_id))
+      throw std::runtime_error("write_weight_scale_to_buffer: expert is not CPU-resident");
 
     this->config.pool->dispense_backend()->do_numa_job([&, this](int i) {
       this->tps[i]->write_weights_to_buffer(gpu_tp_count, this->tp_count, expert_id, this->config,
