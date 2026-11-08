@@ -159,6 +159,20 @@ def _wait_device(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _is_capturing(device: torch.device) -> bool:
+    """True inside a graph capture on ``device``'s current stream or sglang's."""
+    if _sglang_is_capture_mode():
+        return True
+    if device.type == "cuda":
+        return torch.cuda.is_current_stream_capturing()
+    if device.type == "npu":
+        try:
+            return bool(torch.npu.is_current_stream_capturing())
+        except Exception:
+            return False
+    return False
+
+
 def _wait_cuda_stream_on_host(cuda_stream, device: torch.device) -> None:
     """Block the host until everything queued so far on a CUDA submit stream ran.
 
@@ -288,9 +302,17 @@ class KExpertsCPUBuffer:
 
         pin_memory = True
 
+        # A graph captured here bakes in this tuple's pointers, so the tuple must
+        # outlive the graph. Batch sizes outside capture_bs (sglang's decoder
+        # tail graphs, for one) are captured too, so keep any tuple handed out
+        # during a capture, not only the preset sizes.
+        capturing = _is_capturing(hidden_states.device)
+
         if batch_size in cls.capture_buffers:
             return cls.capture_buffers[batch_size]
         if batch_size == cls.temp_bs:
+            if capturing:
+                cls.capture_buffers[batch_size] = cls.temp_buffer
             return cls.temp_buffer
 
         # Batch size changed -> the previous temp tuple is about to be dropped,
@@ -339,7 +361,7 @@ class KExpertsCPUBuffer:
             bsz_tensor_cpu,
             output_gpu,
         )
-        if batch_size in cls.capture_bs:
+        if batch_size in cls.capture_bs or capturing:
             cls.capture_buffers[batch_size] = cur_buffer
         cls.temp_bs = batch_size
         cls.temp_buffer = cur_buffer
