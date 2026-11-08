@@ -441,6 +441,13 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
 
     void finalize_scale_e8() {
+      // E8 is the MXFP4 encoding: the E8 K-major consumers assume one scale per
+      // 32 K. Group-16 power-of-two scales are bf16-exact and take the NV path.
+      if (k_group_size != 32) {
+        scale_e8_valid = false;
+        scale_e8_vector_safe = false;
+        return;
+      }
       const size_t count = static_cast<size_t>(n) * k_group_count;
       bool valid = true;
       bool vector_safe = true;
@@ -486,7 +493,7 @@ struct GemmKernel224MXFP4SmallKGroup {
     // Non-BF16-representable scales (e.g. a future fp34 loader) keep the FP32
     // fallback untouched.
     void finalize_scale_nv() {
-      if (k_group_size != 16 || scale_e8_valid) {
+      if (k_group_size != 16) {
         scale_nv_valid = false;
         return;
       }

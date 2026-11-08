@@ -28,19 +28,20 @@ def unpack_nvfp4(packed, scales):
     return unscaled * scales.float().repeat_interleave(16, -1)
 
 
-def make_nvfp4_rows(experts, rows, cols):
+def make_nvfp4_rows(experts, rows, cols, pow2_scales=False):
     packed = torch.randint(
         0, 256, (experts, rows, cols // 2), dtype=torch.uint8
     ).contiguous()
     # Real e4m3 block scales (exact in bf16) and non-power-of-two globals, like
-    # GLM-5.3's; powers of two would let an e8 path mask NVFP4-specific bugs.
-    block = (
-        (torch.rand(experts, rows, cols // 16) * 216 + 8)
-        .to(torch.float8_e4m3fn)
-        .float()
-        .to(torch.bfloat16)
-        .contiguous()
+    # GLM-5.3's. All-power-of-two block scales must not select the MXFP4 (E8)
+    # layout, whose kernels assume one scale per 32 K; 8..128 keeps the outputs
+    # in the range where assert_amx_matches_avx512's atol is meaningful.
+    raw = (
+        2.0 ** torch.randint(3, 8, (experts, rows, cols // 16)).float()
+        if pow2_scales
+        else torch.rand(experts, rows, cols // 16) * 216 + 8
     )
+    block = raw.to(torch.float8_e4m3fn).float().to(torch.bfloat16).contiguous()
     globals_ = ((torch.rand(experts) * 0.5 + 0.75) * 2.0**-11).tolist()
     return packed, block, globals_
 
@@ -59,7 +60,7 @@ def assert_amx_matches_avx512(actual, expected):
     assert diff.max().item() <= 1.6e-2, f"max abs diff {diff.max().item():.3e}"
 
 
-def _run(backend, expert_counts, weight_layout, hidden, intermediate):
+def _run(backend, expert_counts, weight_layout, hidden, intermediate, pow2_scales=False):
     """Run one prefill backend and return every tensor the test compares."""
     os.environ["KT_NVFP4_KMAJOR_WEIGHTS"] = weight_layout
     os.environ["KT_NVFP4_PREFILL_AMX"] = backend
@@ -67,9 +68,9 @@ def _run(backend, expert_counts, weight_layout, hidden, intermediate):
 
     torch.manual_seed(17)
     experts, qlen = 2, 64
-    gate_packed, gate_scale, gate_global = make_nvfp4_rows(experts, intermediate, hidden)
-    up_packed, up_scale, up_global = make_nvfp4_rows(experts, intermediate, hidden)
-    down_packed, down_scale, down_global = make_nvfp4_rows(experts, hidden, intermediate)
+    gate_packed, gate_scale, gate_global = make_nvfp4_rows(experts, intermediate, hidden, pow2_scales)
+    up_packed, up_scale, up_global = make_nvfp4_rows(experts, intermediate, hidden, pow2_scales)
+    down_packed, down_scale, down_global = make_nvfp4_rows(experts, hidden, intermediate, pow2_scales)
     packed = [gate_packed, up_packed, down_packed]
     scales = [gate_scale, up_scale, down_scale]
     global_scales = [gate_global, up_global, down_global]
@@ -150,41 +151,24 @@ def child_main():
     amx_backend.child_main(_run)
 
 
-@pytest.mark.parametrize("weight_layout", ["0", "1"])
-@pytest.mark.parametrize("expert_counts", [(33, 31), (63, 1)])
-# hidden 8192 > K_BLOCK (7168): one row's scales (k / 16 = 512 groups) span
-# more than a K block.
-@pytest.mark.parametrize("hidden,intermediate", [(1024, 1024), (1024, 1152), (8192, 256)])
-def test_nvfp4_amx_prefill_matches_avx512(
-    tmp_path, expert_counts, weight_layout, hidden, intermediate
-):
-    ext = kt_kernel.kt_kernel_ext
-    if not hasattr(ext.moe, "AMXFP4_KGroup_MOE"):
+def _skip_without_amx_fp4():
+    if not hasattr(kt_kernel.kt_kernel_ext.moe, "AMXFP4_KGroup_MOE"):
         pytest.skip("AMX FP4 extension is unavailable")
     with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
         if "amx_bf16" not in cpuinfo.read():
             pytest.skip("AMX BF16 is unavailable")
 
-    # Kernel selection is cached per process, so each backend gets its own.
+
+def _run_both_backends(tmp_path, **params):
+    """Kernel selection is cached per process, so each backend gets its own."""
     results = {
-        backend: amx_backend.run_backend(
-            __name__,
-            backend,
-            tmp_path,
-            expert_counts=expert_counts,
-            weight_layout=weight_layout,
-            hidden=hidden,
-            intermediate=intermediate,
-        )
+        backend: amx_backend.run_backend(__name__, backend, tmp_path, **params)
         for backend in ("0", "1")
     }
-    fallback, packed, scales, global_scales, inputs, ids, weights = results["0"]
-    amx = results["1"][0]
+    return results["0"], results["1"][0]
 
-    actual = amx["prefill"]
-    assert torch.isfinite(actual).all()
-    assert_amx_matches_avx512(actual, fallback["prefill"])
 
+def _assert_matches_reference(amx, packed, scales, global_scales, inputs, ids, weights, hidden):
     qlen = inputs.shape[0]
     gate, up, down = [
         unpack_nvfp4(weight, scale) * torch.tensor(glob).view(-1, 1, 1)
@@ -199,6 +183,8 @@ def test_nvfp4_amx_prefill_matches_avx512(
         down_result = (activated @ down[expert].T).bfloat16().float()
         reference[selected] = weights[selected] * down_result
 
+    actual = amx["prefill"]
+    assert torch.isfinite(actual).all()
     error = (actual.float() - reference).abs()
     assert error.mean() < reference.abs().mean() * 0.02
 
@@ -207,8 +193,49 @@ def test_nvfp4_amx_prefill_matches_avx512(
     decode_error = (decoded.float() - reference[:1]).abs()
     assert decode_error.mean() < reference[:1].abs().mean() * 0.02
 
+
+@pytest.mark.parametrize("weight_layout", ["0", "1"])
+@pytest.mark.parametrize("expert_counts", [(33, 31), (63, 1)])
+# hidden 8192 > K_BLOCK (7168): one row's scales (k / 16 = 512 groups) span
+# more than a K block.
+@pytest.mark.parametrize("hidden,intermediate", [(1024, 1024), (1024, 1152), (8192, 256)])
+def test_nvfp4_amx_prefill_matches_avx512(
+    tmp_path, expert_counts, weight_layout, hidden, intermediate
+):
+    _skip_without_amx_fp4()
+    (fallback, packed, scales, global_scales, inputs, ids, weights), amx = _run_both_backends(
+        tmp_path,
+        expert_counts=expert_counts,
+        weight_layout=weight_layout,
+        hidden=hidden,
+        intermediate=intermediate,
+    )
+
+    assert torch.isfinite(amx["prefill"]).all()
+    assert_amx_matches_avx512(amx["prefill"], fallback["prefill"])
+    _assert_matches_reference(amx, packed, scales, global_scales, inputs, ids, weights, hidden)
+
     if weight_layout == "1":
         for key in ("prefill", "decode", "small_prefill"):
             torch.testing.assert_close(
                 amx[key], amx[f"row_{key}"], atol=2e-3, rtol=5e-3
             )
+
+
+@pytest.mark.parametrize("weight_layout", ["0", "1"])
+def test_nvfp4_power_of_two_block_scales(tmp_path, weight_layout):
+    """All-power-of-two NVFP4 block scales must give the same results as e4m3 ones."""
+    _skip_without_amx_fp4()
+    hidden = 1024
+    (fallback, packed, scales, global_scales, inputs, ids, weights), amx = _run_both_backends(
+        tmp_path,
+        expert_counts=(33, 31),
+        weight_layout=weight_layout,
+        hidden=hidden,
+        intermediate=1024,
+        pow2_scales=True,
+    )
+
+    assert torch.isfinite(amx["prefill"]).all()
+    assert_amx_matches_avx512(amx["prefill"], fallback["prefill"])
+    _assert_matches_reference(amx, packed, scales, global_scales, inputs, ids, weights, hidden)
