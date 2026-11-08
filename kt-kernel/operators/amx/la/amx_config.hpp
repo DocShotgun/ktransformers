@@ -104,22 +104,7 @@ const int AMX_BLK_SIZE = 32;
 #define TMM6 6
 #define TMM7 7
 
-inline bool enable_amx() {
-  // CHECK: whether this can be removed?
-  // static thread_local bool initialized = false;
-  // if (initialized) {
-  //   return true;
-  // }
-  // initialized = true;
-
-  // if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)) {
-  //   printf("\n Fail to do XFEATURE_XTILEDATA \n\n");
-  //   return false;
-  // } else {
-  //   // printf("\n TILE DATA USE SET - OK \n\n");
-  //   return true;
-  // }
-  // return true;
+inline bool request_amx_permission() {
   unsigned long features;
   long rc;
   rc = syscall(SYS_arch_prctl, ARCH_GET_XCOMP_SUPP, &features);
@@ -142,6 +127,13 @@ inline bool enable_amx() {
     return true;
   }
   return false;
+}
+
+// Kernels call this per task (two arch_prctl syscalls each, ~0.4 us). The
+// XTILEDATA permission is per process, so the first answer holds for every thread.
+inline bool enable_amx() {
+  static const bool enabled = request_amx_permission();
+  return enabled;
 }
 
 struct alignas(64) TileConfig {
