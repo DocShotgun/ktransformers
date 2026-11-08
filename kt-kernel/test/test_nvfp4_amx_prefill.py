@@ -99,7 +99,9 @@ def _run(backend, expert_counts, weight_layout, hidden, intermediate):
         [[0]] * expert_counts[0] + [[1]] * expert_counts[1], dtype=torch.int64
     ).contiguous()
     weights = torch.rand(qlen, 1, dtype=torch.float32).contiguous()
-    inputs = (torch.randn(qlen, hidden) * 0.1).to(torch.bfloat16).contiguous()
+    # Keep the GEMM outputs at the 1024-wide magnitude the absolute tolerances
+    # in assert_amx_matches_avx512 were calibrated on.
+    inputs = (torch.randn(qlen, hidden) * 0.1 * (1024 / hidden) ** 0.5).to(torch.bfloat16).contiguous()
     batch_size = torch.tensor([qlen], dtype=torch.int32)
 
     def forward(target_moe):
@@ -150,7 +152,9 @@ def child_main():
 
 @pytest.mark.parametrize("weight_layout", ["0", "1"])
 @pytest.mark.parametrize("expert_counts", [(33, 31), (63, 1)])
-@pytest.mark.parametrize("hidden,intermediate", [(1024, 1024), (1024, 1152)])
+# hidden 8192 > K_BLOCK (7168): one row's scales (k / 16 = 512 groups) span
+# more than a K block.
+@pytest.mark.parametrize("hidden,intermediate", [(1024, 1024), (1024, 1152), (8192, 256)])
 def test_nvfp4_amx_prefill_matches_avx512(
     tmp_path, expert_counts, weight_layout, hidden, intermediate
 ):

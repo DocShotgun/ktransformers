@@ -14,12 +14,12 @@ import amx_backend
 import kt_kernel  # noqa: F401
 
 
-def _run(backend, qlen, weight_layout, hidden=256, intermediate=512):
+def _run(backend, qlen, weight_layout, hidden=256, intermediate=512, seed=None):
     os.environ["KT_MXFP4_KMAJOR_WEIGHTS"] = weight_layout
     os.environ["KT_MXFP4_PREFILL_AMX"] = backend
     ext = kt_kernel.kt_kernel_ext
 
-    torch.manual_seed(qlen * 7 + int(weight_layout))
+    torch.manual_seed(qlen * 7 + int(weight_layout) if seed is None else seed)
     experts = 2
     packed = [
         torch.randint(0, 256, (experts, intermediate, hidden // 2), dtype=torch.uint8).contiguous()
@@ -136,3 +136,26 @@ def test_mxfp4_shape_tails(tmp_path, qlen, hidden, intermediate):
 
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, atol=5e-4, rtol=5e-3)
+
+
+def test_mxfp4_wide_k_decode_layouts_agree(tmp_path):
+    """One-token decode with K wider than K_BLOCK (8192 > 7168): the row-major
+    (natural-order) GEMV must match the K-major one; its per-row scale scratch
+    has to hold k / 32 = 256 groups."""
+    ext = kt_kernel.kt_kernel_ext
+    if not hasattr(ext.moe, "AMXFP4_KGroup_MOE"):
+        pytest.skip("AMX MXFP4 extension is unavailable")
+    with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
+        if "amx_bf16" not in cpuinfo.read():
+            pytest.skip("AMX BF16 is unavailable")
+
+    results = {}
+    for weight_layout in ("0", "1"):
+        out_dir = tmp_path / f"layout{weight_layout}"
+        out_dir.mkdir()
+        results[weight_layout] = amx_backend.run_backend(
+            __name__, "1", out_dir, qlen=1, weight_layout=weight_layout, hidden=8192, intermediate=128, seed=0
+        )
+
+    assert torch.isfinite(results["0"]).all()
+    torch.testing.assert_close(results["0"], results["1"], atol=5e-4, rtol=5e-3)

@@ -191,6 +191,19 @@ struct GemmKernel224MXFP4SmallKGroup {
 #endif
   }
 
+  // One 64-byte-aligned row of expanded FP32 scales. Kernels pass the full K,
+  // which can exceed K_BLOCK (k / 32 = 256 groups at hidden 8192), so the rows
+  // grow on demand. Four rotate: the GEMV kernels hold up to four at once.
+  static float* scale_row_scratch(int group_count) {
+    thread_local std::array<std::vector<float>, 4> rows;
+    thread_local unsigned slot = 0;
+    std::vector<float>& row = rows[slot++ & 3u];
+    // 15 spare floats cover aligning a 4-byte-aligned start up to 64 bytes.
+    const size_t needed = static_cast<size_t>(group_count) + 15;
+    if (row.size() < needed) row.resize(needed);
+    return reinterpret_cast<float*>((reinterpret_cast<uintptr_t>(row.data()) + 63) & ~uintptr_t(63));
+  }
+
   // BufferA records whether decode activation has already been converted to
   // the natural grouped order. Prefill and all fallback paths keep the
   // existing logical layout.
@@ -505,14 +518,9 @@ struct GemmKernel224MXFP4SmallKGroup {
 
     float* get_scale(int n_, int n_begin, int k_, int k_begin) {
       if (scale_nv_valid) {
-        // Compact BF16 NVFP4 scales expand back to FP32 on demand. Group-16
-        // doubles the group count, so this scratch is sized for k/16.
-        constexpr int max_group_count = K_BLOCK / 16;
+        // Compact BF16 NVFP4 scales expand back to FP32 on demand.
         const int group_count = k_ / k_group_size;
-        assert(group_count <= max_group_count);
-        alignas(64) thread_local float scratch_nv[4][max_group_count];
-        thread_local unsigned slot_nv = 0;
-        float* destination = scratch_nv[slot_nv++ & 3u];
+        float* destination = scale_row_scratch(group_count);
         const ggml_bf16_t* source =
             scale_nv_compact + static_cast<size_t>(n_begin) * k_group_count + k_begin / k_group_size;
         int group = 0;
@@ -526,14 +534,8 @@ struct GemmKernel224MXFP4SmallKGroup {
         return destination;
       }
       if (!scale_e8_valid) return Base::get_scale(n_, n_begin, k_, k_begin);
-      // Group-16 (NVFP4) buffers with power-of-two scales take this path too,
-      // so size for the smallest supported group, not MXFP4's 32.
-      constexpr int max_group_count = K_BLOCK / 16;
       const int group_count = k_ / k_group_size;
-      assert(group_count <= max_group_count);
-      alignas(64) thread_local float scratch[4][max_group_count];
-      thread_local unsigned slot = 0;
-      float* destination = scratch[slot++ & 3u];
+      float* destination = scale_row_scratch(group_count);
       const uint8_t* source = get_scale_e8(n_, n_begin, k_, k_begin);
       int group = 0;
       for (; group + 16 <= group_count; group += 16) {
@@ -924,10 +926,14 @@ struct GemmKernel224MXFP4SmallKGroup {
     auto [n_start, n_end] = split_range_n(n, ith, nth);
     if (n_start >= n_end) return;
     const int group_count = k / 32;
-    assert(group_count <= K_BLOCK / 32);
     const __m512bh* activation = reinterpret_cast<const __m512bh*>(ba->get_submat(1, k, 0, 0));
     float* output = bc->get_submat(1, n, 0, n_start);
-    alignas(64) float scale_scratch[4][K_BLOCK / 32];
+    // Only the E8 instantiation expands its own scales; the other one gets
+    // them from get_scale(), which rotates the same rows.
+    float* scale_scratch[4] = {};
+    if constexpr (E8_SCALE) {
+      for (float*& row : scale_scratch) row = scale_row_scratch(group_count);
+    }
 
     int ni = n_start;
     for (; ni + 4 <= n_end; ni += 4) {
