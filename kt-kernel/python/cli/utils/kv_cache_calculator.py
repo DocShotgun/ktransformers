@@ -14,8 +14,8 @@ from transformers import AutoConfig
 # Add sglang to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "python"))
 
-from sglang.srt.configs.model_config import ModelConfig, is_deepseek_nsa, get_nsa_index_head_dim
-from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+from sglang.srt.configs.model_config import ModelConfig, get_dsa_index_head_dim, is_deepseek_dsa
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
 def get_dtype_bytes(dtype_str: str) -> int:
@@ -94,10 +94,10 @@ def get_kv_size_gb(
         )
 
         # Check if it's NSA (Native Sparse Attention) model
-        if is_deepseek_nsa(hf_config):
-            index_head_dim = get_nsa_index_head_dim(hf_config)
-            indexer_size_per_token = index_head_dim + index_head_dim // NSATokenToKVPool.quant_block_size * 4
-            indexer_dtype_bytes = torch._utils._element_size(NSATokenToKVPool.index_k_with_scale_buffer_dtype)
+        if is_deepseek_dsa(hf_config):
+            index_head_dim = get_dsa_index_head_dim(hf_config)
+            indexer_size_per_token = index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+            indexer_dtype_bytes = torch._utils._element_size(DSATokenToKVPool.index_k_with_scale_buffer_dtype)
             indexer_cell_size = indexer_size_per_token * num_layers * indexer_dtype_bytes
             cell_size += indexer_cell_size
 
