@@ -10,7 +10,7 @@ This module contains base classes and utilities shared across all backend implem
 from __future__ import annotations
 
 import torch
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from abc import ABC, abstractmethod
 import ctypes
 import logging
@@ -655,8 +655,12 @@ class BaseMoEWrapper(_MoEBase, ABC):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], tuple, int, int]:
-        """D2H copy into pinned CPU buffers; return deferred ids and buffer handles."""
+        defer_stage: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], tuple, int, int, Optional[Callable[[int, int], None]]]:
+        """D2H copy into pinned CPU buffers; return deferred ids and buffer handles.
+
+        With defer_stage, a staging kernel is returned as stage(bell, bell_value)
+        instead of launched, so the caller can have it ring a doorbell."""
         self._check_qlen_fits_cpp_buffers(hidden_states)
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
@@ -677,7 +681,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
         if self.max_deferred_experts_per_token == 0 and _can_stage_on_gpu(
             flat_hidden_states, topk_ids, topk_weights, input_tensor_cpu[current_slot]
         ):
-            kt_kernel_ext.stage_moe_inputs(
+            stage_args = (
                 torch.cuda.current_stream(flat_hidden_states.device).cuda_stream,
                 flat_hidden_states.data_ptr(),
                 flat_hidden_states.numel() * flat_hidden_states.element_size(),
@@ -689,6 +693,12 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 immediate_experts_ids_cpu[current_slot].data_ptr(),
                 weights_cpu[current_slot].data_ptr(),
             )
+
+            def stage(bell: int = 0, bell_value: int = 0) -> None:
+                kt_kernel_ext.stage_moe_inputs(*stage_args, bell, bell_value)
+
+            if not defer_stage:
+                stage()
             buffers = (
                 input_tensor_cpu,
                 immediate_experts_ids_cpu,
@@ -698,7 +708,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 bsz_tensor_cpu,
                 _output_gpu,
             )
-            return topk_ids, None, buffers, current_slot, next_slot
+            return topk_ids, None, buffers, current_slot, next_slot, stage if defer_stage else None
 
         topk_ids_long = topk_ids.to(torch.long)
         if self.max_deferred_experts_per_token > 0:
@@ -723,7 +733,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
             bsz_tensor_cpu,
             _output_gpu,
         )
-        return immediate_ids, deferred_ids, buffers, current_slot, next_slot
+        return immediate_ids, deferred_ids, buffers, current_slot, next_slot, None
 
     def copy_inputs_to_cpu_buffers(
         self,
@@ -887,8 +897,10 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 f"KT MoE layer {self.layer_idx} submitted into CPU buffer slot {slot} while layer "
                 f"{busy_layer}'s forward there was not synced yet; KT forwards must not interleave"
             )
-        _immediate_ids, deferred_ids, _buffers, current_slot, next_slot = self._prepare_forward_cpu_buffers(
-            hidden_states, topk_ids, topk_weights
+        bypass = _should_bypass_stream_callback(hidden_states.device)
+        sync_submit = bypass or hidden_states.device.type == "npu"
+        _immediate_ids, deferred_ids, _buffers, current_slot, next_slot, stage = self._prepare_forward_cpu_buffers(
+            hidden_states, topk_ids, topk_weights, defer_stage=not sync_submit
         )
         BaseMoEWrapper._slot_in_flight[slot] = self.layer_idx
         (
@@ -902,7 +914,6 @@ class BaseMoEWrapper(_MoEBase, ABC):
         ) = _buffers
         bsz_slot_tensor = bsz_tensor_cpu[current_slot]
 
-        bypass = _should_bypass_stream_callback(hidden_states.device)
         # NPU only: submit the CPU-MoE synchronously on this host thread.
         # ``submit_with_cuda_stream`` enqueues it via an ACL host callback whose
         # firing is not host-observable (NO_BLOCK) -> a later host-side drain can
@@ -910,7 +921,6 @@ class BaseMoEWrapper(_MoEBase, ABC):
         # nondeterministic on heavy prefill). The synchronous submit still runs on
         # the WorkerPool and overlaps the device experts queued after it.
         # CUDA keeps the upstream async submit_with_cuda_stream path unchanged.
-        sync_submit = bypass or hidden_states.device.type == "npu"
         if sync_submit:
             # The synchronous submit reads input_tensor_cpu immediately -> the input
             # D2H queued async on the stream by _prepare_forward_cpu_buffers MUST be
@@ -939,6 +949,13 @@ class BaseMoEWrapper(_MoEBase, ABC):
             ):
                 kt_kernel_ext.subscribe_ascend_stream(int(cuda_stream))
             self.cpu_infer.submit(immediate_task)
+        elif stage is not None:
+            # Inside a capture the staging kernel rings the doorbell itself once its
+            # stores are visible; otherwise it only stages and a host node submits.
+            bell, bell_value = self.cpu_infer.register_doorbell(cuda_stream, immediate_task)
+            stage(bell, bell_value)
+            if bell == 0:
+                self.cpu_infer.submit_with_cuda_stream(cuda_stream, immediate_task)
         elif deferred_ids is None:
             # One task per forward: inside a CUDA graph the GPU rings a doorbell the
             # CPU polls instead of running a host node (submit_with_cuda_stream_doorbell).

@@ -80,6 +80,76 @@ def _replays_match_eager(qlen, replays=20):
     return slots
 
 
+def _staged_replays_match_eager(qlen, replays=10):
+    """Captured forwards whose staging kernel rings the doorbell (register_doorbell)."""
+    pool = ext.CPUInfer(8)
+    moe, _ = _build_moe(pool, EXPERTS, TOPK, HIDDEN, INTERMEDIATE, max(qlen, 4))
+    layers = []
+    for _ in range(LAYERS):
+        layers.append(
+            dict(
+                hidden=torch.zeros(qlen, HIDDEN, dtype=torch.bfloat16, device="cuda"),
+                device_ids=torch.zeros(qlen, TOPK, dtype=torch.int32, device="cuda"),
+                device_weights=torch.zeros(qlen, TOPK, dtype=torch.float32, device="cuda"),
+                ids=torch.zeros(qlen, TOPK, dtype=torch.int64).pin_memory(),
+                weights=torch.zeros(qlen, TOPK, dtype=torch.float32).pin_memory(),
+                inputs=torch.zeros(qlen, HIDDEN, dtype=torch.bfloat16).pin_memory(),
+                output=torch.zeros(qlen, HIDDEN, dtype=torch.bfloat16).pin_memory(),
+                batch=torch.tensor([qlen], dtype=torch.int32).pin_memory(),
+            )
+        )
+
+    def task(layer):
+        return moe.forward_task(
+            layer["batch"].data_ptr(), TOPK, layer["ids"].data_ptr(), layer["weights"].data_ptr(),
+            layer["inputs"].data_ptr(), layer["output"].data_ptr(), False,
+        )
+
+    def stage(stream, layer, bell, bell_value):
+        ext.stage_moe_inputs(
+            stream.cuda_stream, layer["hidden"].data_ptr(), layer["hidden"].numel() * 2,
+            layer["device_ids"].data_ptr(), True, layer["device_weights"].data_ptr(), qlen * TOPK,
+            layer["inputs"].data_ptr(), layer["ids"].data_ptr(), layer["weights"].data_ptr(), bell, bell_value,
+        )
+
+    def fill(seed):
+        generator = torch.Generator().manual_seed(seed)
+        for layer in layers:
+            ids = torch.stack([torch.randperm(EXPERTS, generator=generator)[:TOPK] for _ in range(qlen)])
+            layer["device_ids"].copy_(ids.to(torch.int32))
+            layer["device_weights"].copy_(torch.rand(qlen, TOPK, generator=generator))
+            layer["hidden"].copy_((torch.randn(qlen, HIDDEN, generator=generator) * 0.1).to(torch.bfloat16))
+            layer["output"].zero_()
+        torch.cuda.synchronize()
+
+    busy = torch.zeros(1 << 20, device="cuda")
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    fill(0)
+    with torch.cuda.graph(graph, stream=stream):
+        for layer in layers:
+            bell, bell_value = pool.register_doorbell(stream.cuda_stream, task(layer))
+            assert bell != 0
+            stage(stream, layer, bell, bell_value)
+            busy.mul_(1.0001)  # GPU work between submit and sync, as in decode
+            pool.sync_with_cuda_stream(stream.cuda_stream, 0)
+    slots = pool.doorbell_slot_count()
+
+    for replay in range(replays):
+        fill(replay + 1)
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+        replayed = [layer["output"].clone() for layer in layers]
+        for i, layer in enumerate(layers):
+            layer["output"].zero_()
+            pool.submit(task(layer))
+            pool.sync()
+            assert replayed[i].abs().sum() > 0, f"replay {replay} layer {i} produced no output"
+            assert torch.equal(replayed[i], layer["output"]), f"replay {replay} layer {i} differs from eager"
+    return slots
+
+
 def _skip_without_doorbell():
     if not torch.cuda.is_available() or not hasattr(ext.moe, "AMXFP4_KGroup_MOE"):
         pytest.skip("CUDA or the AMX FP4 extension is unavailable")
@@ -91,6 +161,16 @@ def _skip_without_doorbell():
 def test_doorbell_replays_match_eager(qlen):
     _skip_without_doorbell()
     assert _replays_match_eager(qlen) == LAYERS
+
+
+@pytest.mark.parametrize("qlen", [1, 4])
+def test_staging_kernel_doorbell_replays_match_eager(qlen):
+    """The staging kernel's own doorbell store must start each replayed forward only
+    once the forward's staged inputs are visible to the CPU."""
+    _skip_without_doorbell()
+    if not hasattr(ext, "stage_moe_inputs"):
+        pytest.skip("kt-kernel was built without CUDA")
+    assert _staged_replays_match_eager(qlen) == LAYERS
 
 
 def _run_worker(**env):

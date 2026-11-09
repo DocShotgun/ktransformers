@@ -95,7 +95,7 @@ namespace py = pybind11;
 // cuda/kt_stage_inputs.cu
 cudaError_t kt_stage_moe_inputs(cudaStream_t stream, const void* hidden, int64_t hidden_bytes, const void* ids,
                                 bool ids_int32, const float* weights, int64_t routes, void* host_hidden,
-                                int64_t* host_ids, float* host_weights);
+                                int64_t* host_ids, float* host_weights, uint32_t* bell, uint32_t bell_value);
 #endif
 using namespace pybind11::literals;
 
@@ -698,15 +698,19 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   m.def(
       "stage_moe_inputs",
       [](intptr_t stream, intptr_t hidden, int64_t hidden_bytes, intptr_t ids, bool ids_int32, intptr_t weights,
-         int64_t routes, intptr_t host_hidden, intptr_t host_ids, intptr_t host_weights) {
+         int64_t routes, intptr_t host_hidden, intptr_t host_ids, intptr_t host_weights, intptr_t bell,
+         uint32_t bell_value) {
         const cudaError_t err = kt_stage_moe_inputs(
             reinterpret_cast<cudaStream_t>(stream), reinterpret_cast<const void*>(hidden), hidden_bytes,
             reinterpret_cast<const void*>(ids), ids_int32, reinterpret_cast<const float*>(weights), routes,
             reinterpret_cast<void*>(host_hidden), reinterpret_cast<int64_t*>(host_ids),
-            reinterpret_cast<float*>(host_weights));
+            reinterpret_cast<float*>(host_weights), reinterpret_cast<uint32_t*>(bell), bell_value);
         if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
       },
-      "Copy one layer's hidden rows, routing weights and int64 expert ids to pinned host memory in one kernel.");
+      "stream"_a, "hidden"_a, "hidden_bytes"_a, "ids"_a, "ids_int32"_a, "weights"_a, "routes"_a, "host_hidden"_a,
+      "host_ids"_a, "host_weights"_a, "bell"_a = 0, "bell_value"_a = 0,
+      "Copy one layer's hidden rows, routing weights and int64 expert ids to pinned host memory in one kernel; "
+      "with a doorbell (CPUInfer.register_doorbell), ring it once they are visible.");
 #endif
 
   py::class_<CPUInfer>(m, "CPUInfer")
@@ -720,6 +724,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
            py::arg("allow_n_pending") = 0)
       .def("submit_with_cuda_stream", &CPUInfer::submit_with_cuda_stream)
       .def("submit_with_cuda_stream_doorbell", &CPUInfer::submit_with_cuda_stream_doorbell)
+      .def("register_doorbell", &CPUInfer::register_doorbell)
       .def("doorbell_slot_count", &CPUInfer::doorbell_slot_count)
 #endif
       ;

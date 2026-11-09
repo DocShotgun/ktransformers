@@ -4,6 +4,8 @@
 // to int64) to the host before the CPU experts can start. As three copies and a
 // cast that is four stream nodes, ~20 us per layer on the critical path; this is
 // one kernel of mapped-memory stores. Prefill-sized inputs keep the copy engine.
+// Given a doorbell word, the kernel also rings it once every store is visible, in
+// place of a stream memory write after it (about 2 us less to the CPU's start).
 
 #include <cuda_runtime.h>
 
@@ -11,9 +13,13 @@
 
 namespace {
 
+// Blocks of the ringing launch in flight that have finished; its last block resets it.
+// KT keeps one doorbell forward in flight, so ringing launches never overlap.
+__device__ unsigned int g_finished_blocks = 0;
+
 __global__ void stage_inputs_kernel(const uint4* hidden, uint4* host_hidden, int64_t hidden_vecs, const void* ids,
                                     bool ids_int32, int64_t* host_ids, const float* weights, float* host_weights,
-                                    int64_t routes) {
+                                    int64_t routes, uint32_t* bell, uint32_t bell_value) {
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   const int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   for (int64_t i = tid; i < hidden_vecs; i += stride) host_hidden[i] = hidden[i];
@@ -25,15 +31,23 @@ __global__ void stage_inputs_kernel(const uint4* hidden, uint4* host_hidden, int
   // Make the stores visible to the host before anything later in the stream
   // (the doorbell write) is.
   __threadfence_system();
+  if (bell == nullptr) return;
+  __syncthreads();
+  if (threadIdx.x == 0 && atomicAdd(&g_finished_blocks, 1u) == gridDim.x - 1) {
+    g_finished_blocks = 0;
+    __threadfence_system();
+    *reinterpret_cast<volatile uint32_t*>(bell) = bell_value;
+  }
 }
 
 }  // namespace
 
 // hidden_bytes must be a multiple of 16 and every pointer 16-byte aligned for the
-// hidden rows; the caller checks both.
+// hidden rows; the caller checks both. bell is a device pointer to a mapped word,
+// or nullptr for no doorbell.
 cudaError_t kt_stage_moe_inputs(cudaStream_t stream, const void* hidden, int64_t hidden_bytes, const void* ids,
                                 bool ids_int32, const float* weights, int64_t routes, void* host_hidden,
-                                int64_t* host_ids, float* host_weights) {
+                                int64_t* host_ids, float* host_weights, uint32_t* bell, uint32_t bell_value) {
   const int64_t hidden_vecs = hidden_bytes / 16;
   const int64_t work = hidden_vecs > routes ? hidden_vecs : routes;
   constexpr int threads = 256;
@@ -42,6 +56,6 @@ cudaError_t kt_stage_moe_inputs(cudaStream_t stream, const void* hidden, int64_t
   if (blocks > 64) blocks = 64;
   stage_inputs_kernel<<<blocks, threads, 0, stream>>>(static_cast<const uint4*>(hidden),
                                                       static_cast<uint4*>(host_hidden), hidden_vecs, ids, ids_int32,
-                                                      host_ids, weights, host_weights, routes);
+                                                      host_ids, weights, host_weights, routes, bell, bell_value);
   return cudaGetLastError();
 }

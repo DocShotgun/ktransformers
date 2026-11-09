@@ -169,6 +169,31 @@ class CPUInfer {
 #endif
     submit_with_cuda_stream(user_cuda_stream, params);
   }
+
+  // The doorbell of submit_with_cuda_stream_doorbell without its stream memory write:
+  // while the stream is being captured, registers the task in a slot and returns the
+  // mapped word (a device pointer) and the value that a kernel captured next on this
+  // stream must store once its writes are visible (stage_moe_inputs does). (0, 0)
+  // means the caller must submit the task itself. Same one-in-flight rule.
+  std::pair<intptr_t, uint32_t> register_doorbell(intptr_t user_cuda_stream, std::pair<intptr_t, intptr_t> params) {
+#if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS)
+    if (stream_is_capturing(user_cuda_stream) && ensure_doorbell()) {
+      const uint32_t slot = doorbell_slot_count_.load(std::memory_order_relaxed);
+      if (slot < kDoorbellSlots) {
+        auto* args = static_cast<HostCallbackArgs*>((void*)params.second);
+        args->cpuinfer = this;
+        args->captured = true;
+        doorbell_slots_[slot] = {(void (*)(void*))params.first, args};
+        doorbell_slot_count_.store(slot + 1, std::memory_order_release);
+        keep_alive([args]() { args->release(args); });
+        return {static_cast<intptr_t>(doorbell_device_), slot + 1};
+      }
+    }
+#endif
+    (void)user_cuda_stream;
+    (void)params;
+    return {0, 0};
+  }
 #endif
 
   struct SyncArgs {
