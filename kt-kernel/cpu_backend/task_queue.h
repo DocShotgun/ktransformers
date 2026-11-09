@@ -21,12 +21,19 @@
 
 class TaskQueue {
  public:
-  TaskQueue();
+  // `idle_poll` runs while the worker spins for work and once at the start of
+  // sync(); it may enqueue a task (CPUInfer's doorbell) and returns whether it did.
+  explicit TaskQueue(std::function<bool()> idle_poll = nullptr);
   ~TaskQueue();
 
   void enqueue(std::function<void()>);
 
   void sync(size_t allow_n_pending);
+
+  // Count one more pending task without enqueuing, so sync() cannot see the queue
+  // drained while a caller is about to enqueue; release_hold() undoes it.
+  void hold();
+  void release_hold();
 
  private:
   struct Node {
@@ -49,6 +56,7 @@ class TaskQueue {
   std::condition_variable worker_cv;
   std::condition_variable sync_cv;
   std::exception_ptr first_exception;
+  std::function<bool()> idle_poll_;
 
   void worker();
 };

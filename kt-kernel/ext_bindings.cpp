@@ -697,6 +697,8 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def("sync_with_cuda_stream", &CPUInfer::sync_with_cuda_stream, py::arg("user_cuda_stream"),
            py::arg("allow_n_pending") = 0)
       .def("submit_with_cuda_stream", &CPUInfer::submit_with_cuda_stream)
+      .def("submit_with_cuda_stream_doorbell", &CPUInfer::submit_with_cuda_stream_doorbell)
+      .def("doorbell_slot_count", &CPUInfer::doorbell_slot_count)
 #endif
       ;
 

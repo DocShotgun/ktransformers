@@ -42,7 +42,7 @@ const int64_t kWorkerSpinUs = spin_us_from_env("KT_TASKQ_SPIN_US", 2000);
 const int64_t kSyncSpinUs = spin_us_from_env("KT_SYNC_SPIN_US", 1000);
 }  // namespace
 
-TaskQueue::TaskQueue() : done(false), pending(0) {
+TaskQueue::TaskQueue(std::function<bool()> idle_poll) : done(false), pending(0), idle_poll_(std::move(idle_poll)) {
   Node* dummy = new Node();
   head.store(dummy, std::memory_order_relaxed);
   tail.store(dummy, std::memory_order_relaxed);
@@ -77,7 +77,20 @@ void TaskQueue::enqueue(std::function<void()> task) {
   worker_cv.notify_one();
 }
 
+void TaskQueue::hold() { pending.fetch_add(1, std::memory_order_acq_rel); }
+
+void TaskQueue::release_hold() {
+  {
+    std::lock_guard<std::mutex> lock(mtx);
+    pending.fetch_sub(1, std::memory_order_acq_rel);
+  }
+  sync_cv.notify_all();
+}
+
 void TaskQueue::sync(size_t allow_n_pending) {
+  // A doorbell the worker has not claimed yet is claimed here, so the wait below
+  // always covers the task it stands for.
+  if (idle_poll_) idle_poll_();
   // The caller is usually waiting on the tail of a task it has just submitted
   // (one forward per layer during decode), so spin for a short while before
   // going to sleep: the wake-up would otherwise cost a futex round trip on the
@@ -136,6 +149,7 @@ void TaskQueue::worker() {
       // submissions hand the task over without sleeping.
       auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(kWorkerSpinUs);
       while (curr->next.load(std::memory_order_acquire) == nullptr) {
+        if (idle_poll_ && idle_poll_()) break;
         if (std::chrono::steady_clock::now() >= spin_until) {
           break;
         }

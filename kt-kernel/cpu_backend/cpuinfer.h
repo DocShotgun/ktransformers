@@ -13,9 +13,11 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <queue>
 #include <thread>
 #include <vector>
@@ -59,7 +61,7 @@ class CPUInfer {
   CPUInfer(int thread_num) {
     printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
     backend_ = new WorkerPool(thread_num);
-    task_queue_ = new TaskQueue();
+    task_queue_ = new TaskQueue([this] { return poll_doorbell(); });
     for (int i = 0; i < (1 << 16); ++i) {
       ggml_table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(i);
     }
@@ -67,7 +69,7 @@ class CPUInfer {
   CPUInfer(int thread_num, int numa_id) {
     printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
     backend_ = new WorkerPool(thread_num, numa_id);
-    task_queue_ = new TaskQueue();
+    task_queue_ = new TaskQueue([this] { return poll_doorbell(); });
     for (int i = 0; i < (1 << 16); ++i) {
       ggml_table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(i);
     }
@@ -76,7 +78,7 @@ class CPUInfer {
   CPUInfer(WorkerPoolConfig config) {
     printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
     backend_ = new WorkerPool(config);
-    task_queue_ = new TaskQueue();
+    task_queue_ = new TaskQueue([this] { return poll_doorbell(); });
     for (int i = 0; i < (1 << 16); ++i) {
       ggml_table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(i);
     }
@@ -136,6 +138,37 @@ class CPUInfer {
     cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)func, args);
 #endif
   }
+
+  // submit_with_cuda_stream without the host node on graph replay. While the stream
+  // is being captured, the task is registered in a doorbell slot and the graph gets
+  // a stream memory write of slot+1 into a mapped word that the queue worker polls,
+  // so the CPU starts as soon as the GPU reaches it instead of after the driver's
+  // host-callback dispatch (~27 us on SM120), and the stream does not stall there.
+  // Requires that this task's sync_with_cuda_stream comes before the next doorbell
+  // submit (one KT forward in flight, no deferred task); otherwise, outside capture,
+  // or when the memory write is unavailable, it is submit_with_cuda_stream.
+  void submit_with_cuda_stream_doorbell(intptr_t user_cuda_stream, std::pair<intptr_t, intptr_t> params) {
+#if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS)
+    if (stream_is_capturing(user_cuda_stream) && ensure_doorbell()) {
+      const uint32_t slot = doorbell_slot_count_.load(std::memory_order_relaxed);
+      if (slot < kDoorbellSlots) {
+        auto* args = static_cast<HostCallbackArgs*>((void*)params.second);
+        args->cpuinfer = this;
+        args->captured = true;
+        doorbell_slots_[slot] = {(void (*)(void*))params.first, args};
+        doorbell_slot_count_.store(slot + 1, std::memory_order_release);
+        if (write_value_((CUstream)user_cuda_stream, doorbell_device_, slot + 1, CU_STREAM_WRITE_VALUE_DEFAULT) ==
+            CUDA_SUCCESS) {
+          keep_alive([args]() { args->release(args); });
+          return;
+        }
+        // The slot stays registered but is never rung; fall back to the host node.
+        doorbell_disabled_ = true;
+      }
+    }
+#endif
+    submit_with_cuda_stream(user_cuda_stream, params);
+  }
 #endif
 
   struct SyncArgs {
@@ -177,6 +210,9 @@ class CPUInfer {
   }
 #endif
 
+  // Captured forwards that ring a doorbell instead of a host node (for tests).
+  uint32_t doorbell_slot_count() const { return doorbell_slot_count_.load(std::memory_order_acquire); }
+
  public:
   WorkerPool* backend_;
   TaskQueue* task_queue_;
@@ -212,6 +248,85 @@ class CPUInfer {
     std::lock_guard<std::mutex> lock(captured_args_mutex_);
     captured_args_.push_back(std::move(release));
   }
+
+  // Claims a rung doorbell and enqueues its task. Runs on the queue worker while it
+  // spins and at the start of every sync(); the CAS makes exactly one of them win.
+  // The hold keeps sync() from seeing nothing pending between the claim and the
+  // enqueue, which would let the stream copy the output back before the task ran.
+  bool poll_doorbell() {
+    std::atomic<uint32_t>* bell = doorbell_.load(std::memory_order_acquire);
+    if (bell == nullptr) return false;
+    uint32_t value = bell->load(std::memory_order_acquire);
+    if (value == 0) return false;
+    task_queue_->hold();
+    if (!bell->compare_exchange_strong(value, 0, std::memory_order_acq_rel)) {
+      task_queue_->release_hold();
+      return false;
+    }
+    // Slots are registered at capture, long before a replay can ring them.
+    if (value > doorbell_slot_count_.load(std::memory_order_acquire)) {
+      task_queue_->release_hold();
+      return false;
+    }
+    const DoorbellSlot& slot = doorbell_slots_[value - 1];
+    slot.func(slot.args);
+    task_queue_->release_hold();
+    return true;
+  }
+
+#if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS)
+  // Lazily maps the doorbell word and resolves cuStreamWriteValue32 through the
+  // runtime (no libcuda link). KT_DOORBELL=0 keeps every submit on the host node.
+  bool ensure_doorbell() {
+    if (doorbell_disabled_) return false;
+    if (doorbell_.load(std::memory_order_acquire) != nullptr) return true;
+    const char* env = std::getenv("KT_DOORBELL");
+    if (env != nullptr && env[0] == '0') {
+      doorbell_disabled_ = true;
+      return false;
+    }
+    void* fn = nullptr;
+    cudaDriverEntryPointQueryResult status;
+    void* host = nullptr;
+    void* device = nullptr;
+    // Allocating pinned memory is not allowed inside a global-mode capture; relax
+    // this thread's mode around it.
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    cudaThreadExchangeStreamCaptureMode(&mode);
+    const bool ok = cudaGetDriverEntryPointByVersion("cuStreamWriteValue32", &fn, 12000, cudaEnableDefault,
+                                                     &status) == cudaSuccess &&
+                    status == cudaDriverEntryPointSuccess && fn != nullptr &&
+                    cudaHostAlloc(&host, 64, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess &&
+                    cudaHostGetDevicePointer(&device, host, 0) == cudaSuccess;
+    cudaThreadExchangeStreamCaptureMode(&mode);
+    if (!ok) {
+      if (host != nullptr) cudaFreeHost(host);
+      doorbell_disabled_ = true;
+      return false;
+    }
+    write_value_ = reinterpret_cast<WriteValueFn>(fn);
+    doorbell_device_ = reinterpret_cast<CUdeviceptr>(device);
+    auto* bell = new (host) std::atomic<uint32_t>(0);
+    doorbell_.store(bell, std::memory_order_release);
+    return true;
+  }
+
+  using WriteValueFn = CUresult (*)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
+  WriteValueFn write_value_ = nullptr;
+  CUdeviceptr doorbell_device_ = 0;
+#endif
+
+  struct DoorbellSlot {
+    void (*func)(void*);
+    void* args;
+  };
+  // Fixed capacity so the worker never reads a reallocating table; one slot per
+  // captured KT forward (graphs x MoE layers).
+  static constexpr uint32_t kDoorbellSlots = 8192;
+  std::unique_ptr<DoorbellSlot[]> doorbell_slots_{new DoorbellSlot[kDoorbellSlots]()};
+  std::atomic<uint32_t> doorbell_slot_count_{0};
+  std::atomic<std::atomic<uint32_t>*> doorbell_{nullptr};
+  bool doorbell_disabled_ = false;
 
   std::vector<std::function<void()>> captured_args_;
   std::mutex captured_args_mutex_;

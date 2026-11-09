@@ -885,6 +885,10 @@ class BaseMoEWrapper(_MoEBase, ABC):
             ):
                 kt_kernel_ext.subscribe_ascend_stream(int(cuda_stream))
             self.cpu_infer.submit(immediate_task)
+        elif deferred_ids is None:
+            # One task per forward: inside a CUDA graph the GPU rings a doorbell the
+            # CPU polls instead of running a host node (submit_with_cuda_stream_doorbell).
+            self.cpu_infer.submit_with_cuda_stream_doorbell(cuda_stream, immediate_task)
         else:
             self.cpu_infer.submit_with_cuda_stream(cuda_stream, immediate_task)
 
