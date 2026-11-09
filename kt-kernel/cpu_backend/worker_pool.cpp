@@ -425,8 +425,6 @@ void NumaJobDistributor::worker_thread(int numa_id) {
   while (true) {
     auto stat = status[numa_id]->load(std::memory_order_acquire);
     if (stat == ThreadStatus::WORKING) {
-      auto me_numa = numa_node_of_cpu(sched_getcpu());
-      // printf("numa work on %d, me %d\n", numa_id, me_numa);
       compute_func(numa_id);
       status[numa_id]->store(ThreadStatus::WAITING, std::memory_order_release);
       start = std::chrono::high_resolution_clock::now();

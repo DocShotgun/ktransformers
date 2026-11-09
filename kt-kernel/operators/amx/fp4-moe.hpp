@@ -269,13 +269,22 @@ struct GemmKernel224MXFP4SmallKGroup {
         row_major = true;
       } else {
         // Restore the staging pointer if the previous call aliased a prefill
-        // buffer; set_data() usually did it already, but from_mat() must not
-        // depend on that.
-        if (row_major) a = pool;
+        // buffer or another expert's row; set_data() usually did it already,
+        // but from_mat() must not depend on that.
+        a = pool;
         Base::from_mat(m, src, ith, nth);
         row_major = false;
       }
       natural_order = false;
+    }
+
+    // Reads source's natural-order decode row in place of a copy of it; the next
+    // set_data() or from_mat*() returns to this buffer's own storage.
+    void alias_natural(const BufferA& source) {
+      assert(source.natural_order && !source.row_major);
+      a = source.a;
+      row_major = false;
+      natural_order = true;
     }
 
     // Row stride of the aliased prefill buffer, or of one K block of the
@@ -294,7 +303,7 @@ struct GemmKernel224MXFP4SmallKGroup {
       assert(m <= max_m);
       assert(ith == 0 && nth == 1);
       assert(k % 32 == 0);
-      if (row_major) a = pool;
+      a = pool;
       row_major = false;
       for (int mi = 0; mi < m; ++mi) {
         const __m512bh* src_row = reinterpret_cast<const __m512bh*>(src + static_cast<size_t>(mi) * k);
@@ -1685,6 +1694,15 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
       amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
                           down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
     }
+  }
+
+  // The natural-order conversion depends only on the input row, so one copy serves
+  // every expert of the step.
+  bool share_decode_gate_input(int expert_idx, int source_expert, int qlen) {
+    if (qlen != 1 || config_.quant_config.group_size != 32 || config_.hidden_size % 32 != 0) return false;
+    if (!gate_up_ba_[source_expert]->natural_order) return false;
+    gate_up_ba_[expert_idx]->alias_natural(*gate_up_ba_[source_expert]);
+    return true;
   }
 
   void prepare_decode_gate_input(int expert_idx, int qlen, const void* input) {

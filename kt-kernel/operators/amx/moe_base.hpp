@@ -577,7 +577,11 @@ class AMX_MOE_BASE {
       gate_up_ba_[expert_idx]->set_data(gate_up_ba_pool_ptr);
       size_t ba_size = align64(buffer_a_required_size(max_m, config_.hidden_size));
       gate_up_ba_pool_ptr = (void*)((uintptr_t)gate_up_ba_pool_ptr + ba_size);
-      derived()->prepare_decode_gate_input(expert_idx, qlen, input);
+      // Every expert reads the same input row; a backend whose conversion does not
+      // depend on the expert can point the others at the first expert's copy.
+      if (i == 0 || !derived()->share_decode_gate_input(expert_idx, m_expert_id_map_[0], qlen)) {
+        derived()->prepare_decode_gate_input(expert_idx, qlen, input);
+      }
     }
 
 #ifdef FORWARD_TIME_PROFILE
@@ -720,6 +724,10 @@ class AMX_MOE_BASE {
   void prepare_decode_gate_input(int expert_idx, int qlen, const void* input) {
     gate_up_ba_[expert_idx]->from_mat(qlen, (ggml_bf16_t*)input, 0, 1);
   }
+
+  // Makes expert_idx's gate/up input alias source_expert's converted one; false keeps
+  // the per-expert conversion.
+  bool share_decode_gate_input(int expert_idx, int source_expert, int qlen) { return false; }
 
   void prepare_decode_down_input(int expert_idx, int qlen) {
     down_ba_[expert_idx]->from_mat(qlen, m_local_gate_output_ptr_[expert_idx], 0, 1);
@@ -1002,39 +1010,51 @@ class TP_MOE<AMX_MOE_BASE<T, Derived>> : public TP_MOE_Common<AMX_MOE_BASE<T, De
     throw std::runtime_error("Not Implemented");
   }
 
-  void merge_results(int qlen, void* output, bool incremental) override {
-    auto& config = this->config;
-    auto& tp_count = this->tp_count;
-    auto& local_output_numa = this->local_output_numa;
-    auto& tp_configs = this->tp_configs;
-
-    auto merge_fn = [this, output, incremental, &config, &tp_count, &local_output_numa, &tp_configs](int token_nth) {
-      const float* base = local_output_numa[0] + (size_t)token_nth * tp_configs[0].hidden_size;
-      ggml_bf16_t* dst = (ggml_bf16_t*)output + (size_t)token_nth * config.hidden_size;
-      // Accumulate the TP parts in registers and convert once. The previous
-      // form wrote the running sum back to local_output_numa[0] and then
-      // re-read it for the BF16 conversion, so every token cost an extra
-      // hidden_size write + read of the (remote) scratch.
-      for (int e = 0; e < config.hidden_size; e += 32) {
-        __m512 x0, x1;
-        if (incremental) {
-          avx512_32xbf16_to_32xfp32((__m512i*)(dst + e), &x0, &x1);
-          x0 = _mm512_add_ps(x0, _mm512_loadu_ps(base + e));
-          x1 = _mm512_add_ps(x1, _mm512_loadu_ps(base + e + 16));
-        } else {
-          x0 = _mm512_loadu_ps(base + e);
-          x1 = _mm512_loadu_ps(base + e + 16);
-        }
-        for (int i = 1; i < tp_count; i++) {
-          const float* src = local_output_numa[i] + (size_t)token_nth * tp_configs[i].hidden_size;
-          x0 = _mm512_add_ps(x0, _mm512_loadu_ps(src + e));
-          x1 = _mm512_add_ps(x1, _mm512_loadu_ps(src + e + 16));
-        }
-        avx512_32xfp32_to_32xbf16(&x0, &x1, (__m512i*)(dst + e));
+  // Sums elements [e_begin, e_end) of one token's TP partials into output, in TP order,
+  // accumulating in registers and converting to BF16 once.
+  void merge_token(int token_nth, int e_begin, int e_end, void* output, bool incremental) {
+    const float* base = this->local_output_numa[0] + (size_t)token_nth * this->tp_configs[0].hidden_size;
+    ggml_bf16_t* dst = (ggml_bf16_t*)output + (size_t)token_nth * this->config.hidden_size;
+    for (int e = e_begin; e < e_end; e += 32) {
+      __m512 x0, x1;
+      if (incremental) {
+        avx512_32xbf16_to_32xfp32((__m512i*)(dst + e), &x0, &x1);
+        x0 = _mm512_add_ps(x0, _mm512_loadu_ps(base + e));
+        x1 = _mm512_add_ps(x1, _mm512_loadu_ps(base + e + 16));
+      } else {
+        x0 = _mm512_loadu_ps(base + e);
+        x1 = _mm512_loadu_ps(base + e + 16);
       }
+      for (int i = 1; i < this->tp_count; i++) {
+        const float* src = this->local_output_numa[i] + (size_t)token_nth * this->tp_configs[i].hidden_size;
+        x0 = _mm512_add_ps(x0, _mm512_loadu_ps(src + e));
+        x1 = _mm512_add_ps(x1, _mm512_loadu_ps(src + e + 16));
+      }
+      avx512_32xfp32_to_32xbf16(&x0, &x1, (__m512i*)(dst + e));
+    }
+  }
+
+  // Decode-size batches merge inside the NUMA job: one thread summing every remote
+  // partial costs about 6 us per layer, a quarter of hidden_size per node about 1.5.
+  bool merges_in_numa_job(int qlen) const override { return qlen < 10; }
+
+  void merge_results_part(int qlen, void* output, bool incremental, int part, int parts) override {
+    const int groups = this->config.hidden_size / 32;
+    const int begin = static_cast<int>(static_cast<int64_t>(groups) * part / parts) * 32;
+    const int end = static_cast<int>(static_cast<int64_t>(groups) * (part + 1) / parts) * 32;
+    for (int i = 0; i < qlen; i++) {
+      merge_token(i, begin, end, output, incremental);
+    }
+  }
+
+  void merge_results(int qlen, void* output, bool incremental) override {
+    const int hidden = this->config.hidden_size;
+    auto merge_fn = [this, output, incremental, hidden](int token_nth) {
+      merge_token(token_nth, 0, hidden, output, incremental);
     };
 
-    auto pool = config.pool;
+    auto pool = this->config.pool;
+    const int tp_count = this->tp_count;
     if (qlen < 10) {
       for (int i = 0; i < qlen; i++) {
         merge_fn(i);

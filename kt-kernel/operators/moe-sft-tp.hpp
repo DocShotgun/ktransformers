@@ -768,6 +768,9 @@ class TP_MOE_SFT : public TP_MOE<T> {
    */
   void merge_results(int qlen, void* output) override { merge_results(qlen, output, false); }
 
+  // Keeps forward() on the merge_results override below.
+  bool merges_in_numa_job(int qlen) const override { return false; }
+
   void merge_results(int qlen, void* output, bool incremental) override {
     auto& tp_count_ref = this->tp_count;
     auto& local_output_numa_ref = this->local_output_numa;

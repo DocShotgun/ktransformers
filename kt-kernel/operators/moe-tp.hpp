@@ -3,6 +3,9 @@
 
 // #define CHECK
 
+#include <immintrin.h>
+
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -209,11 +212,22 @@ class TP_MOE_Common : public MoE_Interface {
     int qlen = *qlen_ptr;
 
     auto pool = config.pool;
-    pool->dispense_backend()->do_numa_job([this, pool, qlen, k, expert_ids, input, weights](int numa_id) {
-      tps[numa_id]->forward(qlen, k, expert_ids, weights, input, this->local_output_numa[numa_id]);
-    });
-
-    merge_results(qlen, output, incremental);
+    if (merges_in_numa_job(qlen)) {
+      // Each node sums its part of hidden_size once every node's partial is complete.
+      std::atomic<int> finished{0};
+      const int parts = tp_count;
+      pool->dispense_backend()->do_numa_job([&](int numa_id) {
+        tps[numa_id]->forward(qlen, k, expert_ids, weights, input, this->local_output_numa[numa_id]);
+        finished.fetch_add(1, std::memory_order_acq_rel);
+        while (finished.load(std::memory_order_acquire) < parts) _mm_pause();
+        merge_results_part(qlen, output, incremental, numa_id, parts);
+      });
+    } else {
+      pool->dispense_backend()->do_numa_job([this, pool, qlen, k, expert_ids, input, weights](int numa_id) {
+        tps[numa_id]->forward(qlen, k, expert_ids, weights, input, this->local_output_numa[numa_id]);
+      });
+      merge_results(qlen, output, incremental);
+    }
 #ifdef FORWARD_TIME_REPORT
     auto end = std::chrono::high_resolution_clock::now();
     auto forward_time = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
@@ -248,6 +262,14 @@ class TP_MOE_Common : public MoE_Interface {
   virtual void load_weights() = 0;
 
   virtual void merge_results(int qlen, void* output) = 0;
+
+  // Whether forward() merges a qlen-token batch inside the NUMA job, each node summing
+  // part `numa_id` of hidden_size with merge_results_part in merge_results' order.
+  virtual bool merges_in_numa_job(int qlen) const { return false; }
+
+  virtual void merge_results_part(int qlen, void* output, bool incremental, int part, int parts) {
+    throw std::runtime_error("Not Implemented");
+  }
 
   virtual void merge_results(int qlen, void* output, bool incremental) {
     if (incremental == false) {
