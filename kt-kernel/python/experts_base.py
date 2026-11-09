@@ -213,6 +213,34 @@ def generate_gpu_experts_masks(
     return gpu_experts_masks
 
 
+# Rows up to which one staging kernel (cuda/kt_stage_inputs.cu) replaces the
+# cast and three device-to-host copies; larger batches keep the copy engine.
+# Arbitrary; decode and speculative verification are far below it.
+_STAGE_MAX_ROWS = 64
+_STAGE_ON_GPU = os.environ.get("KT_STAGE_KERNEL", "1") != "0" and hasattr(kt_kernel_ext, "stage_moe_inputs")
+
+
+def _can_stage_on_gpu(hidden: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor, host_hidden) -> bool:
+    """Whether stage_moe_inputs can produce exactly what the copy_ path would."""
+    return (
+        _STAGE_ON_GPU
+        and hidden.is_cuda
+        and hidden.shape[0] <= _STAGE_MAX_ROWS
+        and hidden.dtype == torch.bfloat16
+        and host_hidden.dtype == torch.bfloat16
+        and hidden.is_contiguous()
+        and (hidden.numel() * 2) % 16 == 0
+        and hidden.data_ptr() % 16 == 0
+        and host_hidden.data_ptr() % 16 == 0
+        and ids.dtype in (torch.int32, torch.int64)
+        and ids.is_contiguous()
+        and weights.dtype == torch.float32
+        and weights.is_contiguous()
+        and ids.shape == weights.shape
+        and ids.shape[0] == hidden.shape[0]
+    )
+
+
 class KExpertsCPUBuffer:
     """Pinned buffers that carry one MoE layer's tokens to the CPU experts, and the
     device buffer the result comes back to.
@@ -645,6 +673,32 @@ class BaseMoEWrapper(_MoEBase, ABC):
         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
         next_slot = (current_slot + 1) % KExpertsCPUBuffer.buffer_depth
         bsz_slot_tensor = bsz_tensor_cpu[current_slot]
+
+        if self.max_deferred_experts_per_token == 0 and _can_stage_on_gpu(
+            flat_hidden_states, topk_ids, topk_weights, input_tensor_cpu[current_slot]
+        ):
+            kt_kernel_ext.stage_moe_inputs(
+                torch.cuda.current_stream(flat_hidden_states.device).cuda_stream,
+                flat_hidden_states.data_ptr(),
+                flat_hidden_states.numel() * flat_hidden_states.element_size(),
+                topk_ids.data_ptr(),
+                topk_ids.dtype == torch.int32,
+                topk_weights.data_ptr(),
+                topk_ids.numel(),
+                input_tensor_cpu[current_slot].data_ptr(),
+                immediate_experts_ids_cpu[current_slot].data_ptr(),
+                weights_cpu[current_slot].data_ptr(),
+            )
+            buffers = (
+                input_tensor_cpu,
+                immediate_experts_ids_cpu,
+                deferred_experts_ids_cpu,
+                weights_cpu,
+                output_cpu,
+                bsz_tensor_cpu,
+                _output_gpu,
+            )
+            return topk_ids, None, buffers, current_slot, next_slot
 
         topk_ids_long = topk_ids.to(torch.long)
         if self.max_deferred_experts_per_token > 0:

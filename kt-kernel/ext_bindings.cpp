@@ -90,6 +90,13 @@ static const bool _is_plain_ = false;
 #include "pybind11/pybind11.h"
 
 namespace py = pybind11;
+
+#if defined(KTRANSFORMERS_USE_CUDA)
+// cuda/kt_stage_inputs.cu
+cudaError_t kt_stage_moe_inputs(cudaStream_t stream, const void* hidden, int64_t hidden_bytes, const void* ids,
+                                bool ids_int32, const float* weights, int64_t routes, void* host_hidden,
+                                int64_t* host_ids, float* host_weights);
+#endif
 using namespace pybind11::literals;
 
 py::object to_float_ptr(uintptr_t input_ptr, int size, ggml_type type) {
@@ -686,6 +693,21 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def_readwrite("subpool_count", &WorkerPoolConfig::subpool_count)
       .def_readwrite("subpool_numa_map", &WorkerPoolConfig::subpool_numa_map)
       .def_readwrite("subpool_thread_count", &WorkerPoolConfig::subpool_thread_count);
+
+#if defined(KTRANSFORMERS_USE_CUDA)
+  m.def(
+      "stage_moe_inputs",
+      [](intptr_t stream, intptr_t hidden, int64_t hidden_bytes, intptr_t ids, bool ids_int32, intptr_t weights,
+         int64_t routes, intptr_t host_hidden, intptr_t host_ids, intptr_t host_weights) {
+        const cudaError_t err = kt_stage_moe_inputs(
+            reinterpret_cast<cudaStream_t>(stream), reinterpret_cast<const void*>(hidden), hidden_bytes,
+            reinterpret_cast<const void*>(ids), ids_int32, reinterpret_cast<const float*>(weights), routes,
+            reinterpret_cast<void*>(host_hidden), reinterpret_cast<int64_t*>(host_ids),
+            reinterpret_cast<float*>(host_weights));
+        if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
+      },
+      "Copy one layer's hidden rows, routing weights and int64 expert ids to pinned host memory in one kernel.");
+#endif
 
   py::class_<CPUInfer>(m, "CPUInfer")
       .def(py::init<int>())
