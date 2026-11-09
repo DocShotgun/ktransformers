@@ -104,6 +104,9 @@ void TaskQueue::worker() {
         } catch (...) {
           task_exception = std::current_exception();
         }
+        // This node stays the queue head until the next task arrives; release
+        // the closure and its captures before sync() can observe completion.
+        next->task = nullptr;
       }
       delete curr;
       curr = next;

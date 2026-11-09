@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -35,6 +36,13 @@ int main() {
   } catch (const std::runtime_error& error) {
     assert(std::string(error.what()) == "first");
   }
+
+  // A finished task's captures are released by the time sync() returns, even
+  // when no later task arrives to retire its queue node.
+  auto captured = std::make_shared<int>(0);
+  queue.enqueue([captured] { (void)captured; });
+  queue.sync(0);
+  assert(captured.use_count() == 1);
 
   return 0;
 }
