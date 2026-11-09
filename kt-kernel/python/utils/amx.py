@@ -584,8 +584,8 @@ class AMXMoEWrapper(BaseMoEWrapper):
 class NativeMoEWrapper(BaseMoEWrapper):
     """Wrapper for native CPU/SYCL experts stored in compressed SafeTensor format."""
 
-    # Loader instances keyed by weight method; per-layer quant autodetect can
-    # create more than one per model (e.g. NVFP4 layers plus an MXFP8 layer).
+    # Loader instances keyed by weight method. Every layer loads with the wrapper's
+    # own method, so a model holds one loader; there is no per-layer detection.
     _native_loader_instances: dict = {}
 
     def __init__(

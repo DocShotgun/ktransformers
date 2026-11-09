@@ -852,7 +852,8 @@ class TP_MOE<AMX_MXFP8_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_MXFP8_MOE_
               uint8_t* src_up_scale = (uint8_t*)config.up_scales[0][expert_id];
               uint8_t* src_down_scale = (uint8_t*)config.down_scales[0][expert_id];
 
-              // gate/up: row-major [intermediate_size, hidden_size], TP splits along hidden
+              // gate/up: row-major [intermediate_size, hidden_size], each TP part is a
+              // contiguous block of intermediate rows
               memcpy((uint8_t*)tpc.gate_proj + expert_id * weight_elem_count,
                      src_gate + i * weight_elem_count, weight_elem_count);
               memcpy((uint8_t*)tpc.up_proj + expert_id * weight_elem_count,
