@@ -13,6 +13,7 @@
 #include <sched.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <thread>
 
@@ -24,12 +25,21 @@
 #endif
 
 namespace {
-// How long the worker spins for a follow-up task before going to sleep.
-constexpr int64_t kWorkerSpinUs = 100;
-// How long sync() spins for the tail of the task it just submitted. Decode
-// needs the round trip hidden (~4 us); prefill would otherwise burn the full
-// budget on every layer because its task is much longer than the spin.
-constexpr int64_t kSyncSpinUs = 10;
+int64_t spin_us_from_env(const char* name, int64_t fallback) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') return fallback;
+  const long long parsed = std::atoll(value);
+  return parsed < 0 ? fallback : parsed;
+}
+// How long the worker spins for a follow-up task before going to sleep
+// (KT_TASKQ_SPIN_US). Decode's gap between layers is the GPU's per-layer work
+// (~300 us on DSv4.1, more on larger models); sleeping there puts a futex wake on
+// every layer's critical path.
+const int64_t kWorkerSpinUs = spin_us_from_env("KT_TASKQ_SPIN_US", 2000);
+// How long sync() spins for the tail of the task it just submitted
+// (KT_SYNC_SPIN_US). Decode tasks take 70-1000 us; past the spin, completion costs
+// a futex wake. A prefill layer's task outlasts it and then sleeps as before.
+const int64_t kSyncSpinUs = spin_us_from_env("KT_SYNC_SPIN_US", 1000);
 }  // namespace
 
 TaskQueue::TaskQueue() : done(false), pending(0) {

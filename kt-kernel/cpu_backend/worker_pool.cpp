@@ -22,6 +22,13 @@
 
 #include "hwloc.h"
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#define KT_POOL_PAUSE() _mm_pause()
+#else
+#define KT_POOL_PAUSE() ((void)0)
+#endif
+
 thread_local int WorkerPool::thread_local_id = -1;
 
 InNumaPool::InNumaPool(int max_thread_num) {
@@ -98,6 +105,9 @@ InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
 }
 
 InNumaPool::~InNumaPool() {
+  exit_.store(true, std::memory_order_seq_cst);
+  gen_.store(((gen_.load(std::memory_order_relaxed) >> kGenCountBits) + 1) << kGenCountBits,
+             std::memory_order_seq_cst);
   for (int i = 0; i < total_worker_count; i++) {
     {
       std::lock_guard<std::mutex> lock(thread_state_[i].mutex);
@@ -120,9 +130,9 @@ int InNumaPool::get_thread_num() {
 void InNumaPool::set_restricted_worker_count(int count) { restricted_worker_count = count; }
 
 void InNumaPool::wait() {
-  for (int i = 0; i < worker_count; i++) {
-    while (thread_state_[i].status.load(std::memory_order_acquire) == ThreadStatus::WORKING) {
-    }
+  // Thread 0 is the caller, which ran its share inside do_work_stealing_job_async.
+  while (done_.load(std::memory_order_acquire) < worker_count - 1) {
+    KT_POOL_PAUSE();
   }
 
 #ifdef PROFILE_BALANCE
@@ -159,12 +169,18 @@ void InNumaPool::do_work_stealing_job_async(int task_num, std::function<void(int
   worker_count = std::min(restricted_worker_count, task_num);
   curr_.store(0, std::memory_order_release);
   end_ = task_num;
-  for (int i = 0; i < worker_count; i++) {
-    {
+  done_.store(0, std::memory_order_relaxed);
+  assert(worker_count < (1 << kGenCountBits));
+  // seq_cst pairs with the worker's seq_cst `sleeping` store: either we see it
+  // asleep and notify under its mutex, or it sees the new generation first.
+  // Only one thread dispatches to a pool at a time, so load + store is enough.
+  const uint64_t next_gen = ((gen_.load(std::memory_order_relaxed) >> kGenCountBits) + 1) << kGenCountBits;
+  gen_.store(next_gen | static_cast<uint64_t>(std::max(worker_count, 0)), std::memory_order_seq_cst);
+  for (int i = 1; i < worker_count; i++) {
+    if (thread_state_[i].sleeping.load(std::memory_order_seq_cst)) {
       std::lock_guard<std::mutex> lock(thread_state_[i].mutex);
-      thread_state_[i].status.store(ThreadStatus::WORKING, std::memory_order_release);
+      thread_state_[i].cv.notify_one();
     }
-    thread_state_[i].cv.notify_one();
   }
   WorkerPool::thread_local_id = 0;
   process_tasks(0);
@@ -187,8 +203,8 @@ void InNumaPool::process_tasks(int thread_id) {
       break;
     }
 
-    int block = (rem + worker_count - 1) / worker_count;
-    block = 1;
+    // One task per claim. worker_count is the dispatcher's field; a helper must not read it.
+    const int block = 1;
     int task_id = curr_.fetch_add(block, std::memory_order_acq_rel);
     if (task_id >= end_) {
       break;
@@ -211,31 +227,45 @@ void InNumaPool::process_tasks(int thread_id) {
   s.finish_ns =
       std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - start).count();
 #endif
+  if (thread_id != 0) {
+    done_.fetch_add(1, std::memory_order_release);
+  }
 }
 
 void InNumaPool::worker_thread(int thread_id, int numa_id) {
   if (numa_id >= 0) {
     set_memory_to_numa(numa_id);
   }
-  auto start = std::chrono::high_resolution_clock::now();
   WorkerPool::thread_local_id = thread_id;  // 设置线程本地变量
+  auto& s = thread_state_[thread_id];
+  // Generations start at 0, so a worker that starts after the first dispatch still runs it.
+  uint64_t seen = 0;
+  auto last_work = std::chrono::steady_clock::now();
+  uint32_t spins = 0;
   while (true) {
-    ThreadStatus status = thread_state_[thread_id].status.load(std::memory_order_acquire);
-    if (status == ThreadStatus::WORKING) {
-      process_tasks(thread_id);
-      start = std::chrono::high_resolution_clock::now();
-    } else if (status == ThreadStatus::WAITING) {
-      auto now = std::chrono::high_resolution_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-      if (duration > 50) {
-        std::unique_lock<std::mutex> lock(thread_state_[thread_id].mutex);
-        thread_state_[thread_id].cv.wait(lock, [&] {
-          return thread_state_[thread_id].status.load(std::memory_order_acquire) != ThreadStatus::WAITING;
-        });
-      }
-    } else if (status == ThreadStatus::EXIT) {
-      return;
+    const uint64_t gen = gen_.load(std::memory_order_acquire);
+    if (gen != seen) {
+      seen = gen;
+      if (exit_.load(std::memory_order_acquire)) return;
+      // The job fields were written before the generation bump; the count travels in it.
+      const int participants = static_cast<int>(gen & ((uint64_t{1} << kGenCountBits) - 1));
+      if (thread_id < participants) process_tasks(thread_id);
+      last_work = std::chrono::steady_clock::now();
+      spins = 0;
+      continue;
     }
+    if (exit_.load(std::memory_order_relaxed)) return;
+    KT_POOL_PAUSE();
+    // Read the clock only every 256 pauses; the SMT sibling hosts the queue and callback threads.
+    if ((++spins & 255) != 0) continue;
+    if (std::chrono::steady_clock::now() - last_work < std::chrono::milliseconds(50)) continue;
+    std::unique_lock<std::mutex> lock(s.mutex);
+    s.sleeping.store(true, std::memory_order_seq_cst);
+    s.cv.wait(lock, [&] {
+      return gen_.load(std::memory_order_seq_cst) != seen || exit_.load(std::memory_order_acquire);
+    });
+    s.sleeping.store(false, std::memory_order_relaxed);
+    last_work = std::chrono::steady_clock::now();
   }
 }
 

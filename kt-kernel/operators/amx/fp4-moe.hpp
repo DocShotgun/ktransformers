@@ -47,13 +47,39 @@ struct GemmKernel224MXFP4SmallKGroup {
   // tasks to cover a full 32-thread subpool; wide projections are 2x
   // faster on whole panels and the AMX prefill kernel (m >= 16)
   // re-streams the activation for every task, so both keep whole panels.
-  static int task_width(int n, int m) { return m >= 16 || n >= 8 * N_BLOCK ? N_BLOCK : 64; }
+  static int task_width(int n, int m) {
+    if (m >= 16) return N_BLOCK;
+    return n >= 8 * N_BLOCK ? decode_wide_width() : decode_narrow_width();
+  }
+
+  // Small-m (decode) task widths. Any multiple of 32 that divides N_BLOCK keeps the
+  // K-major kernels bit-identical: each 32-channel tile is computed independently.
+  static int decode_width_from_env(const char* name, int fallback) {
+    const char* value = std::getenv(name);
+    const int width = value ? std::atoi(value) : fallback;
+    return width >= 32 && width <= N_BLOCK && width % 32 == 0 && N_BLOCK % width == 0 ? width : fallback;
+  }
+  static int decode_narrow_width() {
+    static const int width = decode_width_from_env("KT_FP4_DECODE_WIDTH", 32);
+    return width;
+  }
+  static int decode_wide_width() {
+    static const int width = decode_width_from_env("KT_FP4_DECODE_DOWN_WIDTH", N_BLOCK);
+    return width;
+  }
+
+  // Bytes ahead that the m=1 K-major kernels prefetch (KT_FP4_DECODE_PREFETCH, 0 = off).
+  // 2048 measured best on DSv4.1 decode (1024-8192 within 1%).
+  static int decode_prefetch_bytes() {
+    const char* value = std::getenv("KT_FP4_DECODE_PREFETCH");
+    return value ? std::max(0, std::atoi(value)) / 64 * 64 : 2048;
+  }
 
   static std::string name() { return "MXFP4_KGROUP"; }
   // Narrowest width task_width can return for this n, so the count covers
   // every kernel; a wider split folds the surplus tasks away.
   static int recommended_nth(int n) {
-    const int width = n >= 8 * N_BLOCK ? N_BLOCK : 64;
+    const int width = n >= 8 * N_BLOCK ? std::min(N_BLOCK, decode_wide_width()) : decode_narrow_width();
     return (n + width - 1) / width;
   }
   static std::pair<int, int> split_range_n(int n, int ith, int nth, int m = 1) {
@@ -736,11 +762,16 @@ struct GemmKernel224MXFP4SmallKGroup {
         }
       }
     }
+    // Decode streams each 32-channel tile once; a software prefetch this many bytes
+    // ahead keeps a lone thread fed when few tasks remain. 0 disables it.
+    static const int prefetch_bytes = decode_prefetch_bytes();
     for (; mi < m; ++mi) {
       const auto* activation = reinterpret_cast<const uint16_t*>(ba->get_submat(m, k, mi, 0));
       float* output = bc->get_submat(m, n, mi, n_start);
       for (int n_pos = n_start; n_pos < n_end; n_pos += 32) {
         const uint8_t* tile = bb->b + static_cast<size_t>(n_pos) * row_bytes;
+        // Tiles of a task are contiguous, so prefetching past a tile's end feeds the next one.
+        const uint8_t* prefetch_end = bb->b + static_cast<size_t>(n_end) * row_bytes;
         __m512 sum0 = _mm512_setzero_ps();
         __m512 sum1 = _mm512_setzero_ps();
         for (int group = 0; group < group_count; ++group) {
@@ -750,6 +781,12 @@ struct GemmKernel224MXFP4SmallKGroup {
           const __m512 scale1 = _mm512_castsi512_ps(_mm512_slli_epi32(
               _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(group_scales + 16))), 23));
           const uint8_t* src = tile + static_cast<size_t>(group) * 16 * 32;
+          if (prefetch_bytes > 0) {
+            const uint8_t* ahead = src + prefetch_bytes;
+            for (int line = 0; line < 8 && ahead + line * 64 < prefetch_end; ++line) {
+              _mm_prefetch(reinterpret_cast<const char*>(ahead + line * 64), _MM_HINT_T0);
+            }
+          }
           const uint16_t* a = activation + static_cast<size_t>(group) * 32;
           __m512 group0 = _mm512_setzero_ps();
           __m512 group1 = _mm512_setzero_ps();
@@ -860,9 +897,13 @@ struct GemmKernel224MXFP4SmallKGroup {
         }
       }
     }
+    // See fp4_mat_vec_kmajor: software prefetch for the m=1 stream (KT_FP4_DECODE_PREFETCH).
+    static const int prefetch_bytes = decode_prefetch_bytes();
     for (; mi < m; ++mi) {
       const auto* activation = reinterpret_cast<const uint16_t*>(ba->get_submat(m, k, mi, 0));
       float* output = bc->get_submat(m, n, mi, n_start);
+      const uint8_t* weight_end = bb->b + static_cast<size_t>(n_end) * row_bytes;
+      const ggml_bf16_t* scale_end = bb->scale_nv_kmajor + static_cast<size_t>(n_end) * group_count;
       for (int n_pos = n_start; n_pos < n_end; n_pos += 32) {
         const uint8_t* tile = bb->b + static_cast<size_t>(n_pos) * row_bytes;
         __m512 sum0 = _mm512_setzero_ps();
@@ -870,6 +911,17 @@ struct GemmKernel224MXFP4SmallKGroup {
         for (int group = 0; group < group32_count; ++group) {
           const ggml_bf16_t* scales =
               bb->scale_nv_kmajor + static_cast<size_t>(n_pos) * group_count + group * 64;
+          if (prefetch_bytes > 0) {
+            // Weights take 512 B per 32-K group and scales 128 B, so scales run a quarter as far ahead.
+            const uint8_t* ahead = tile + static_cast<size_t>(group) * 16 * 32 + prefetch_bytes;
+            for (int line = 0; line < 8 && ahead + line * 64 < weight_end; ++line) {
+              _mm_prefetch(reinterpret_cast<const char*>(ahead + line * 64), _MM_HINT_T0);
+            }
+            const ggml_bf16_t* scale_ahead = scales + prefetch_bytes / 4 / sizeof(ggml_bf16_t);
+            for (int line = 0; line < 2 && scale_ahead + line * 32 < scale_end; ++line) {
+              _mm_prefetch(reinterpret_cast<const char*>(scale_ahead + line * 32), _MM_HINT_T0);
+            }
+          }
           const __m512i sv0 = _mm512_loadu_si512(scales);
           const __m512i sv1 = _mm512_loadu_si512(scales + 32);
           // 32 channels per k-group: lanes 0..15 hold channels 0..15, lanes
@@ -1653,6 +1705,42 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
 #else
     Base::prepare_decode_down_input(expert_idx, qlen);
 #endif
+  }
+
+  // Fused-decode form of apply_decode_activation below: one (expert, range) task. The
+  // natural-order flag is set once per expert in finish_decode_expert.
+  void apply_decode_activation_range(int expert_idx, int ith, int nth, int qlen) {
+#if defined(__AVX512BF16__)
+    if (qlen != 1 || config_.quant_config.group_size != 32 || config_.intermediate_size % 32 != 0) {
+      Base::apply_decode_activation_range(expert_idx, ith, nth, qlen);
+      return;
+    }
+    auto [n_start, n_end] = T::split_range_n(config_.intermediate_size, ith, nth);
+    const ggml_bf16_t* gate = m_local_gate_output_ptr_[expert_idx];
+    const ggml_bf16_t* up = this->m_local_up_output_ptr_[expert_idx];
+    ggml_bf16_t* destination = down_ba_[expert_idx]->get_submat(1, config_.intermediate_size, 0, n_start);
+    for (int j = n_start; j < n_end; j += 32) {
+      __m512 gate0, gate1, up0, up1;
+      avx512_32xbf16_to_32xfp32((__m512i*)(gate + j), &gate0, &gate1);
+      avx512_32xbf16_to_32xfp32((__m512i*)(up + j), &up0, &up1);
+      const __m512 result0 = amx::act_fn(gate0, up0, config_.swiglu_limit, config_.swiglu_alpha);
+      const __m512 result1 = amx::act_fn(gate1, up1, config_.swiglu_limit, config_.swiglu_alpha);
+      const __m512bh logical = _mm512_cvtne2ps_pbh(result1, result0);
+      const __m512bh natural = T::permute_activation_group(logical);
+      _mm512_storeu_si512((void*)(destination + (j - n_start)), (__m512i)natural);
+    }
+#else
+    Base::apply_decode_activation_range(expert_idx, ith, nth, qlen);
+#endif
+  }
+
+  void finish_decode_expert(int expert_idx, int qlen) {
+#if defined(__AVX512BF16__)
+    if (qlen == 1 && config_.quant_config.group_size == 32 && config_.intermediate_size % 32 == 0) {
+      down_ba_[expert_idx]->natural_order = true;
+    }
+#endif
+    prepare_decode_down_input(expert_idx, qlen);
   }
 
   void apply_decode_activation(int activated_expert, int nth, int qlen) {

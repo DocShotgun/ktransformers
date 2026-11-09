@@ -62,6 +62,8 @@ enum ThreadStatus {
 
 struct alignas(64) ThreadState {
   std::atomic<ThreadStatus> status;
+  // Set while the worker blocks on `cv`; a dispatch notifies only these workers.
+  std::atomic<bool> sleeping{false};
   std::mutex mutex;
   std::condition_variable cv;
 #ifdef PROFILE_BALANCE
@@ -97,6 +99,15 @@ class InNumaPool {
   std::function<void(int)> finalize_func_;
   std::atomic<int> curr_;
   int end_;
+
+  // One store publishes a job to every worker: the dispatcher bumps `gen_` after
+  // writing the job fields, and each participant bumps `done_` when it finishes.
+  // Generation in the high bits, participant count in the low kGenCountBits, so a
+  // late reader never pairs one job's generation with another job's count.
+  static constexpr int kGenCountBits = 16;
+  alignas(64) std::atomic<uint64_t> gen_{0};
+  alignas(64) std::atomic<int> done_{0};
+  std::atomic<bool> exit_{false};
 
   void process_tasks(int);
   void worker_thread(int, int);
