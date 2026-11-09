@@ -1035,18 +1035,24 @@ class TP_MOE<AMX_MOE_BASE<T, Derived>> : public TP_MOE_Common<AMX_MOE_BASE<T, De
     };
 
     auto pool = config.pool;
-
-    auto direct_or_pool = [&](int count, auto&& fn) {
-      if (qlen < 10) {
-        for (int i = 0; i < count; i++) {
-          fn(i);
-        }
-      } else {
-        pool->do_work_stealing_job(count, nullptr, fn, nullptr);
+    if (qlen < 10) {
+      for (int i = 0; i < qlen; i++) {
+        merge_fn(i);
       }
-    };
-
-    direct_or_pool(qlen, merge_fn);
+      return;
+    }
+    // Every NUMA pool merges a contiguous token range, so the remote partial
+    // reads spread over all nodes instead of node 0's threads.
+    const int parts = tp_count;
+    pool->dispense_backend()->do_numa_job([&](int numa_id) {
+      if (numa_id >= parts) return;
+      const int begin = static_cast<int>(static_cast<int64_t>(qlen) * numa_id / parts);
+      const int end = static_cast<int>(static_cast<int64_t>(qlen) * (numa_id + 1) / parts);
+      if (begin < end) {
+        pool->get_subpool(numa_id)->do_work_stealing_job(
+            end - begin, nullptr, [&](int i) { merge_fn(begin + i); }, nullptr);
+      }
+    });
   }
 
   void merge_results(int qlen, void* output) override { merge_results(qlen, output, false); }
