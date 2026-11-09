@@ -1,6 +1,7 @@
 #!/usr/bin/bash
-# Pre-commit hook: run clang-format via kt-kernel's CMake 'format' target and Black for Python
-# before allowing commit. If formatting makes changes, stage them and abort so user can review.
+# Pre-commit hook: run clang-format and Black on staged kt-kernel files before allowing commit.
+# If a formatter changes a file, abort so the user can review; the change is staged only when
+# the file was fully staged, so partially staged files never pick up their unstaged hunks.
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -32,6 +33,7 @@ PY_CHANGED=()
 CPP_CHANGED=()
 
 for f in "${STAGED[@]}"; do
+  [ -f "$f" ] || continue
   case "$f" in
     "$REL_KERNEL_DIR"/*)
       ext="${f##*.}"
@@ -45,6 +47,16 @@ for f in "${STAGED[@]}"; do
       esac
       ;;
   esac
+done
+
+# Fingerprint the working copies before formatting, and note which already match the index.
+FMT_FILES=("${PY_CHANGED[@]}" "${CPP_CHANGED[@]}")
+declare -A BEFORE=() FULLY_STAGED=()
+for f in "${FMT_FILES[@]}"; do
+  BEFORE["$f"]="$(git hash-object -- "$f")"
+  if git diff --quiet -- "$f"; then
+    FULLY_STAGED["$f"]=1
+  fi
 done
 
 # Run clang-format only on staged C/C++ files
@@ -61,11 +73,27 @@ if command -v "$BLACK_BIN" >/dev/null 2>&1 && [ ${#PY_CHANGED[@]} -gt 0 ]; then
   "$BLACK_BIN" "${PY_CHANGED[@]}"
 fi
 
-# Stage any formatting changes for tracked, formatted files only
-FMT_FILES=("${PY_CHANGED[@]}" "${CPP_CHANGED[@]}")
-if [ ${#FMT_FILES[@]} -gt 0 ] && ! git diff --quiet --exit-code -- "${FMT_FILES[@]}"; then
-  echo "[pre-commit] Formatting applied; updating index." >&2
-  git add "${FMT_FILES[@]}"
+# Act only on files a formatter actually changed. Unstaged hunks of a partially staged file
+# are not the formatter's doing and must stay unstaged.
+RESTAGE=()
+PARTIAL=()
+for f in "${FMT_FILES[@]}"; do
+  if [ "$(git hash-object -- "$f")" != "${BEFORE[$f]}" ]; then
+    if [ -n "${FULLY_STAGED[$f]:-}" ]; then
+      RESTAGE+=("$f")
+    else
+      PARTIAL+=("$f")
+    fi
+  fi
+done
+if [ ${#RESTAGE[@]} -gt 0 ] || [ ${#PARTIAL[@]} -gt 0 ]; then
+  if [ ${#RESTAGE[@]} -gt 0 ]; then
+    git add -- "${RESTAGE[@]}"
+    echo "[pre-commit] Formatting applied and staged: ${RESTAGE[*]}" >&2
+  fi
+  if [ ${#PARTIAL[@]} -gt 0 ]; then
+    echo "[pre-commit] Formatting applied but not staged (these files have unstaged changes): ${PARTIAL[*]}" >&2
+  fi
   echo "[pre-commit] Re-run git commit to proceed after reviewing changes." >&2
   exit 1
 fi
