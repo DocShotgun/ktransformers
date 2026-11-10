@@ -18,6 +18,8 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <type_traits>
 #include <vector>
 
 #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
@@ -700,6 +702,180 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   }
 
+  // Rows [mi, mi + MB) of the K-major MXFP4 GEMV below. Each (n_pos, group)
+  // weight tile is decoded once and consumed by every row of the block. With
+  // row-major activations (MEM) each activation pair is broadcast from memory
+  // with one 32-bit load; natural order keeps the two-element gather. The
+  // per-row arithmetic is the single-row loop's, so results are bit-identical.
+  template <int MB, bool MEM>
+  static void fp4_kmajor_rows(int mi, int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int n_start,
+                              int n_end) {
+    const int group_count = k / 32;
+    const size_t row_bytes = static_cast<size_t>(k) / 2;
+    const __m512i lut = _mm512_castsi256_si512(_mm256_load_si256(reinterpret_cast<const __m256i*>(fp4_bf16)));
+    const __m512i nibble_mask = _mm512_set1_epi16(15);
+    const uint16_t* activation[MB];
+    float* output[MB];
+    for (int t = 0; t < MB; ++t) {
+      activation[t] = reinterpret_cast<const uint16_t*>(ba->get_submat(m, k, mi + t, 0));
+      output[t] = bc->get_submat(m, n, mi + t, n_start);
+    }
+    for (int n_pos = n_start; n_pos < n_end; n_pos += 32) {
+      const uint8_t* tile = bb->b + static_cast<size_t>(n_pos) * row_bytes;
+      __m512 sum0[MB];
+      __m512 sum1[MB];
+      for (int t = 0; t < MB; ++t) {
+        sum0[t] = _mm512_setzero_ps();
+        sum1[t] = _mm512_setzero_ps();
+      }
+      for (int group = 0; group < group_count; ++group) {
+        const uint8_t* group_scales = bb->scale_e8_kmajor + static_cast<size_t>(n_pos) * group_count + group * 32;
+        const __m512 scale0 = _mm512_castsi512_ps(_mm512_slli_epi32(
+            _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(group_scales))), 23));
+        const __m512 scale1 = _mm512_castsi512_ps(_mm512_slli_epi32(
+            _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(group_scales + 16))), 23));
+        const uint8_t* src = tile + static_cast<size_t>(group) * 16 * 32;
+        __m512 group0[MB];
+        __m512 group1[MB];
+        for (int t = 0; t < MB; ++t) {
+          group0[t] = _mm512_setzero_ps();
+          group1[t] = _mm512_setzero_ps();
+        }
+        for (int pair = 0; pair < 16; ++pair) {
+          const __m512i words = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
+          const __m512i low = _mm512_permutexvar_epi16(_mm512_and_si512(words, nibble_mask), lut);
+          const __m512i high = _mm512_permutexvar_epi16(_mm512_and_si512(_mm512_srli_epi16(words, 4), nibble_mask), lut);
+          for (int t = 0; t < MB; ++t) {
+            const __m512bh broadcast = pair_broadcast<MEM>(activation[t] + static_cast<size_t>(group) * 32, pair);
+            group0[t] = _mm512_dpbf16_ps(group0[t], (__m512bh)low, broadcast);
+            group1[t] = _mm512_dpbf16_ps(group1[t], (__m512bh)high, broadcast);
+          }
+        }
+        for (int t = 0; t < MB; ++t) {
+          sum0[t] = _mm512_fmadd_ps(group0[t], scale0, sum0[t]);
+          sum1[t] = _mm512_fmadd_ps(group1[t], scale1, sum1[t]);
+        }
+      }
+      for (int t = 0; t < MB; ++t) {
+        _mm512_storeu_ps(output[t] + n_pos - n_start, sum0[t]);
+        _mm512_storeu_ps(output[t] + n_pos - n_start + 16, sum1[t]);
+      }
+    }
+  }
+
+  // NVFP4 companion of fp4_kmajor_rows (per-16 BF16 scales). Pairs 0..7 and
+  // 8..15 of a 32-K group fall in the two scale halves, so one accumulator
+  // pair per row serves both halves in turn, folding each half's scale in the
+  // same order as the single-row loop of fp4_mat_vec_kmajor_nvfp4.
+  template <int MB, bool MEM>
+  static void fp4_kmajor_rows_nvfp4(int mi, int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int n_start,
+                                    int n_end) {
+    const int group_count = k / 16;
+    const int group32_count = k / 32;
+    const size_t row_bytes = static_cast<size_t>(k) / 2;
+    const __m512i lut = _mm512_castsi256_si512(_mm256_load_si256(reinterpret_cast<const __m256i*>(fp4_bf16)));
+    const __m512i nibble_mask = _mm512_set1_epi16(15);
+    const uint16_t* activation[MB];
+    float* output[MB];
+    for (int t = 0; t < MB; ++t) {
+      activation[t] = reinterpret_cast<const uint16_t*>(ba->get_submat(m, k, mi + t, 0));
+      output[t] = bc->get_submat(m, n, mi + t, n_start);
+    }
+    for (int n_pos = n_start; n_pos < n_end; n_pos += 32) {
+      const uint8_t* tile = bb->b + static_cast<size_t>(n_pos) * row_bytes;
+      __m512 sum0[MB];
+      __m512 sum1[MB];
+      for (int t = 0; t < MB; ++t) {
+        sum0[t] = _mm512_setzero_ps();
+        sum1[t] = _mm512_setzero_ps();
+      }
+      for (int group = 0; group < group32_count; ++group) {
+        // 32 channels per k-group: lanes 0..15 hold channels 0..15, lanes
+        // 16..31 hold channels 16..31 (dpbf16 lane halves).
+        const ggml_bf16_t* scales = bb->scale_nv_kmajor + static_cast<size_t>(n_pos) * group_count + group * 64;
+        const uint8_t* src = tile + static_cast<size_t>(group) * 16 * 32;
+        for (int half = 0; half < 2; ++half) {
+          const __m512i sv = _mm512_loadu_si512(scales + half * 32);
+          const __m512 scale0 = _mm512_cvtpbh_ps((__m256bh)_mm512_castsi512_si256(sv));
+          const __m512 scale1 = _mm512_cvtpbh_ps((__m256bh)_mm512_extracti64x4_epi64(sv, 1));
+          __m512 group0[MB];
+          __m512 group1[MB];
+          for (int t = 0; t < MB; ++t) {
+            group0[t] = _mm512_setzero_ps();
+            group1[t] = _mm512_setzero_ps();
+          }
+          for (int pair = half * 8; pair < half * 8 + 8; ++pair) {
+            const __m512i words = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
+            const __m512i low = _mm512_permutexvar_epi16(_mm512_and_si512(words, nibble_mask), lut);
+            const __m512i high = _mm512_permutexvar_epi16(_mm512_and_si512(_mm512_srli_epi16(words, 4), nibble_mask), lut);
+            for (int t = 0; t < MB; ++t) {
+              const __m512bh broadcast = pair_broadcast<MEM>(activation[t] + static_cast<size_t>(group) * 32, pair);
+              group0[t] = _mm512_dpbf16_ps(group0[t], (__m512bh)low, broadcast);
+              group1[t] = _mm512_dpbf16_ps(group1[t], (__m512bh)high, broadcast);
+            }
+          }
+          for (int t = 0; t < MB; ++t) {
+            sum0[t] = _mm512_fmadd_ps(scale0, group0[t], sum0[t]);
+            sum1[t] = _mm512_fmadd_ps(scale1, group1[t], sum1[t]);
+          }
+        }
+      }
+      for (int t = 0; t < MB; ++t) {
+        _mm512_storeu_ps(output[t] + n_pos - n_start, sum0[t]);
+        _mm512_storeu_ps(output[t] + n_pos - n_start + 16, sum1[t]);
+      }
+    }
+  }
+
+  // Activation pair `pair` of a 32-K group as one dpbf16 broadcast. Row-major
+  // order (MEM) holds it as two adjacent BF16 values; natural order holds the
+  // pair's K values 16 apart.
+  template <bool MEM>
+  static inline __m512bh pair_broadcast(const uint16_t* a, int pair) {
+    if constexpr (MEM) {
+      int32_t bits;
+      std::memcpy(&bits, a + pair * 2, sizeof(bits));
+      return (__m512bh)_mm512_set1_epi32(bits);
+    } else {
+      const uint32_t bits = static_cast<uint32_t>(a[pair]) | (static_cast<uint32_t>(a[16 + pair]) << 16);
+      return (__m512bh)_mm512_set1_epi32(static_cast<int32_t>(bits));
+    }
+  }
+
+  // Row blocks for the K-major GEMVs: blocks of four rows, then a leftover of
+  // two or three rows as one block, since every pass over the weights costs
+  // about as much as a whole block. Returns the first row not covered (at
+  // most one row is left, for the single-row loop).
+  template <bool NVFP4, bool MEM>
+  static int fp4_kmajor_row_blocks(int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int n_start,
+                                   int n_end) {
+    const auto rows = [&](auto block, int mi) {
+      constexpr int MB = decltype(block)::value;
+      if constexpr (NVFP4) {
+        fp4_kmajor_rows_nvfp4<MB, MEM>(mi, m, n, k, ba, bb, bc, n_start, n_end);
+      } else {
+        fp4_kmajor_rows<MB, MEM>(mi, m, n, k, ba, bb, bc, n_start, n_end);
+      }
+    };
+    int mi = 0;
+    for (; mi + 4 <= m; mi += 4) rows(std::integral_constant<int, 4>{}, mi);
+    if (m - mi == 3) {
+      rows(std::integral_constant<int, 3>{}, mi);
+      mi = m;
+    } else if (m - mi == 2) {
+      rows(std::integral_constant<int, 2>{}, mi);
+      mi = m;
+    }
+    return mi;
+  }
+
+  template <bool NVFP4>
+  static int fp4_kmajor_row_blocks(int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int n_start,
+                                   int n_end, bool natural_order) {
+    return natural_order ? fp4_kmajor_row_blocks<NVFP4, false>(m, n, k, ba, bb, bc, n_start, n_end)
+                         : fp4_kmajor_row_blocks<NVFP4, true>(m, n, k, ba, bb, bc, n_start, n_end);
+  }
+
   // SGLang's resident K-pair-major layout also permits GEMV across 32
   // output channels at once. Each 32-byte load contains two adjacent K
   // values for channels 0..15 and 16..31. AMX handles prefill; AVX512 BF16
@@ -713,64 +889,9 @@ struct GemmKernel224MXFP4SmallKGroup {
     const __m512i lut = _mm512_castsi256_si512(_mm256_load_si256(reinterpret_cast<const __m256i*>(fp4_bf16)));
     const __m512i nibble_mask = _mm512_set1_epi16(15);
     const bool natural_order = ba->natural_order;
-    // Four tokens at a time: the weight tile for an (n_pos, group) pair is
-    // decoded once and consumed by every token in the block, so the inner
-    // loop is limited by the BF16 dots instead of the weight fetch.
-    constexpr int MB = 4;
-    int mi = 0;
-    for (; mi + MB <= m; mi += MB) {
-      const uint16_t* activation[MB];
-      float* output[MB];
-      for (int t = 0; t < MB; ++t) {
-        activation[t] = reinterpret_cast<const uint16_t*>(ba->get_submat(m, k, mi + t, 0));
-        output[t] = bc->get_submat(m, n, mi + t, n_start);
-      }
-      for (int n_pos = n_start; n_pos < n_end; n_pos += 32) {
-        const uint8_t* tile = bb->b + static_cast<size_t>(n_pos) * row_bytes;
-        __m512 sum0[MB];
-        __m512 sum1[MB];
-        for (int t = 0; t < MB; ++t) {
-          sum0[t] = _mm512_setzero_ps();
-          sum1[t] = _mm512_setzero_ps();
-        }
-        for (int group = 0; group < group_count; ++group) {
-          const uint8_t* group_scales = bb->scale_e8_kmajor + static_cast<size_t>(n_pos) * group_count + group * 32;
-          const __m512 scale0 = _mm512_castsi512_ps(_mm512_slli_epi32(
-              _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(group_scales))), 23));
-          const __m512 scale1 = _mm512_castsi512_ps(_mm512_slli_epi32(
-              _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(group_scales + 16))), 23));
-          const uint8_t* src = tile + static_cast<size_t>(group) * 16 * 32;
-          __m512 group0[MB];
-          __m512 group1[MB];
-          for (int t = 0; t < MB; ++t) {
-            group0[t] = _mm512_setzero_ps();
-            group1[t] = _mm512_setzero_ps();
-          }
-          for (int pair = 0; pair < 16; ++pair) {
-            const __m512i words = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
-            const __m512i low = _mm512_permutexvar_epi16(_mm512_and_si512(words, nibble_mask), lut);
-            const __m512i high = _mm512_permutexvar_epi16(_mm512_and_si512(_mm512_srli_epi16(words, 4), nibble_mask), lut);
-            for (int t = 0; t < MB; ++t) {
-              const uint16_t* a = activation[t] + static_cast<size_t>(group) * 32;
-              const uint16_t a0 = natural_order ? a[pair] : a[pair * 2];
-              const uint16_t a1 = natural_order ? a[16 + pair] : a[pair * 2 + 1];
-              const uint32_t pair_activation = static_cast<uint32_t>(a0) | (static_cast<uint32_t>(a1) << 16);
-              const __m512bh broadcast = (__m512bh)_mm512_set1_epi32(pair_activation);
-              group0[t] = _mm512_dpbf16_ps(group0[t], (__m512bh)low, broadcast);
-              group1[t] = _mm512_dpbf16_ps(group1[t], (__m512bh)high, broadcast);
-            }
-          }
-          for (int t = 0; t < MB; ++t) {
-            sum0[t] = _mm512_fmadd_ps(group0[t], scale0, sum0[t]);
-            sum1[t] = _mm512_fmadd_ps(group1[t], scale1, sum1[t]);
-          }
-        }
-        for (int t = 0; t < MB; ++t) {
-          _mm512_storeu_ps(output[t] + n_pos - n_start, sum0[t]);
-          _mm512_storeu_ps(output[t] + n_pos - n_start + 16, sum1[t]);
-        }
-      }
-    }
+    // Blocks of rows share each decoded weight tile, so the inner loop is
+    // limited by the BF16 dots instead of the weight fetch.
+    int mi = fp4_kmajor_row_blocks<false>(m, n, k, ba, bb, bc, n_start, n_end, natural_order);
     // Decode streams each 32-channel tile once; a software prefetch this many bytes
     // ahead keeps a lone thread fed when few tasks remain. 0 disables it.
     static const int prefetch_bytes = decode_prefetch_bytes();
@@ -833,79 +954,8 @@ struct GemmKernel224MXFP4SmallKGroup {
     const __m512i lut = _mm512_castsi256_si512(_mm256_load_si256(reinterpret_cast<const __m256i*>(fp4_bf16)));
     const __m512i nibble_mask = _mm512_set1_epi16(15);
     const bool natural_order = ba->natural_order;
-    // Four tokens at a time: the weight tile for an (n_pos, group) pair is
-    // decoded once and consumed by every token in the block.
-    constexpr int MB = 4;
-    int mi = 0;
-    for (; mi + MB <= m; mi += MB) {
-      const uint16_t* activation[MB];
-      float* output[MB];
-      for (int t = 0; t < MB; ++t) {
-        activation[t] = reinterpret_cast<const uint16_t*>(ba->get_submat(m, k, mi + t, 0));
-        output[t] = bc->get_submat(m, n, mi + t, n_start);
-      }
-      for (int n_pos = n_start; n_pos < n_end; n_pos += 32) {
-        const uint8_t* tile = bb->b + static_cast<size_t>(n_pos) * row_bytes;
-        __m512 sum0[MB];
-        __m512 sum1[MB];
-        for (int t = 0; t < MB; ++t) {
-          sum0[t] = _mm512_setzero_ps();
-          sum1[t] = _mm512_setzero_ps();
-        }
-        for (int group = 0; group < group32_count; ++group) {
-          const ggml_bf16_t* scales =
-              bb->scale_nv_kmajor + static_cast<size_t>(n_pos) * group_count + group * 64;
-          const __m512i sv0 = _mm512_loadu_si512(scales);
-          const __m512i sv1 = _mm512_loadu_si512(scales + 32);
-          // 32 channels per k-group: lanes 0..15 hold channels 0..15, lanes
-          // 16..31 hold channels 16..31 (dpbf16 lane halves).
-          const __m512 s0a = _mm512_cvtpbh_ps((__m256bh)_mm512_castsi512_si256(sv0));
-          const __m512 s0b = _mm512_cvtpbh_ps((__m256bh)_mm512_extracti64x4_epi64(sv0, 1));
-          const __m512 s1a = _mm512_cvtpbh_ps((__m256bh)_mm512_castsi512_si256(sv1));
-          const __m512 s1b = _mm512_cvtpbh_ps((__m256bh)_mm512_extracti64x4_epi64(sv1, 1));
-          const uint8_t* src = tile + static_cast<size_t>(group) * 16 * 32;
-          __m512 g0h0[MB];
-          __m512 g0h1[MB];
-          __m512 g1h0[MB];
-          __m512 g1h1[MB];
-          for (int t = 0; t < MB; ++t) {
-            g0h0[t] = _mm512_setzero_ps();
-            g0h1[t] = _mm512_setzero_ps();
-            g1h0[t] = _mm512_setzero_ps();
-            g1h1[t] = _mm512_setzero_ps();
-          }
-          for (int pair = 0; pair < 16; ++pair) {
-            const __m512i words = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
-            const __m512i low = _mm512_permutexvar_epi16(_mm512_and_si512(words, nibble_mask), lut);
-            const __m512i high = _mm512_permutexvar_epi16(_mm512_and_si512(_mm512_srli_epi16(words, 4), nibble_mask), lut);
-            for (int t = 0; t < MB; ++t) {
-              const uint16_t* a = activation[t] + static_cast<size_t>(group) * 32;
-              const uint16_t a0 = natural_order ? a[pair] : a[pair * 2];
-              const uint16_t a1 = natural_order ? a[16 + pair] : a[pair * 2 + 1];
-              const uint32_t pair_activation = static_cast<uint32_t>(a0) | (static_cast<uint32_t>(a1) << 16);
-              const __m512bh broadcast = (__m512bh)_mm512_set1_epi32(pair_activation);
-              if (pair < 8) {
-                g0h0[t] = _mm512_dpbf16_ps(g0h0[t], (__m512bh)low, broadcast);
-                g1h0[t] = _mm512_dpbf16_ps(g1h0[t], (__m512bh)high, broadcast);
-              } else {
-                g0h1[t] = _mm512_dpbf16_ps(g0h1[t], (__m512bh)low, broadcast);
-                g1h1[t] = _mm512_dpbf16_ps(g1h1[t], (__m512bh)high, broadcast);
-              }
-            }
-          }
-          for (int t = 0; t < MB; ++t) {
-            sum0[t] = _mm512_fmadd_ps(s0a, g0h0[t], sum0[t]);
-            sum0[t] = _mm512_fmadd_ps(s1a, g0h1[t], sum0[t]);
-            sum1[t] = _mm512_fmadd_ps(s0b, g1h0[t], sum1[t]);
-            sum1[t] = _mm512_fmadd_ps(s1b, g1h1[t], sum1[t]);
-          }
-        }
-        for (int t = 0; t < MB; ++t) {
-          _mm512_storeu_ps(output[t] + n_pos - n_start, sum0[t]);
-          _mm512_storeu_ps(output[t] + n_pos - n_start + 16, sum1[t]);
-        }
-      }
-    }
+    // Blocks of rows share each decoded weight tile (see fp4_kmajor_rows_nvfp4).
+    int mi = fp4_kmajor_row_blocks<true>(m, n, k, ba, bb, bc, n_start, n_end, natural_order);
     // See fp4_mat_vec_kmajor: software prefetch for the m=1 stream (KT_FP4_DECODE_PREFETCH).
     static const int prefetch_bytes = decode_prefetch_bytes();
     for (; mi < m; ++mi) {
