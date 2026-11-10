@@ -1202,11 +1202,12 @@ struct GemmKernel224MXFP4SmallKGroup {
   // Expand one 32-output-channel tile to AMX's VNNI B layout. A 32-K group
   // becomes 16 rows of 32 adjacent BF16 pairs. Reuse this expanded tile for
   // every 32-token M tile instead of decoding the FP4 weights for every token.
-  static void pack_fp4_amx_b_scalar(int n, int k, int n_pos, BufferB* bb, uint32_t* packed) {
+  static void pack_fp4_amx_b_scalar(int n, int k, int n_pos, BufferB* bb, uint32_t* packed, int group_begin,
+                                    int group_end) {
     const auto& lut = scaled_fp4_lut();
     const int group_count = k / 32;
-    for (int group = 0; group < group_count; ++group) {
-      uint32_t* destination = packed + static_cast<size_t>(group) * 16 * 32;
+    for (int group = group_begin; group < group_end; ++group) {
+      uint32_t* destination = packed + static_cast<size_t>(group - group_begin) * 16 * 32;
       for (int channel = 0; channel < 32; ++channel) {
         const int output_row = n_pos + channel;
         const auto* source = bb->get_submat(n, k, output_row, group * 32);
@@ -1222,12 +1223,12 @@ struct GemmKernel224MXFP4SmallKGroup {
 // NVFP4 scalar fallback: fold each per-16 FP32 scale into BF16 pair words.
   // Used when no transposed BF16 scale copy exists (fp32-scale escape hatch
   // or KT_NVFP4_KMAJOR_WEIGHTS=0) and by hosts without AVX512 BF16.
-  static void pack_fp4_amx_b_scalar_nvfp4(int n, int k, int n_pos, BufferB* bb, uint32_t* packed) {
+  static void pack_fp4_amx_b_scalar_nvfp4(int n, int k, int n_pos, BufferB* bb, uint32_t* packed, int group_begin,
+                                          int group_end) {
     constexpr float values[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
                                   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
-    const int group_count = k / 32;
-    for (int group = 0; group < group_count; ++group) {
-      uint32_t* destination = packed + static_cast<size_t>(group) * 16 * 32;
+    for (int group = group_begin; group < group_end; ++group) {
+      uint32_t* destination = packed + static_cast<size_t>(group - group_begin) * 16 * 32;
       for (int channel = 0; channel < 32; ++channel) {
         const int output_row = n_pos + channel;
         const auto* source = bb->get_submat(n, k, output_row, group * 32);
@@ -1247,7 +1248,7 @@ struct GemmKernel224MXFP4SmallKGroup {
 #if defined(__AVX512BF16__)
   // Resident SGLang layout: skip the temporary 512-byte repack for every
   // K group. Transposed E8 scales are loaded as one vector per group.
-  static void pack_fp4_amx_b_kmajor(int k, int n_pos, BufferB* bb, uint32_t* packed) {
+  static void pack_fp4_amx_b_kmajor(int k, int n_pos, BufferB* bb, uint32_t* packed, int group_begin, int group_end) {
     const __m512i lut = _mm512_castsi256_si512(_mm256_load_si256(reinterpret_cast<const __m256i*>(fp4_bf16)));
     const __m512i nibble_mask = _mm512_set1_epi16(15);
     const __m512i abs_mask = _mm512_set1_epi16(0x7FFF);
@@ -1261,7 +1262,7 @@ struct GemmKernel224MXFP4SmallKGroup {
         8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15};
     const __m512i duplicate0 = _mm512_load_si512(duplicate_indices);
     const __m512i duplicate1 = _mm512_add_epi16(duplicate0, _mm512_set1_epi16(16));
-    for (int group = 0; group < group_count; ++group) {
+    for (int group = group_begin; group < group_end; ++group) {
       const uint8_t* group_scales = bb->scale_e8_kmajor + static_cast<size_t>(n_pos) * group_count + group * 32;
       const __m512i exponents = _mm512_cvtepu8_epi16(
           _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_scales)));
@@ -1269,7 +1270,7 @@ struct GemmKernel224MXFP4SmallKGroup {
       const __m512i scale0 = _mm512_permutexvar_epi16(duplicate0, scale_offsets);
       const __m512i scale1 = _mm512_permutexvar_epi16(duplicate1, scale_offsets);
       const uint8_t* src = tile + static_cast<size_t>(group) * 16 * 32;
-      uint32_t* destination = packed + static_cast<size_t>(group) * 16 * 32;
+      uint32_t* destination = packed + static_cast<size_t>(group - group_begin) * 16 * 32;
       for (int pair = 0; pair < 16; ++pair) {
         const __m512i words = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
         __m512i low = _mm512_permutexvar_epi16(_mm512_and_si512(words, nibble_mask), lut);
@@ -1291,11 +1292,11 @@ struct GemmKernel224MXFP4SmallKGroup {
   // at K 2pair+(j&1), so per-channel scales duplicate along lane pairs via
   // the same index trick as the E8 variant; pairs 0..7 / 8..15 select which
   // of the two k-group scales (32-K halves) multiplies the fold.
-  static void pack_fp4_amx_b_kmajor_nvfp4(int k, int n_pos, BufferB* bb, uint32_t* packed) {
+  static void pack_fp4_amx_b_kmajor_nvfp4(int k, int n_pos, BufferB* bb, uint32_t* packed, int group_begin,
+                                          int group_end) {
     const __m512i lut = _mm512_castsi256_si512(_mm256_load_si256(reinterpret_cast<const __m256i*>(fp4_bf16)));
     const __m512i nibble_mask = _mm512_set1_epi16(15);
     const int nv_group_count = k / 16;
-    const int group_count = k / 32;
     const size_t row_bytes = static_cast<size_t>(k) / 2;
     const uint8_t* tile = bb->b + static_cast<size_t>(n_pos) * row_bytes;
     alignas(64) static constexpr uint16_t duplicate_indices[32] = {
@@ -1324,7 +1325,7 @@ struct GemmKernel224MXFP4SmallKGroup {
       _mm512_storeu_si512(destination, (__m512i)_mm512_cvtne2ps_pbh(f_lo1, f_lo0));
       _mm512_storeu_si512(destination + 16, (__m512i)_mm512_cvtne2ps_pbh(f_hi1, f_hi0));
     };
-    for (int group = 0; group < group_count; ++group) {
+    for (int group = group_begin; group < group_end; ++group) {
       const ggml_bf16_t* scales =
           bb->scale_nv_kmajor + static_cast<size_t>(n_pos) * nv_group_count + group * 64;
       const __m512i sv0 = _mm512_loadu_si512(scales);
@@ -1340,7 +1341,7 @@ struct GemmKernel224MXFP4SmallKGroup {
       const __m512 dup1a_lo = dup_lane_lo(dup1a), dup1a_hi = dup_lane_hi(dup1a);
       const __m512 dup1b_lo = dup_lane_lo(dup1b), dup1b_hi = dup_lane_hi(dup1b);
       const uint8_t* src = tile + static_cast<size_t>(group) * 16 * 32;
-      uint32_t* destination = packed + static_cast<size_t>(group) * 16 * 32;
+      uint32_t* destination = packed + static_cast<size_t>(group - group_begin) * 16 * 32;
       for (int pair = 0; pair < 8; ++pair) {
         const __m512i words = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
         fold_block(words, dup0a_lo, dup0a_hi, dup0b_lo, dup0b_hi, destination + pair * 32);
@@ -1353,79 +1354,183 @@ struct GemmKernel224MXFP4SmallKGroup {
   }
 #endif
 
-  static void fp4_mat_mat_kgroup_amx(int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
-                                     int nth) {
+  // K and M extents of one blocking step of fp4_mat_mat_kgroup_amx. A K block
+  // of a 256-column task expands to 512 KB of BF16 weight tiles (512 to 2048
+  // measured within 2% on DSv4.1, MiMo and GLM-5.3), and an M chunk bounds the
+  // per-thread accumulator scratch to 512 KB.
+  static constexpr int AMX_K_BLOCK = 1024;
+  static constexpr int AMX_M_CHUNK = 512;
+
+  // Expand the weights of the 32-column panel at n_pos, 32-K groups
+  // [group_begin, group_end), into AMX VNNI tiles at `packed`.
+  static void pack_fp4_amx_b(int n, int k, int n_pos, BufferB* bb, uint32_t* packed, int group_begin, int group_end) {
+#if defined(__AVX512BF16__)
+    if (bb->kmajor_weights && bb->scale_e8_vector_safe) {
+      pack_fp4_amx_b_kmajor(k, n_pos, bb, packed, group_begin, group_end);
+      return;
+    }
+    if (bb->kmajor_weights && bb->scale_nv_valid) {
+      pack_fp4_amx_b_kmajor_nvfp4(k, n_pos, bb, packed, group_begin, group_end);
+      return;
+    }
+#endif
+    if (bb->k_group_size == 16) {
+      pack_fp4_amx_b_scalar_nvfp4(n, k, n_pos, bb, packed, group_begin, group_end);
+    } else {
+      pack_fp4_amx_b_scalar(n, k, n_pos, bb, packed, group_begin, group_end);
+    }
+  }
+
+  // AMX prefill GEMM for one task's columns [n_start, n_end): C = A x B with
+  // the FP4 scales folded into BF16 weight tiles.
+  //
+  // Blocking: for every K block the task's weight panels are expanded once,
+  // then each 32-row M block reads its activation slice in place and sweeps
+  // all panels with a 2x2 tile kernel, so neither operand is re-streamed per
+  // panel. Accumulators of earlier K blocks round-trip through FP32 scratch,
+  // which is exact: every output element adds its K steps in the same order
+  // as one pass over K, so results do not depend on the blocking.
+  //
+  // Output: with dst, rows go straight to the row-major BF16 matrix (stride n),
+  // rounded like BufferC::to_mat, and bc is not touched; otherwise the FP32
+  // tiles land in bc for to_mat.
+  static void fp4_mat_mat_kgroup_amx(int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith, int nth,
+                                     ggml_bf16_t* dst = nullptr) {
     auto [n_start, n_end] = split_range_n(n, ith, nth, m);
     if (n_start >= n_end) return;
     configure_fp4_amx();
 
-    // Per-worker scratch is bounded by 32 BF16 output channels times K. No
-    // expanded copy of the full model is retained in host RAM.
+    const int panels = (n_end - n_start) / 32;
+    const int k_block = std::min(k, AMX_K_BLOCK);
+    const auto align = [](auto* p) {
+      return reinterpret_cast<decltype(p)>((reinterpret_cast<uintptr_t>(p) + 63) & ~uintptr_t(63));
+    };
+    // Per-worker scratch: one K block of the task's weight panels, the
+    // accumulators of one M chunk (only when K spans several blocks), and the
+    // activation slice of a short last M block. No expanded copy of the model
+    // is retained in host RAM.
     thread_local std::vector<uint8_t> packed_storage;
-    packed_storage.resize(static_cast<size_t>(k) * 64 + 63);
-    auto* packed = reinterpret_cast<uint32_t*>((reinterpret_cast<uintptr_t>(packed_storage.data()) + 63) & ~uintptr_t(63));
-    alignas(64) ggml_bf16_t tail_a[32][32] = {};
-    alignas(64) float tail_c[32][32];
-    const int group_count = k / 32;
-    for (int n_pos = n_start; n_pos < n_end; n_pos += 32) {
-#if defined(__AVX512BF16__)
-      if (bb->kmajor_weights && bb->scale_e8_vector_safe) {
-        pack_fp4_amx_b_kmajor(k, n_pos, bb, packed);
-      } else if (bb->kmajor_weights && bb->scale_nv_valid) {
-        pack_fp4_amx_b_kmajor_nvfp4(k, n_pos, bb, packed);
-      } else
-#endif
-      {
-        if (bb->k_group_size == 16) {
-          pack_fp4_amx_b_scalar_nvfp4(n, k, n_pos, bb, packed);
-        } else {
-          pack_fp4_amx_b_scalar(n, k, n_pos, bb, packed);
+    packed_storage.resize(static_cast<size_t>(panels) * k_block * 64 + 63);
+    uint32_t* packed = reinterpret_cast<uint32_t*>(align(packed_storage.data()));
+    thread_local std::vector<float> acc_storage;
+    thread_local std::vector<ggml_bf16_t> tail_storage;
+    alignas(64) float tile_out[32][32];
+
+    for (int chunk_begin = 0; chunk_begin < m; chunk_begin += AMX_M_CHUNK) {
+      const int chunk_end = std::min(m, chunk_begin + AMX_M_CHUNK);
+      float* acc = nullptr;
+      if (k > k_block) {
+        acc_storage.resize(static_cast<size_t>(chunk_end - chunk_begin + 31) / 32 * panels * 32 * 32 + 16);
+        acc = align(acc_storage.data());
+      }
+      for (int k_begin = 0; k_begin < k; k_begin += k_block) {
+        const int groups = std::min(k_block, k - k_begin) / 32;
+        const int group_begin = k_begin / 32;
+        const bool first = k_begin == 0;
+        const bool last = k_begin + groups * 32 >= k;
+        for (int panel = 0; panel < panels; ++panel) {
+          pack_fp4_amx_b(n, k, n_start + panel * 32, bb, packed + static_cast<size_t>(panel) * groups * 16 * 32,
+                         group_begin, group_begin + groups);
+        }
+        for (int m_pos = chunk_begin; m_pos < chunk_end; m_pos += 32) {
+          const int rows = std::min(32, m - m_pos);
+          // A short last block copies its rows as [group][32 rows][32 K], so
+          // each tile load reads 16 consecutive lines. Rows past `rows` keep
+          // stale values: they only feed output rows that are discarded, since
+          // each output row depends on its own activation row alone.
+          const ggml_bf16_t* tail = nullptr;
+          if (rows < 32) {
+            tail_storage.resize(static_cast<size_t>(32) * k_block + 32);
+            auto* copy = align(tail_storage.data());
+            for (int group = 0; group < groups; ++group) {
+              const int kk = (group_begin + group) * 32;
+              const ggml_bf16_t* source = ba->get_submat(m, k, m_pos, kk);
+              const size_t stride = ba->k_block_stride(kk / K_BLOCK * K_BLOCK);
+              ggml_bf16_t* destination = copy + static_cast<size_t>(group) * 32 * 32;
+              for (int row = 0; row < rows; ++row) {
+                _mm512_store_si512(destination + row * 32, _mm512_loadu_si512(source + row * stride));
+              }
+            }
+            tail = copy;
+          }
+          const int acc_block = (m_pos - chunk_begin) / 32;
+          for (int panel = 0; panel < panels; ++panel) {
+            const int n_pos = n_start + panel * 32;
+            float* acc_tile = acc ? acc + (static_cast<size_t>(acc_block) * panels + panel) * 32 * 32 : nullptr;
+            if (first) {
+              _tile_zero(4);
+              _tile_zero(5);
+              _tile_zero(6);
+              _tile_zero(7);
+            } else {
+              _tile_loadd(4, acc_tile, 32 * sizeof(float));
+              _tile_loadd(5, acc_tile + 16, 32 * sizeof(float));
+              _tile_loadd(6, acc_tile + 16 * 32, 32 * sizeof(float));
+              _tile_loadd(7, acc_tile + 16 * 32 + 16, 32 * sizeof(float));
+            }
+            const uint32_t* b = packed + static_cast<size_t>(panel) * groups * 16 * 32;
+            for (int group = 0; group < groups; ++group) {
+              const ggml_bf16_t* a;
+              int a_stride;
+              if (tail) {
+                a = tail + static_cast<size_t>(group) * 32 * 32;
+                a_stride = 32 * sizeof(ggml_bf16_t);
+              } else {
+                const int kk = (group_begin + group) * 32;
+                a = ba->get_submat(m, k, m_pos, kk);
+                a_stride = ba->k_block_stride(kk / K_BLOCK * K_BLOCK) * sizeof(ggml_bf16_t);
+              }
+              _tile_loadd(0, a, a_stride);
+              _tile_loadd(1, reinterpret_cast<const uint8_t*>(a) + 16 * a_stride, a_stride);
+              _tile_loadd(2, b + group * 16 * 32, 128);
+              _tile_loadd(3, b + group * 16 * 32 + 16, 128);
+              _tile_dpbf16ps(4, 0, 2);
+              _tile_dpbf16ps(5, 0, 3);
+              _tile_dpbf16ps(6, 1, 2);
+              _tile_dpbf16ps(7, 1, 3);
+            }
+            if (!last) {
+              _tile_stored(4, acc_tile, 32 * sizeof(float));
+              _tile_stored(5, acc_tile + 16, 32 * sizeof(float));
+              _tile_stored(6, acc_tile + 16 * 32, 32 * sizeof(float));
+              _tile_stored(7, acc_tile + 16 * 32 + 16, 32 * sizeof(float));
+              continue;
+            }
+            store_amx_result(m, n, m_pos, n_pos, rows, bc, dst, tile_out);
+          }
         }
       }
-      for (int m_pos = 0; m_pos < m; m_pos += 32) {
-        const int rows = std::min(32, m - m_pos);
-        _tile_zero(4);
-        _tile_zero(5);
-        _tile_zero(6);
-        _tile_zero(7);
-        for (int group = 0; group < group_count; ++group) {
-          auto* a = ba->get_submat(m, k, m_pos, group * 32);
-          const int k_block_start = (group * 32 / K_BLOCK) * K_BLOCK;
-          const int a_stride = ba->k_block_stride(k_block_start);
-          if (rows < 32) {
-            for (int row = 0; row < rows; ++row) {
-              std::memcpy(tail_a[row], a + static_cast<size_t>(row) * a_stride,
-                          32 * sizeof(ggml_bf16_t));
-            }
-            a = &tail_a[0][0];
-          }
-          const int tile_stride = rows == 32 ? a_stride * sizeof(ggml_bf16_t) : 64;
-          const uint32_t* b = packed + static_cast<size_t>(group) * 16 * 32;
-          _tile_loadd(0, a, tile_stride);
-          _tile_loadd(1, a + 16 * (tile_stride / sizeof(ggml_bf16_t)), tile_stride);
-          _tile_loadd(2, b, 128);
-          _tile_loadd(3, b + 16, 128);
-          _tile_dpbf16ps(4, 0, 2);
-          _tile_dpbf16ps(5, 0, 3);
-          _tile_dpbf16ps(6, 1, 2);
-          _tile_dpbf16ps(7, 1, 3);
-        }
+    }
+  }
 
-        // BufferC tail blocks (n % N_BLOCK != 0) stride by their true width,
-        // not N_BLOCK, so tile stores must follow BufferCImpl::get_submat.
-        const int dst_stride_elems = std::min(N_BLOCK, n - (n_pos / N_BLOCK) * N_BLOCK);
-        float* result = rows == 32 ? bc->get_submat(m, n, m_pos, n_pos) : &tail_c[0][0];
-        const int stride = rows == 32 ? dst_stride_elems * sizeof(float) : 32 * sizeof(float);
-        _tile_stored(4, result, stride);
-        _tile_stored(5, result + 16, stride);
-        _tile_stored(6, result + 16 * (stride / sizeof(float)), stride);
-        _tile_stored(7, result + 16 * (stride / sizeof(float)) + 16, stride);
-        if (rows < 32) {
-          float* destination = bc->get_submat(m, n, m_pos, n_pos);
-          for (int row = 0; row < rows; ++row) {
-            std::memcpy(destination + static_cast<size_t>(row) * dst_stride_elems, tail_c[row], 32 * sizeof(float));
-          }
-        }
+  // Epilogue of fp4_mat_mat_kgroup_amx for the 32x32 block at (m_pos, n_pos)
+  // held in tiles 4..7: BF16 rows into dst, or FP32 into bc.
+  static void store_amx_result(int m, int n, int m_pos, int n_pos, int rows, BufferC* bc, ggml_bf16_t* dst,
+                               float (&tile_out)[32][32]) {
+    if (dst) {
+      _tile_stored(4, &tile_out[0][0], 32 * sizeof(float));
+      _tile_stored(5, &tile_out[0][16], 32 * sizeof(float));
+      _tile_stored(6, &tile_out[16][0], 32 * sizeof(float));
+      _tile_stored(7, &tile_out[16][16], 32 * sizeof(float));
+      for (int row = 0; row < rows; ++row) {
+        avx512_32xfp32_to_32xbf16(reinterpret_cast<__m512*>(&tile_out[row][0]), reinterpret_cast<__m512*>(&tile_out[row][16]),
+                                  reinterpret_cast<__m512i*>(dst + static_cast<size_t>(m_pos + row) * n + n_pos));
+      }
+      return;
+    }
+    // BufferC tail blocks (n % N_BLOCK != 0) stride by their true width,
+    // not N_BLOCK, so tile stores must follow BufferCImpl::get_submat.
+    const int dst_stride_elems = std::min(N_BLOCK, n - (n_pos / N_BLOCK) * N_BLOCK);
+    float* result = rows == 32 ? bc->get_submat(m, n, m_pos, n_pos) : &tile_out[0][0];
+    const int stride = rows == 32 ? dst_stride_elems * sizeof(float) : 32 * sizeof(float);
+    _tile_stored(4, result, stride);
+    _tile_stored(5, result + 16, stride);
+    _tile_stored(6, result + 16 * (stride / sizeof(float)), stride);
+    _tile_stored(7, result + 16 * (stride / sizeof(float)) + 16, stride);
+    if (rows < 32) {
+      float* destination = bc->get_submat(m, n, m_pos, n_pos);
+      for (int row = 0; row < rows; ++row) {
+        std::memcpy(destination + static_cast<size_t>(row) * dst_stride_elems, tile_out[row], 32 * sizeof(float));
       }
     }
   }
@@ -1583,20 +1688,24 @@ inline void vec_mul_kgroup(int m, int n, int k, int k_group_size,
   GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_kgroup(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
 }
 
-inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
+// Prefill GEMM task. With dst, a kernel that can write the task's BF16 output
+// rows itself does so and the call returns true; otherwise the FP32 result is
+// in bc for to_mat and the call returns false.
+inline bool mat_mul_kgroup(int m, int n, int k, int k_group_size,
                            std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferA> ba,
                            std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferB> bb,
-                           std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferC> bc, int ith, int nth) {
+                           std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferC> bc, int ith, int nth,
+                           ggml_bf16_t* dst = nullptr) {
 #if defined(__AVX512BF16__)
   // Sparse routing can leave an expert below the AMX threshold even when
   // the overall prompt is large. Keep those tiles in K-major form too.
   if (m < 16 && k_group_size == 16 && k % 32 == 0 && bb->kmajor_weights && bb->scale_nv_valid) {
     GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_kmajor_nvfp4(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth);
-    return;
+    return false;
   }
   if (m < 16 && bb->kmajor_weights && bb->scale_e8_valid && k_group_size == 32 && k % 32 == 0) {
     GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_kmajor(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth);
-    return;
+    return false;
   }
 #endif
 #ifdef HAVE_AMX
@@ -1605,8 +1714,8 @@ inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
       m >= 16 && n >= GemmKernel224MXFP4SmallKGroup::N_STEP && k >= GemmKernel224MXFP4SmallKGroup::N_STEP &&
       n % GemmKernel224MXFP4SmallKGroup::N_STEP == 0 &&
       k_group_size == 32 && k % 32 == 0 && bb->scale_e8_valid) {
-    GemmKernel224MXFP4SmallKGroup::fp4_mat_mat_kgroup_amx(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth);
-    return;
+    GemmKernel224MXFP4SmallKGroup::fp4_mat_mat_kgroup_amx(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth, dst);
+    return dst != nullptr;
   }
   // The NVFP4 packers fold the per-16 scale into bf16(fp4 * scale). That is
   // exact for e4m3 block scales (at most 6 significant bits), i.e. whenever the
@@ -1616,11 +1725,12 @@ inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
       m >= 16 && n >= GemmKernel224MXFP4SmallKGroup::N_STEP && k >= GemmKernel224MXFP4SmallKGroup::N_STEP &&
       n % GemmKernel224MXFP4SmallKGroup::N_STEP == 0 &&
       k_group_size == 16 && k % 32 == 0) {
-    GemmKernel224MXFP4SmallKGroup::fp4_mat_mat_kgroup_amx(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth);
-    return;
+    GemmKernel224MXFP4SmallKGroup::fp4_mat_mat_kgroup_amx(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth, dst);
+    return dst != nullptr;
   }
 #endif
   GemmKernel224MXFP4SmallKGroup::fp4_mat_mat_kgroup(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
+  return false;
 }
 
 }  // namespace amx
@@ -1638,8 +1748,10 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
   using Base::gate_bb_;
   using Base::gate_bc_;
   using Base::gate_up_ba_;
+  using Base::m_local_down_output_ptr_;
   using Base::m_local_gate_output_ptr_;
   using Base::m_local_num_;
+  using Base::m_local_up_output_ptr_;
   using Base::tp_part_idx;
   using Base::up_bb_;
   using Base::up_bc_;
@@ -1719,7 +1831,9 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     return std::make_shared<typename T::BufferC>(m, n, data);
   }
 
-  void do_gate_up_gemm(bool do_up, int expert_idx, int ith, int nth, int qlen) {
+  // With dst, a kernel that writes the BF16 output rows itself does so and the
+  // call returns true; otherwise the FP32 result is in the expert's BufferC.
+  bool do_gate_up_gemm(bool do_up, int expert_idx, int ith, int nth, int qlen, ggml_bf16_t* dst = nullptr) {
     auto& group_size = config_.quant_config.group_size;
     int m = m_local_num_[expert_idx];
     auto& ba = gate_up_ba_[expert_idx];
@@ -1727,23 +1841,38 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
 
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
-      amx::mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
-    } else {
-      amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
+      return amx::mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth,
+                                 dst);
     }
+    amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
+    return false;
   }
 
-  void do_down_gemm(int expert_idx, int ith, int nth, int qlen) {
+  bool do_down_gemm(int expert_idx, int ith, int nth, int qlen, ggml_bf16_t* dst = nullptr) {
     auto& group_size = config_.quant_config.group_size;
     int m = m_local_num_[expert_idx];
 
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
-      amx::mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
-                          down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
-    } else {
-      amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
-                          down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
+      return amx::mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
+                                 down_bb_[expert_idx], down_bc_[expert_idx], ith, nth, dst);
     }
+    amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
+                        down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
+    return false;
+  }
+
+  // Prefill tasks hand the BF16 output rows to the GEMM, so the AMX kernel skips
+  // the FP32 BufferC round trip; the other kernels still go through to_mat.
+  void gate_up_gemm_to_mat(bool do_up, int expert_idx, int ith, int nth, int qlen) {
+    ggml_bf16_t* dst = do_up ? m_local_up_output_ptr_[expert_idx] : m_local_gate_output_ptr_[expert_idx];
+    if (do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen, dst)) return;
+    (do_up ? up_bc_ : gate_bc_)[expert_idx]->to_mat(m_local_num_[expert_idx], dst, ith, nth);
+  }
+
+  void down_gemm_to_mat(int expert_idx, int ith, int nth, int qlen) {
+    ggml_bf16_t* dst = m_local_down_output_ptr_[expert_idx];
+    if (do_down_gemm(expert_idx, ith, nth, qlen, dst)) return;
+    down_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], dst, ith, nth);
   }
 
   // The natural-order conversion depends only on the input row, so one copy serves

@@ -379,12 +379,7 @@ class AMX_MOE_BASE {
           int expert_idx = m_expert_id_map_[task_id / nth];
 
           int ith = task_id % nth;
-          derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
-          if (do_up) {
-            up_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_up_output_ptr_[expert_idx], ith, nth);
-          } else {
-            gate_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_gate_output_ptr_[expert_idx], ith, nth);
-          }
+          derived()->gate_up_gemm_to_mat(do_up, expert_idx, ith, nth, qlen);
         },
         nullptr);
 
@@ -428,8 +423,7 @@ class AMX_MOE_BASE {
         [this, nth, qlen](int task_id) {
           int expert_idx = m_expert_id_map_[task_id / nth];
           int ith = task_id % nth;
-          derived()->do_down_gemm(expert_idx, ith, nth, qlen);
-          down_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_down_output_ptr_[expert_idx], ith, nth);
+          derived()->down_gemm_to_mat(expert_idx, ith, nth, qlen);
         },
         nullptr);
 
@@ -728,6 +722,23 @@ class AMX_MOE_BASE {
   // Makes expert_idx's gate/up input alias source_expert's converted one; false keeps
   // the per-expert conversion.
   bool share_decode_gate_input(int expert_idx, int source_expert, int qlen) { return false; }
+
+  // One prefill gate/up GEMM task, leaving its BF16 rows in the expert's gate or up
+  // output. A backend whose kernel writes those rows itself overrides this.
+  void gate_up_gemm_to_mat(bool do_up, int expert_idx, int ith, int nth, int qlen) {
+    derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
+    if (do_up) {
+      up_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_up_output_ptr_[expert_idx], ith, nth);
+    } else {
+      gate_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_gate_output_ptr_[expert_idx], ith, nth);
+    }
+  }
+
+  // The same for one prefill down GEMM task and the expert's down output.
+  void down_gemm_to_mat(int expert_idx, int ith, int nth, int qlen) {
+    derived()->do_down_gemm(expert_idx, ith, nth, qlen);
+    down_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_down_output_ptr_[expert_idx], ith, nth);
+  }
 
   void prepare_decode_down_input(int expert_idx, int qlen) {
     down_ba_[expert_idx]->from_mat(qlen, m_local_gate_output_ptr_[expert_idx], 0, 1);
