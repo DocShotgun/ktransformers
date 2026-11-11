@@ -709,6 +709,9 @@ if(KTRANSFORMERS_USE_CUDA)
     list(APPEND ALL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/cuda/kt_stage_inputs.cu)
 endif()
 
+# Gradient clipping must propagate NaN/Inf even though the other KT kernels use fast-math.
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/bf16_sumsq.cpp PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
+
 file(GLOB_RECURSE FMT_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/*.hpp"

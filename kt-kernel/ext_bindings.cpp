@@ -20,6 +20,7 @@
 #include <cstring>
 #include <memory>
 
+#include "bf16_sumsq.h"
 #include "cpu_backend/cpuinfer.h"
 #include "cpu_backend/worker_pool.h"
 #if defined(KTRANSFORMERS_USE_ASCEND_NPU)
@@ -67,6 +68,11 @@ static const bool _is_plain_ = false;
 #include "operators/avx2/gptq_int4_avxvnni-moe.hpp"
 #include "operators/avx2/gptq_int4_avxvnni_packed-moe.hpp"
 #include "operators/avx2/mxfp4-moe.hpp"
+#include "operators/avx2/sft_mxfp4-moe.hpp"
+#include "operators/avx2/sft_rawint4-moe.hpp"
+#if !defined(USE_AMX_AVX_KERNEL)
+#include "operators/moe-sft-tp.hpp"
+#endif
 #include "operators/avx2/mxfp8-moe.hpp"
 #include "operators/avx2/rawint4-moe.hpp"
 #include "operators/avx2/rawint4_avxvnni-moe.hpp"
@@ -294,7 +300,7 @@ class MOEBindings {
   };
 };
 
-#if defined(__x86_64__) && defined(USE_AMX_AVX_KERNEL)
+#if defined(__x86_64__)
 template <class T>
 class MOESFTBindings {
  public:
@@ -496,7 +502,7 @@ void bind_moe_sft_module(py::module_& moe_module, const char* name) {
         self.set_base_weight_pointers((void*)gate, (void*)up, (void*)down);
       });
 }
-#endif  // defined(__x86_64__) && defined(USE_AMX_AVX_KERNEL)
+#endif  // defined(__x86_64__)
 
 template <typename MoeTP>
 void bind_moe_module(py::module_& moe_module, const char* name) {
@@ -590,6 +596,8 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
 }
 
 PYBIND11_MODULE(kt_kernel_ext, m) {
+  m.def("_bf16_sumsq_ptr", &bf16_sumsq_ptr, py::arg("data_ptr"), py::arg("numel"),
+        py::call_guard<py::gil_scoped_release>());
 #if defined(HAVE_AMX)
   m.attr("__cpu_variant__") = "amx";
   m.attr("__int8_kernel__") = "amx-int8";
@@ -612,6 +620,8 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   m.attr("__int8_weight_layout__") = "kt-int8-n32-k64-vnni-v1";
 #if defined(USE_AMX_AVX_KERNEL) && defined(__AVX512BF16__)
   m.attr("__rawint4_kernel__") = "amx-int4-kgroup-g32";
+#elif defined(__x86_64__) && !defined(USE_AMX_AVX_KERNEL)
+  m.attr("__rawint4_kernel__") = "avx2-int4-kgroup-g32";
 #else
   m.attr("__rawint4_kernel__") = "unsupported";
 #endif
@@ -1040,6 +1050,8 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
 #if defined(__AVX512BF16__)
   // SFT MoE with LoRA support (BF16, INT8, INT4, AWQ, K2)
   bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224BF16, AMX_BF16_MOE_TP>>(moe_module, "AMXBF16_SFT_MOE");
+  bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224MXFP4SmallKGroup, AMX_FP4_MOE_TP>>(
+      moe_module, "MXFP4_SFT_MOE");
 #if defined(__AVX512VBMI__)
   bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224FP8, AMX_FP8_MOE_TP>>(moe_module, "AMXFP8_SFT_MOE");
 #endif
@@ -1069,6 +1081,13 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   bind_moe_module<AVX2_GPTQ_INT4_MOE_TP<avx2::GemmKernelAVX2GPTQInt4>>(moe_module, "AVX2GPTQInt4_MOE");
   bind_moe_module<AVX2_RAW_INT4_MOE_TP<avx2::GemmKernelAVX2RawInt4>>(moe_module, "AVX2RawInt4_MOE");
   bind_moe_module<AVX2_MXFP4_MOE_TP<avx2::GemmKernelAVX2MXFP4>>(moe_module, "AVX2MXFP4_MOE");
+#if !defined(USE_AMX_AVX_KERNEL)
+  // AVX2 tier of the MXFP4 routed-expert LoRA SFT (same Python name as the AMX build)
+  bind_moe_sft_module<avx2::AVX2_SFT_MXFP4_MOE_TP<avx2::GemmKernelAVX2MXFP4>>(moe_module, "MXFP4_SFT_MOE");
+  // AVX2 tier of the RAWINT4 routed-expert LoRA SFT (same Python name as the AMX build)
+  bind_moe_sft_module<avx2::AVX2_SFT_RAWINT4_MOE_TP<avx2::GemmKernelAVX2RawInt4>>(moe_module,
+                                                                                  "AMXInt4_KGroup_SFT_MOE");
+#endif
   bind_moe_module<AVX2_MXFP8_MOE_TP<avx2::GemmKernelAVX2MXFP8>>(moe_module, "AVX2MXFP8_MOE");
   bind_moe_module<AVXVNNI256_GPTQ_INT4_MOE_TP<avxvnni::GemmKernelAVXVNNI256GPTQInt4>>(moe_module,
                                                                                       "AVXVNNI256GPTQInt4_MOE");

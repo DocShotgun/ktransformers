@@ -132,6 +132,9 @@ class AMX_K2_SFT_MOE_TP : public AMX_K2_MOE_TP<T> {
   static GeneralMOEConfig validated_base_config(const MOESFTConfig& config) {
     GeneralMOEConfig base_config = static_cast<const GeneralMOEConfig&>(config);
     validate_k2_kgroup_contract(base_config);
+    if (config.swiglu_limit != 0.0f || config.swiglu_alpha != 0.0f) {
+      throw std::runtime_error("K2 RAWINT4 SFT does not implement the swiglu clamp; swiglu_limit must be 0");
+    }
     return base_config;
   }
 
@@ -4960,6 +4963,7 @@ class AMX_K2_SFT_MOE_TP : public AMX_K2_MOE_TP<T> {
   static constexpr bool kSkipLoRA = SkipLoRA;
   static constexpr bool kIsInt8Backend = false;
   static constexpr bool kIsFP8Backend = false;
+  static constexpr bool kIsMXFP4Backend = false;
   static constexpr bool kSupportsDirectBf16Reload = false;
   static constexpr bool kSupportsAuthoritativeBaseGrads = false;
   static constexpr bool kSupportsAuthoritativeLoraGrads = !SkipLoRA;

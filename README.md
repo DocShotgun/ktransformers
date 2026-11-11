@@ -16,6 +16,8 @@
 KTransformers is a research project focused on efficient inference and fine-tuning of large language models through CPU-GPU heterogeneous computing. The project now exposes two user-facing capabilities from the kt-kernel source tree: [Inference](./kt-kernel/README.md) and [SFT](./doc/en/SFT/KTransformers-Fine-Tuning_Cookbook.md).
 
 ## 🔥 Updates
+
+* **Oct 8, 2026**: We release the author preprint of **KTransformers-FineTune (KT-FT)**, presenting layout-aware and schedule-optimized CPU-GPU co-computation for MoE fine-tuning. [Paper and citation](./papers/kt-ft/) · [PDF](./papers/kt-ft/ktransformers-finetune.pdf).
 * **Sep 13, 2026**: **Kimi K2.5 / K2.6 LoRA fine-tuning** is supported with native RAWINT4 routed experts.
 * **Aug 26, 2026**: Added native support for **GLM-5.3-flash**, bringing 1M-token context and multimodal input to consumer GPUs. ([Tutorial](./doc/en/kt-kernel/GLM-5.3-Flash-Tutorial.md))
 * **Aug 25, 2026**: Uploaded a new easy-to-use [KTransformers × LlamaFactory MoE Fine-Tuning Cookbook](./doc/en/SFT/KTransformers-Fine-Tuning_Cookbook.md), covering hardware checks, installation, BF16/FP8/INT8 recipes, LoRA and full fine-tuning, resource planning, and troubleshooting.
@@ -55,7 +57,7 @@ KTransformers is a research project focused on efficient inference and fine-tuni
 * **Feb 15, 2025**: Longer Context (from 4K to 8K for 24GB VRAM) & Slightly Faster Speed （+15%, up to 16 Tokens/s), update [docs](./doc/en/DeepseekR1_V3_tutorial.md) and [online books](https://kvcache-ai.github.io/ktransformers/).
 * **Feb 10, 2025**: Support Deepseek-R1 and V3 on single (24GB VRAM)/multi gpu and 382G DRAM, up to 3~28x speedup. For detailed show case and reproduction tutorial, see [here](./doc/en/DeepseekR1_V3_tutorial.md).
 * **Aug 28, 2024**: Decrease DeepseekV2's required VRAM from 21G to 11G.
-* **Aug 15, 2024**: Update detailed [tutorial](doc/en/injection_tutorial.md) for injection and multi-GPU.
+* **Aug 15, 2024**: Update detailed [tutorial](doc/en/SFT/injection_tutorial.md) for injection and multi-GPU.
 * **Aug 14, 2024**: Support llamfile as linear backend.
 * **Aug 12, 2024**: Support multiple GPU; Support new model: mixtral 8\*7B  and 8\*22B; Support q2k, q3k, q5k dequant on gpu.
 * **Aug 9, 2024**: Support windows native.
@@ -100,6 +102,8 @@ pip install .
 
 ### 🎓 [SFT](./doc/en/SFT/KTransformers-Fine-Tuning_Cookbook.md) - Fine-Tuning with LlamaFactory
 
+**Research paper:** [KTransformers-FineTune (KT-FT)](./papers/kt-ft/) · [PDF](./papers/kt-ft/ktransformers-finetune.pdf).
+
 KTransformers × LlamaFactory integration for ultra-large MoE model fine-tuning. The new Cookbook provides an easy-to-use path from hardware checks and installation to BF16/FP8/INT8 configuration, LoRA/full training, resource planning, and troubleshooting.
 
 **Kimi K2.5 / K2.6 LoRA fine-tuning** is supported with native RAWINT4 routed experts. Follow the [PyPI installation, training, resume and SGLang serving guide (中文)](./.github/release/examples/kimi-k25/README.md). End-to-end validation uses Kimi K2.5; K2.6 follows the same model-architecture path.
@@ -139,7 +143,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch \
 
 ## 🔥 Citation
 
-If you use KTransformers in your research, please cite our paper:
+If you use KTransformers in your research, please cite the relevant paper.
+
+### Inference paper
 
 ```bibtex
 @inproceedings{10.1145/3731569.3764843,
@@ -147,6 +153,21 @@ If you use KTransformers in your research, please cite our paper:
   author = {Chen, Hongtao and Xie, Weiyu and Zhang, Boxin and Tang, Jingqi and Wang, Jiahao and Dong, Jianwei and Chen, Shaoyuan and Yuan, Ziwei and Lin, Chen and Qiu, Chengyu and Zhu, Yuening and Ou, Qingliang and Liao, Jiaqi and Chen, Xianglin and Ai, Zhiyuan and Wu, Yongwei and Zhang, Mingxing},
   booktitle = {Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles},
   year = {2025}
+}
+```
+
+### Fine-tuning paper
+
+[KTransformers-FineTune (KT-FT)](./papers/kt-ft/) · [Full BibTeX](./papers/kt-ft/CITATION.bib)
+
+```bibtex
+@misc{li2026ktft,
+  title = {{KTransformers-FineTune: Beyond Offload with Layout-Aware and Schedule-Optimized Heterogeneous MoE Fine-Tuning}},
+  author = {Li, Peilin and Hao, Xingxing and Chen, Hongtao and Xie, Weiyu and Zheng, Yaowei and Wu, Bowen and Yang, Yujie and Shen, Huanming and Ou, Qingliang and Zhang, Boxin and Tang, Jingqi and Yuan, Ziwei and Dong, Jianwei and Kuang, Dongdong and Feng, Zhangchi and Dai, Jiaheng and Yang, Qianrui and Chen, Shaoyuan and Wang, Jiahao and Han, Yaochen and Zhu, Yuening and Liao, Jiaqi and Chen, Xianglin and Ai, Zhiyuan and Wu, Yongwei and Zhang, Mingxing},
+  year = {2026},
+  note = {Author preprint, version paper-ktft-v1.1},
+  howpublished = {Author preprint, GitHub},
+  url = {https://github.com/kvcache-ai/ktransformers/tree/paper-ktft-v1.1/papers/kt-ft}
 }
 ```
 
