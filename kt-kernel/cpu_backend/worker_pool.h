@@ -152,7 +152,10 @@ class WorkerPool {
   WorkerPool(int total_thread_count, int single_numa_id);
   WorkerPool(WorkerPoolConfig config);
   ~WorkerPool();
+  // Workers across all subpools.
   int get_thread_num();
+  // Cap every subpool at `count` workers (clamped to [1, subpool size]) for
+  // the jobs dispatched after the call. Call only while no job is running.
   void set_restricted_worker_count(int count);
 
   static thread_local int thread_local_id;
@@ -169,9 +172,7 @@ class WorkerPool {
  private:
   void init(WorkerPoolConfig config);
 
-  int total_thread_count;
-  int numa_count;
-  int threads_per_numa;
+  int total_thread_count = 0;
   std::unique_ptr<NumaJobDistributor> distributor;
 
   std::vector<std::unique_ptr<InNumaPool>> numa_worker_pools;

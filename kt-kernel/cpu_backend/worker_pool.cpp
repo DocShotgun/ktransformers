@@ -145,7 +145,10 @@ int InNumaPool::get_thread_num() {
   return total_worker_count;
 }
 
-void InNumaPool::set_restricted_worker_count(int count) { restricted_worker_count = count; }
+// A count above the pool size would dispatch to workers that do not exist.
+void InNumaPool::set_restricted_worker_count(int count) {
+  restricted_worker_count = std::clamp(count, 1, total_worker_count);
+}
 
 void InNumaPool::wait() {
   // Thread 0 is the caller, which ran its share inside do_work_stealing_job_async.
@@ -414,6 +417,7 @@ void NumaJobDistributor::do_numa_job(std::function<void(int)> compute_func) {
     if (i == me_numa) continue;
 
     while (status[i]->load(std::memory_order_acquire) == ThreadStatus::WORKING) {
+      KT_POOL_PAUSE();
     }
   }
 }
@@ -427,34 +431,41 @@ void NumaJobDistributor::do_numa_job(std::function<void(int)> compute_func) {
     }
     cvs[i]->notify_one();
   }
+  // The caller is the task-queue worker, usually on an SMT sibling of a pool worker.
   for (int i = 0; i < numa_count; i++) {
     while (status[i]->load(std::memory_order_acquire) == ThreadStatus::WORKING) {
+      KT_POOL_PAUSE();
     }
   }
 }
 #endif
 
+// numa_id is this thread's subpool index; numa_ids[numa_id] is its NUMA node.
 void NumaJobDistributor::worker_thread(int numa_id) {
-  auto start = std::chrono::high_resolution_clock::now();
-  set_memory_to_numa(numa_id);
+  // This thread is worker 0 of its subpool, so its allocations and first
+  // touches must land on the node it is pinned to.
+  set_memory_to_numa(numa_ids[numa_id]);
   status[numa_id] =
       std::move(std::unique_ptr<std::atomic<ThreadStatus>>(new std::atomic<ThreadStatus>(ThreadStatus::WAITING)));
   ready_bar->arrive_and_wait();
+  auto last_work = std::chrono::steady_clock::now();
+  uint32_t spins = 0;
   while (true) {
     auto stat = status[numa_id]->load(std::memory_order_acquire);
     if (stat == ThreadStatus::WORKING) {
       compute_func(numa_id);
       status[numa_id]->store(ThreadStatus::WAITING, std::memory_order_release);
-      start = std::chrono::high_resolution_clock::now();
+      last_work = std::chrono::steady_clock::now();
+      spins = 0;
     } else if (stat == ThreadStatus::WAITING) {
-      auto now = std::chrono::high_resolution_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-      if (duration > 50) {
-        std::unique_lock<std::mutex> lock(*mutexes[numa_id]);
-        cvs[numa_id]->wait(lock, [&] {
-          return status[numa_id]->load(std::memory_order_acquire) != ThreadStatus::WAITING;
-        });
-      }
+      KT_POOL_PAUSE();
+      // Read the clock only every 256 pauses, as InNumaPool's workers do.
+      if ((++spins & 255) != 0) continue;
+      if (std::chrono::steady_clock::now() - last_work < std::chrono::milliseconds(50)) continue;
+      std::unique_lock<std::mutex> lock(*mutexes[numa_id]);
+      cvs[numa_id]->wait(lock, [&] {
+        return status[numa_id]->load(std::memory_order_acquire) != ThreadStatus::WAITING;
+      });
     } else if (stat == ThreadStatus::EXIT) {
       return;
     }
@@ -483,6 +494,8 @@ void WorkerPool::init(WorkerPoolConfig config) {
       // numa_worker_pools[i] = std::move(std::unique_ptr<InNumaPool>(new InNumaPool(this_thread_count)));
     }).join();
     numa_threads_count[this_numa] += this_thread_count;
+    // InNumaPool never runs fewer than one worker.
+    total_thread_count += std::max(1, this_thread_count);
   }
 
   distributor = std::move(std::unique_ptr<NumaJobDistributor>(
@@ -527,9 +540,7 @@ WorkerPool::~WorkerPool() {}
 int WorkerPool::get_thread_num() { return total_thread_count; }
 
 void WorkerPool::set_restricted_worker_count(int count) {
-  for (int i = 0; i < numa_count; i++) {
-    numa_worker_pools[i]->set_restricted_worker_count(threads_per_numa);
-  }
+  for (auto& pool : numa_worker_pools) pool->set_restricted_worker_count(count);
 }
 
 InNumaPool* WorkerPool::get_subpool(int numa_id) { return numa_worker_pools[numa_id].get(); }
