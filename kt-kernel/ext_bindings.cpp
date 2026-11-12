@@ -102,6 +102,9 @@ namespace py = pybind11;
 cudaError_t kt_stage_moe_inputs(cudaStream_t stream, const void* hidden, int64_t hidden_bytes, const void* ids,
                                 bool ids_int32, const float* weights, int64_t routes, void* host_hidden,
                                 int64_t* host_ids, float* host_weights, uint32_t* bell, uint32_t bell_value);
+// cuda/kt_merge_output.cu
+cudaError_t kt_merge_moe_output(cudaStream_t stream, const void* gpu, const void* host, void* out, int64_t elems,
+                                float scale, bool apply_scale);
 #endif
 using namespace pybind11::literals;
 
@@ -721,6 +724,18 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       "host_ids"_a, "host_weights"_a, "bell"_a = 0, "bell_value"_a = 0,
       "Copy one layer's hidden rows, routing weights and int64 expert ids to pinned host memory in one kernel; "
       "with a doorbell (CPUInfer.register_doorbell), ring it once they are visible.");
+  m.def(
+      "merge_moe_output",
+      [](intptr_t stream, intptr_t gpu, intptr_t host, intptr_t out, int64_t elems, float scale, bool apply_scale) {
+        const cudaError_t err = kt_merge_moe_output(reinterpret_cast<cudaStream_t>(stream),
+                                                    reinterpret_cast<const void*>(gpu),
+                                                    reinterpret_cast<const void*>(host), reinterpret_cast<void*>(out),
+                                                    elems, scale, apply_scale);
+        if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
+      },
+      "stream"_a, "gpu"_a, "host"_a, "out"_a, "elems"_a, "scale"_a, "apply_scale"_a,
+      "out = gpu + host in bf16, then out *= scale if apply_scale, rounding as torch's add and mul do; host is the "
+      "pinned CPU-expert output, read in place.");
 #endif
 
   py::class_<CPUInfer>(m, "CPUInfer")

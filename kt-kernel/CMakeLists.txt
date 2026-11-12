@@ -705,8 +705,9 @@ message(STATUS "SOURCE_DIR7: ${SOURCE_DIR7}")
 
 set(ALL_SOURCES ${SOURCE_DIR1} ${SOURCE_DIR2} ${SOURCE_DIR3} ${SOURCE_DIR4} ${SOURCE_DIR5} ${SOURCE_DIR6} ${SOURCE_DIR7})
 if(KTRANSFORMERS_USE_CUDA)
-    # Decode staging kernel for KT's CPU-expert inputs (python/experts_base.py).
+    # Decode staging and merge kernels for KT's CPU-expert inputs and output (python/experts_base.py).
     list(APPEND ALL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/cuda/kt_stage_inputs.cu)
+    list(APPEND ALL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/cuda/kt_merge_output.cu)
 endif()
 
 # Gradient clipping must propagate NaN/Inf even though the other KT kernels use fast-math.

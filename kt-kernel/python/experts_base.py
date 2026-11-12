@@ -220,6 +220,27 @@ _STAGE_MAX_ROWS = 64
 _STAGE_ON_GPU = os.environ.get("KT_STAGE_KERNEL", "1") != "0" and hasattr(kt_kernel_ext, "stage_moe_inputs")
 
 
+_MERGE_ON_GPU = os.environ.get("KT_MERGE_KERNEL", "1") != "0" and hasattr(kt_kernel_ext, "merge_moe_output")
+
+
+def _can_merge_on_gpu(gpu_output: torch.Tensor, host_output: torch.Tensor) -> bool:
+    """Whether merge_moe_output can produce exactly what the copy_, add and mul produced."""
+    return (
+        _MERGE_ON_GPU
+        and gpu_output.is_cuda
+        and gpu_output.dim() == 2
+        and gpu_output.shape[0] <= _STAGE_MAX_ROWS
+        and gpu_output.shape == host_output.shape
+        and gpu_output.dtype == torch.bfloat16
+        and host_output.dtype == torch.bfloat16
+        and gpu_output.is_contiguous()
+        and host_output.is_contiguous()
+        and gpu_output.numel() % 8 == 0
+        and gpu_output.data_ptr() % 16 == 0
+        and host_output.data_ptr() % 16 == 0
+    )
+
+
 def _can_stage_on_gpu(hidden: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor, host_hidden) -> bool:
     """Whether stage_moe_inputs can produce exactly what the copy_ path would."""
     return (
@@ -1009,6 +1030,43 @@ class BaseMoEWrapper(_MoEBase, ABC):
         Returns:
             output_gpu: Output tensor on GPU
         """
+        self._sync_cpu_forward(hidden_states, cuda_stream)
+        return self.copy_forward_output_to_device(hidden_states)
+
+    def sync_forward_merged(
+        self,
+        hidden_states: torch.Tensor,
+        cuda_stream,
+        gpu_output: torch.Tensor,
+        scale: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Synchronize, then return ``(gpu_output + CPU output) * scale`` in a new tensor
+        (no multiply when ``scale`` is None), bit-identical to ``gpu_output +
+        sync_forward(...)`` followed by ``*= scale``.
+
+        At decode sizes on CUDA one kernel reads the pinned CPU output in place of the
+        host-to-device copy, the add and the multiply.
+        """
+        output_cpu = self._sync_cpu_forward(hidden_states, cuda_stream)
+        if _can_merge_on_gpu(gpu_output, output_cpu):
+            merged = torch.empty_like(gpu_output)
+            kt_kernel_ext.merge_moe_output(
+                cuda_stream,
+                gpu_output.data_ptr(),
+                output_cpu.data_ptr(),
+                merged.data_ptr(),
+                gpu_output.numel(),
+                1.0 if scale is None else scale,
+                scale is not None,
+            )
+            return merged
+        merged = gpu_output + self.copy_forward_output_to_device(hidden_states)
+        if scale is not None:
+            merged *= scale
+        return merged
+
+    def _sync_cpu_forward(self, hidden_states: torch.Tensor, cuda_stream) -> torch.Tensor:
+        """Order the stream after this layer's CPU forward; return its pinned output."""
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         (
             _input_tensor_cpu,
@@ -1017,7 +1075,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
             _weights_cpu,
             output_cpu,
             _bsz_tensor_cpu,
-            output_gpu,
+            _output_gpu,
         ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
 
         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
@@ -1042,8 +1100,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
             else:
                 self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
         BaseMoEWrapper._slot_in_flight.pop(current_slot, None)
-
-        return self.copy_forward_output_to_device(hidden_states)
+        return output_cpu[current_slot]
 
     def forward(
         self,
