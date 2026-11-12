@@ -78,6 +78,8 @@ class InNumaPool {
   ~InNumaPool();
   int get_thread_num();
   void set_restricted_worker_count(int count);
+  // Threads a job may run on: the pool size, or the restricted count.
+  int worker_capacity() const { return restricted_worker_count; }
 
   void do_work_stealing_job_async(int, std::function<void(int)>, std::function<void(int)>, std::function<void(int)>);
   void wait();

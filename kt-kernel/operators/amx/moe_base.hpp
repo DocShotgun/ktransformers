@@ -825,19 +825,23 @@ class AMX_MOE_BASE {
     for (int p = 0; p < activated_expert * nth_gu; p++) decode_pair_done_[p].v.store(0, std::memory_order_relaxed);
     for (int d = 0; d < nth_down; d++) decode_block_done_[d].v.store(0, std::memory_order_relaxed);
 
-    // Kernels with few gate/up ranges per expert (256-wide FP8 / INT4 blocks) need gate
-    // and up as separate units to occupy the pool; the second of the pair to finish
-    // applies the activation. Fine ranges (FP4 decode) run both in one unit.
-    // Threshold measured on DSv4.1/MiMo/GLM (FP4, 16-18 ranges) and DSv3/Kimi (2).
+    // Gate and up as separate units (the second of the pair to finish applies the
+    // activation) halve each unit. Kernels with few ranges per expert (256-wide FP8 / INT4
+    // blocks, DSv3/Kimi: 2) need that to occupy the pool at all. Fine ranges (FP4: 16-18)
+    // split only while activated_expert * nth_gu units are under 1.5 per thread; past that
+    // the pool is saturated and splitting costs ~1%. Measured with 32 threads per node:
+    // -13% on DSv4.1 at 2 CPU experts, -14% / -6% on MiMo at 1 / 2.
     static const int split_below = [] {
       const char* value = std::getenv("KT_DECODE_SPLIT_GATE_UP_BELOW");
       return value ? std::atoi(value) : 8;
     }();
-    const bool split_gate_up = nth_gu < split_below;
+    static const bool split_by_occupancy = cached_env_flag("KT_DECODE_SPLIT_GATE_UP_OCCUPANCY");
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+    const bool split_gate_up =
+        nth_gu < split_below || (split_by_occupancy && 2 * activated_expert * nth_gu < 3 * pool->worker_capacity());
     const int units_per_range = split_gate_up ? 2 : 1;
     const int units_gate_up = activated_expert * nth_gu * units_per_range;
     const int units_down = activated_expert * nth_down;
-    auto pool = config_.pool->get_subpool(tp_part_idx);
     pool->do_work_stealing_job(
         units_gate_up + units_down, [](int) { T::config(); },
         [&, this](int unit) {
