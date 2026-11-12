@@ -15,6 +15,9 @@
 #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
 #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -319,6 +322,37 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   };
 
+  // BF16 bits of the positive e4m3 subnormals m * 2^-9, m = 0..7.
+  static constexpr uint16_t kE4m3SubnormalBf16[8] = {0x0000, 0x3B00, 0x3B80, 0x3BC0,
+                                                     0x3C00, 0x3C20, 0x3C40, 0x3C60};
+
+  // The e4m3 code (0..0x7E) with exactly this BF16 value, or -1 (negative, NaN or
+  // not representable).
+  static int e4m3_code_of_bf16(uint16_t bits) {
+    if (bits & 0x8000u) return -1;
+    const int exponent = bits >> 7;
+    const int mantissa = bits & 0x7F;
+    if (exponent >= 121 && exponent <= 135 && (mantissa & 0x0F) == 0) {
+      const int code = ((exponent - 120) << 3) | (mantissa >> 4);
+      return code == 0x7F ? -1 : code;
+    }
+    for (int m = 0; m < 8; ++m)
+      if (bits == kE4m3SubnormalBf16[m]) return m;
+    return -1;
+  }
+
+#if defined(__AVX512BF16__)
+  // 32 e4m3 codes from e4m3_code_of_bf16 back to their BF16 bits, in byte order: a
+  // normal code is (code << 4) + (120 << 7), a subnormal one a table entry.
+  static inline __m512i e4m3x32_to_bf16(const uint8_t* codes) {
+    const __m512i c = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes)));
+    const __m512i normal = _mm512_add_epi16(_mm512_slli_epi16(c, 4), _mm512_set1_epi16(0x3C00));
+    const __mmask32 subnormal = _mm512_cmplt_epu16_mask(c, _mm512_set1_epi16(8));
+    const __m512i table = _mm512_castsi128_si512(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kE4m3SubnormalBf16)));
+    return _mm512_mask_permutexvar_epi16(normal, subnormal, c, table);
+  }
+#endif
+
   // Native MXFP4 scales are positive powers of two. After validating the full
   // tensor, keep one exponent byte per group in the FP32 slot area;
   // reconstructing either FP32 or BF16 is then bit-exact. Other input is
@@ -350,6 +384,12 @@ struct GemmKernel224MXFP4SmallKGroup {
     ggml_bf16_t* scale_nv_compact = nullptr;
     ggml_bf16_t* scale_nv_kmajor = nullptr;
     bool scale_nv_valid = false;
+    // When every scale is an exact e4m3 value (block scales with the global applied
+    // separately), the K-major copy holds one e4m3 code per group at the start of
+    // scale_nv_kmajor's area; the kernels decode it to the same BF16
+    // (KT_NVFP4_E4M3_SCALES=0 keeps BF16).
+    uint8_t* scale_nv_kmajor_e4m3 = nullptr;
+    bool scale_nv_e4m3 = false;
 
     static size_t required_size(int n, int k, int k_group_size) { return Base::required_size(n, k, k_group_size); }
 
@@ -359,6 +399,7 @@ struct GemmKernel224MXFP4SmallKGroup {
       scale_e8_kmajor = scale_e8 + static_cast<size_t>(n) * k_group_count;
       scale_nv_compact = reinterpret_cast<ggml_bf16_t*>(d);
       scale_nv_kmajor = scale_nv_compact + static_cast<size_t>(n) * k_group_count;
+      scale_nv_kmajor_e4m3 = reinterpret_cast<uint8_t*>(scale_nv_kmajor);
       // NVFP4 keeps its own K-major knob (KT_NVFP4_KMAJOR_WEIGHTS) mirroring
       // the MXFP4 one; both default on for AMX/BF16 hosts.
       const char* layout =
@@ -531,6 +572,16 @@ struct GemmKernel224MXFP4SmallKGroup {
       }
     }
 
+    // Compact scales use the first used_bytes of the four bytes per group; nothing reads
+    // the rest. Return its whole pages to the kernel (a later FP32 load faults in zero pages).
+    void release_scale_tail(size_t used_bytes) {
+      static const uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+      const uintptr_t base = reinterpret_cast<uintptr_t>(d);
+      const uintptr_t first = (base + used_bytes + page - 1) & ~(page - 1);
+      const uintptr_t last = (base + static_cast<size_t>(n) * k_group_count * sizeof(float)) & ~(page - 1);
+      if (last > first) madvise(reinterpret_cast<void*>(first), last - first, MADV_DONTNEED);
+    }
+
     // NVFP4 per-16 scales arrive as BF16 values (see scale_nv_compact). Compact
     // the FP32 slots to BF16 in-place -- forward compression stays overlap-safe, bytes 2i and 2i+1
     // are always written below the first byte of every not-yet-read float
@@ -549,17 +600,32 @@ struct GemmKernel224MXFP4SmallKGroup {
         valid = valid && GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(d[i])) == d[i];
       }
       scale_nv_valid = valid;
+      scale_nv_e4m3 = false;
       if (!valid) return;
       for (size_t i = 0; i < count; ++i) scale_nv_compact[i] = GGML_FP32_TO_BF16(d[i]);
-      if (kmajor_weights) {
-        for (int row = 0; row < n; row += 32) {
-          for (int group = 0; group < k_group_count; ++group) {
-            ggml_bf16_t* dst = scale_nv_kmajor + static_cast<size_t>(row) * k_group_count + group * 32;
-            for (int channel = 0; channel < 32; ++channel)
-              dst[channel] = scale_nv_compact[static_cast<size_t>(row + channel) * k_group_count + group];
+      if (!kmajor_weights) return;
+      static const bool e4m3_enabled = [] {
+        const char* value = std::getenv("KT_NVFP4_E4M3_SCALES");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+      }();
+      bool e4m3 = e4m3_enabled;
+      for (size_t i = 0; e4m3 && i < count; ++i) e4m3 = e4m3_code_of_bf16(scale_nv_compact[i].bits) >= 0;
+      scale_nv_e4m3 = e4m3;
+      for (int row = 0; row < n; row += 32) {
+        for (int group = 0; group < k_group_count; ++group) {
+          const size_t offset = static_cast<size_t>(row) * k_group_count + group * 32;
+          for (int channel = 0; channel < 32; ++channel) {
+            const ggml_bf16_t value = scale_nv_compact[static_cast<size_t>(row + channel) * k_group_count + group];
+            if (e4m3) {
+              scale_nv_kmajor_e4m3[offset + channel] = static_cast<uint8_t>(e4m3_code_of_bf16(value.bits));
+            } else {
+              scale_nv_kmajor[offset + channel] = value;
+            }
           }
         }
       }
+      // The BF16 compact copy and the e4m3 K-major copy fill three of the four bytes per group.
+      if (e4m3) release_scale_tail(3 * count);
     }
 
     const uint8_t* get_scale_e8(int n_, int n_begin, int k_, int k_begin) const {
@@ -852,6 +918,12 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   }
 
+  // 32 K-major NVFP4 scales starting at element `index`, as BF16 bits.
+  static inline __m512i nv_kmajor_scales(const BufferB* bb, size_t index) {
+    return bb->scale_nv_e4m3 ? e4m3x32_to_bf16(bb->scale_nv_kmajor_e4m3 + index)
+                             : _mm512_loadu_si512(bb->scale_nv_kmajor + index);
+  }
+
   // NVFP4 companion of fp4_kmajor_rows (per-16 BF16 scales). Pairs 0..7 and
   // 8..15 of a 32-K group fall in the two scale halves, so one accumulator
   // pair per row serves both halves in turn, folding each half's scale in the
@@ -881,10 +953,10 @@ struct GemmKernel224MXFP4SmallKGroup {
       for (int group = 0; group < group32_count; ++group) {
         // 32 channels per k-group: lanes 0..15 hold channels 0..15, lanes
         // 16..31 hold channels 16..31 (dpbf16 lane halves).
-        const ggml_bf16_t* scales = bb->scale_nv_kmajor + static_cast<size_t>(n_pos) * group_count + group * 64;
+        const size_t scales = static_cast<size_t>(n_pos) * group_count + group * 64;
         const uint8_t* src = tile + static_cast<size_t>(group) * 16 * 32;
         for (int half = 0; half < 2; ++half) {
-          const __m512i sv = _mm512_loadu_si512(scales + half * 32);
+          const __m512i sv = nv_kmajor_scales(bb, scales + half * 32);
           const __m512 scale0 = _mm512_cvtpbh_ps((__m256bh)_mm512_castsi512_si256(sv));
           const __m512 scale1 = _mm512_cvtpbh_ps((__m256bh)_mm512_extracti64x4_epi64(sv, 1));
           __m512 group0[MB];
@@ -1051,27 +1123,30 @@ struct GemmKernel224MXFP4SmallKGroup {
       const auto* activation = reinterpret_cast<const uint16_t*>(ba->get_submat(m, k, mi, 0));
       float* output = bc->get_submat(m, n, mi, n_start);
       const uint8_t* weight_end = bb->b + static_cast<size_t>(n_end) * row_bytes;
-      const ggml_bf16_t* scale_end = bb->scale_nv_kmajor + static_cast<size_t>(n_end) * group_count;
+      // Scales take 128 B (BF16) or 64 B (e4m3) per 32-K group against the weights'
+      // 512 B, so they run a quarter or an eighth as far ahead.
+      const size_t scale_bytes = bb->scale_nv_e4m3 ? 1 : sizeof(ggml_bf16_t);
+      const uint8_t* scale_base = bb->scale_nv_e4m3 ? bb->scale_nv_kmajor_e4m3
+                                                    : reinterpret_cast<const uint8_t*>(bb->scale_nv_kmajor);
+      const uint8_t* scale_end = scale_base + static_cast<size_t>(n_end) * group_count * scale_bytes;
       for (int n_pos = n_start; n_pos < n_end; n_pos += 32) {
         const uint8_t* tile = bb->b + static_cast<size_t>(n_pos) * row_bytes;
         __m512 sum0 = _mm512_setzero_ps();
         __m512 sum1 = _mm512_setzero_ps();
         for (int group = 0; group < group32_count; ++group) {
-          const ggml_bf16_t* scales =
-              bb->scale_nv_kmajor + static_cast<size_t>(n_pos) * group_count + group * 64;
+          const size_t scales = static_cast<size_t>(n_pos) * group_count + group * 64;
           if (prefetch_bytes > 0) {
-            // Weights take 512 B per 32-K group and scales 128 B, so scales run a quarter as far ahead.
             const uint8_t* ahead = tile + static_cast<size_t>(group) * 16 * 32 + prefetch_bytes;
             for (int line = 0; line < 8 && ahead + line * 64 < weight_end; ++line) {
               _mm_prefetch(reinterpret_cast<const char*>(ahead + line * 64), _MM_HINT_T0);
             }
-            const ggml_bf16_t* scale_ahead = scales + prefetch_bytes / 4 / sizeof(ggml_bf16_t);
-            for (int line = 0; line < 2 && scale_ahead + line * 32 < scale_end; ++line) {
-              _mm_prefetch(reinterpret_cast<const char*>(scale_ahead + line * 32), _MM_HINT_T0);
+            const uint8_t* scale_ahead = scale_base + scales * scale_bytes + prefetch_bytes * scale_bytes / 8;
+            for (int line = 0; line < static_cast<int>(scale_bytes) && scale_ahead + line * 64 < scale_end; ++line) {
+              _mm_prefetch(reinterpret_cast<const char*>(scale_ahead + line * 64), _MM_HINT_T0);
             }
           }
-          const __m512i sv0 = _mm512_loadu_si512(scales);
-          const __m512i sv1 = _mm512_loadu_si512(scales + 32);
+          const __m512i sv0 = nv_kmajor_scales(bb, scales);
+          const __m512i sv1 = nv_kmajor_scales(bb, scales + 32);
           // 32 channels per k-group: lanes 0..15 hold channels 0..15, lanes
           // 16..31 hold channels 16..31 (dpbf16 lane halves).
           const __m512 s0a = _mm512_cvtpbh_ps((__m256bh)_mm512_castsi512_si256(sv0));
@@ -1418,10 +1493,9 @@ struct GemmKernel224MXFP4SmallKGroup {
       _mm512_storeu_si512(destination + 16, (__m512i)_mm512_cvtne2ps_pbh(f_hi1, f_hi0));
     };
     for (int group = group_begin; group < group_end; ++group) {
-      const ggml_bf16_t* scales =
-          bb->scale_nv_kmajor + static_cast<size_t>(n_pos) * nv_group_count + group * 64;
-      const __m512i sv0 = _mm512_loadu_si512(scales);
-      const __m512i sv1 = _mm512_loadu_si512(scales + 32);
+      const size_t scales = static_cast<size_t>(n_pos) * nv_group_count + group * 64;
+      const __m512i sv0 = nv_kmajor_scales(bb, scales);
+      const __m512i sv1 = nv_kmajor_scales(bb, scales + 32);
       // dup lane l <- channel l>>1 (low nibbles) / 16 + l>>1 (high nibbles),
       // per k-group half 2g (sv0) and 2g+1 (sv1).
       const __m512i dup0a = _mm512_permutexvar_epi16(duplicate, sv0);
