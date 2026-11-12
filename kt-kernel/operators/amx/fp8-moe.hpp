@@ -38,7 +38,10 @@ class AMX_FP8_MOE_TP : public AMX_MOE_BASE<T, AMX_FP8_MOE_TP<T>> {
   using Base::gate_bb_;
   using Base::gate_bc_;
   using Base::gate_up_ba_;
+  using Base::m_local_down_output_ptr_;
+  using Base::m_local_gate_output_ptr_;
   using Base::m_local_num_;
+  using Base::m_local_up_output_ptr_;
   using Base::tp_part_idx;
   using Base::up_bb_;
   using Base::up_bc_;
@@ -90,7 +93,9 @@ class AMX_FP8_MOE_TP : public AMX_MOE_BASE<T, AMX_FP8_MOE_TP<T>> {
   // CRTP virtual points - GEMM dispatch
   // ============================================================================
 
-  void do_gate_up_gemm(bool do_up, int expert_idx, int ith, int nth, int qlen) {
+  // Returns true when the AMX kernel wrote the BF16 rows into dst; otherwise the result is
+  // in the expert's BufferC.
+  bool do_gate_up_gemm(bool do_up, int expert_idx, int ith, int nth, int qlen, ggml_bf16_t* dst = nullptr) {
     auto& group_size = config_.quant_config.group_size;
     int m = m_local_num_[expert_idx];
     auto& ba = gate_up_ba_[expert_idx];
@@ -100,22 +105,37 @@ class AMX_FP8_MOE_TP : public AMX_MOE_BASE<T, AMX_FP8_MOE_TP<T>> {
     // Prefill matmul tiles (AMX staging gated in amx::mat_mul_kgroup) beat the
     // matvec inner loops once enough tokens share an expert batch.
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
-      amx::mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
-    } else {
-      amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
+      return amx::mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth,
+                                 dst);
     }
+    amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
+    return false;
   }
-  void do_down_gemm(int expert_idx, int ith, int nth, int qlen) {
+  bool do_down_gemm(int expert_idx, int ith, int nth, int qlen, ggml_bf16_t* dst = nullptr) {
     auto& group_size = config_.quant_config.group_size;
     int m = m_local_num_[expert_idx];
 
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
-      amx::mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
-                          down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
-    } else {
-      amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
-                          down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
+      return amx::mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
+                                 down_bb_[expert_idx], down_bc_[expert_idx], ith, nth, dst);
     }
+    amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
+                        down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
+    return false;
+  }
+
+  // Prefill tasks hand the BF16 output rows to the GEMM, so the AMX kernel skips the FP32
+  // BufferC round trip; the vector kernel still goes through to_mat.
+  void gate_up_gemm_to_mat(bool do_up, int expert_idx, int ith, int nth, int qlen) {
+    ggml_bf16_t* dst = do_up ? m_local_up_output_ptr_[expert_idx] : m_local_gate_output_ptr_[expert_idx];
+    if (do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen, dst)) return;
+    (do_up ? up_bc_ : gate_bc_)[expert_idx]->to_mat(m_local_num_[expert_idx], dst, ith, nth);
+  }
+
+  void down_gemm_to_mat(int expert_idx, int ith, int nth, int qlen) {
+    ggml_bf16_t* dst = m_local_down_output_ptr_[expert_idx];
+    if (do_down_gemm(expert_idx, ith, nth, qlen, dst)) return;
+    down_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], dst, ith, nth);
   }
 
 #ifdef DEBUG_FP8_MOE

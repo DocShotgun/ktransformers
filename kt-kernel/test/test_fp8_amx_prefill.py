@@ -18,13 +18,13 @@ def dequantize_fp8_blockwise(fp8, scales, group_size=128):
     return scaled.view(experts, n, k)
 
 
-def _run(backend, expert_counts):
+def _run(backend, expert_counts, hidden=1024):
     """Run one prefill backend and return its outputs plus the fp32 reference."""
     os.environ["KT_FP8_PREFILL_AMX"] = backend
     ext = kt_kernel.kt_kernel_ext
 
     torch.manual_seed(17)
-    experts, hidden, intermediate, qlen = 2, 1024, 1024, 64
+    experts, intermediate, qlen = 2, 1024, sum(expert_counts)
     group_size = 128
 
     # Random FP8 codes stress every widening lookup entry (denorms, both signs);
@@ -61,8 +61,9 @@ def _run(backend, expert_counts):
     pool.submit(moe.load_weights_task(mapping.data_ptr()))
     pool.sync()
 
-    # 33/31 exercises full and partial AMX tiles (tail rows must stay zero);
-    # 63/1 exercises the single-row staging fallback alongside an aliased expert.
+    # 33/31 exercises full and partial AMX tiles, the short one being the last expert's
+    # rows; 63/1 the single-row staging fallback beside an aliased expert; 560/40 at hidden
+    # 2048 several K blocks and an expert spanning two 512-row accumulator chunks.
     ids = torch.tensor(
         [[0]] * expert_counts[0] + [[1]] * expert_counts[1], dtype=torch.int64
     ).contiguous()
@@ -111,8 +112,8 @@ def child_main():
     amx_backend.child_main(_run)
 
 
-@pytest.mark.parametrize("expert_counts", [(33, 31), (63, 1)])
-def test_fp8_amx_prefill_matches_avx512(tmp_path, expert_counts):
+@pytest.mark.parametrize("expert_counts, hidden", [((33, 31), 1024), ((63, 1), 1024), ((560, 40), 2048)])
+def test_fp8_amx_prefill_matches_avx512(tmp_path, expert_counts, hidden):
     ext = kt_kernel.kt_kernel_ext
     if not hasattr(ext.moe, "AMXFP8_MOE"):
         pytest.skip("AMX FP8 extension is unavailable")
@@ -123,7 +124,7 @@ def test_fp8_amx_prefill_matches_avx512(tmp_path, expert_counts):
     # Kernel selection is cached per process, so each backend gets its own.
     results = {
         backend: amx_backend.run_backend(
-            __name__, backend, tmp_path, expert_counts=expert_counts
+            __name__, backend, tmp_path, expert_counts=expert_counts, hidden=hidden
         )
         for backend in ("0", "1")
     }
