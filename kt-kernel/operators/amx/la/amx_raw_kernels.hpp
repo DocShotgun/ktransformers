@@ -348,6 +348,12 @@ struct GemmKernel224FP8 {
         Base::from_mat(m, src, ith, nth);
       }
     }
+    // Reads the caller's row-major rows (stride k) in place, a single row included. The
+    // rows must stay unchanged until the GEMMs that read this buffer are done.
+    void alias_rows(ggml_bf16_t* src) {
+      a = src;
+      row_major = true;
+    }
     // Elements between consecutive rows at the pointer get_submat returns.
     int row_stride() const { return row_major ? k : K_STEP; }
     ggml_bf16_t* get_submat(int m, int k_, int m_begin, int k_begin) {
@@ -745,6 +751,163 @@ struct GemmKernel224FP8 {
       _mm512_store_ps(c + i * K::N_STEP + K::TILE_N, result);
     }
   }
+
+  // ==========================================================================
+  // Small-m GEMV: decode, and prefill experts under 16 rows. It walks the task
+  // panel by panel. A 32-column panel's K is contiguous when k <= K_BLOCK, and a
+  // task's panels follow each other, so a task reads one prefetched sequential
+  // range. Each converted weight vector feeds every row of a block. Per output
+  // element the arithmetic is that of avx_kernel plus apply_scale_kgroup (which
+  // compiles to an FMA): a dpbf16 chain from zero over each k group in K order,
+  // then c = fma(sum, scale, c) for each group in K order, starting from c = 0.
+  // The results are therefore bit-identical to float_mat_vec_kgroup's.
+  // KT_FP8_DECODE_PANELS=0 restores float_mat_vec_kgroup, the staged decode
+  // input and whole-range decode units.
+  // ==========================================================================
+
+  static bool decode_panels() {
+    static const bool enabled = cached_env_flag("KT_FP8_DECODE_PANELS");
+    return enabled;
+  }
+
+  // How far ahead of the stream position the GEMV prefetches inside a task's weights,
+  // in bytes (KT_FP8_DECODE_PREFETCH; 0 turns prefetching off). On DSv3 decode, 8192 and
+  // 16384 measured best: about 1% faster than no prefetch, 6% with one CPU expert; 32768
+  // is slower.
+  static int decode_prefetch_bytes() {
+    static const int bytes = [] {
+      const char* value = std::getenv("KT_FP8_DECODE_PREFETCH");
+      return value ? std::max(0, std::atoi(value)) / 64 * 64 : 8192;
+    }();
+    return bytes;
+  }
+
+  // G consecutive k groups from g0, for rows row..row+R-1 of the M block at m_begin and
+  // the panel at n_pos, accumulated into c. With G = 2 a single row has four independent
+  // dpbf16 chains instead of two; dpbf16 latency is about four times its issue interval.
+  // prefetch is this block's stream position plus the prefetch distance (nullptr: off).
+  template <int R, int G>
+  static inline void fp8_vec_groups(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, int m_begin,
+                                    int row, int n_pos, int g0, __m512 (&c)[4][2], const uint8_t* prefetch,
+                                    const uint8_t* prefetch_end) {
+    __m512 sum[G][R][2];
+#pragma GCC unroll 2
+    for (int gi = 0; gi < G; ++gi) {
+#pragma GCC unroll 4
+      for (int r = 0; r < R; ++r) sum[gi][r][0] = sum[gi][r][1] = _mm512_setzero_ps();
+    }
+    const int a_stride = ba->row_stride();
+    for (int kk = 0; kk < k_group_size; kk += K_STEP) {
+      const __m512i* b[G];
+      const ggml_bf16_t* a[G];
+#pragma GCC unroll 2
+      for (int gi = 0; gi < G; ++gi) {
+        const int kc = (g0 + gi) * k_group_size + kk;
+        b[gi] = reinterpret_cast<const __m512i*>(bb->get_submat(n, k, n_pos, kc));
+        a[gi] = ba->get_submat(m, k, m_begin, kc) + static_cast<size_t>(row) * a_stride;
+      }
+      if (prefetch) {
+        // This step reads G KB of the block; prefetch the G KB as far ahead.
+        const uint8_t* ahead = prefetch + static_cast<size_t>(kk) * G * N_STEP;
+        for (int line = 0; line < 16 * G && ahead + line * 64 < prefetch_end; ++line) {
+          _mm_prefetch(reinterpret_cast<const char*>(ahead + line * 64), _MM_HINT_T0);
+        }
+      }
+      for (int k_i = 0; k_i < K_STEP / 2; ++k_i) {
+#pragma GCC unroll 2
+        for (int gi = 0; gi < G; ++gi) {
+          const auto [lo, hi] = fp8x64_to_bf16x64(_mm512_load_si512(b[gi] + k_i));
+#pragma GCC unroll 4
+          for (int r = 0; r < R; ++r) {
+            int32_t pair;
+            std::memcpy(&pair, a[gi] + static_cast<size_t>(r) * a_stride + k_i * 2, sizeof(pair));
+            const __m512bh activation = (__m512bh)_mm512_set1_epi32(pair);
+            sum[gi][r][0] = _mm512_dpbf16_ps(sum[gi][r][0], activation, (__m512bh)lo);
+            sum[gi][r][1] = _mm512_dpbf16_ps(sum[gi][r][1], activation, (__m512bh)hi);
+          }
+        }
+      }
+    }
+#pragma GCC unroll 2
+    for (int gi = 0; gi < G; ++gi) {
+      const __m512 scale = _mm512_set1_ps(*bb->get_scale(n, n_pos, k, (g0 + gi) * k_group_size));
+#pragma GCC unroll 4
+      for (int r = 0; r < R; ++r) {
+        c[r][0] = _mm512_fmadd_ps(sum[gi][r][0], scale, c[r][0]);
+        c[r][1] = _mm512_fmadd_ps(sum[gi][r][1], scale, c[r][1]);
+      }
+    }
+  }
+
+  // Rows row..row+R-1 of one panel over every k group, into c[0..R-1]. A non-zero
+  // prefetch_bytes runs the prefetch stream that far ahead of the panel's reads.
+  template <int R, int G>
+  static inline void fp8_vec_panel(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, int m_begin,
+                                   int row, int n_pos, __m512 (&c)[4][2], int prefetch_bytes,
+                                   const uint8_t* prefetch_end) {
+#pragma GCC unroll 4
+    for (int r = 0; r < R; ++r) c[r][0] = c[r][1] = _mm512_setzero_ps();
+    const int groups = k / k_group_size;
+    const size_t group_bytes = static_cast<size_t>(k_group_size) * N_STEP;
+    const uint8_t* stream = prefetch_bytes > 0 ? bb->get_submat(n, k, n_pos, 0) + prefetch_bytes : nullptr;
+    int g = 0;
+    for (; g + G <= groups; g += G) {
+      fp8_vec_groups<R, G>(m, n, k, k_group_size, ba, bb, m_begin, row, n_pos, g, c,
+                           stream ? stream + g * group_bytes : nullptr, prefetch_end);
+    }
+    for (; g < groups; ++g) {
+      fp8_vec_groups<R, 1>(m, n, k, k_group_size, ba, bb, m_begin, row, n_pos, g, c,
+                           stream ? stream + g * group_bytes : nullptr, prefetch_end);
+    }
+  }
+
+  // Columns [n_start, n_end) of the small-m GEMV. Writes BF16 rows into dst (row stride
+  // n) when it is given, else FP32 blocks into bc for to_mat.
+  static void fp8_mat_vec_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc,
+                                 int n_start, int n_end, ggml_bf16_t* dst) {
+    assert(n % N_STEP == 0 && n_start % N_STEP == 0 && n_end % N_STEP == 0);
+    assert(k % k_group_size == 0 && k_group_size % K_STEP == 0);
+    // Past K_BLOCK a panel's K is split across blocks and the stream is not sequential.
+    const int prefetch_bytes = k <= K_BLOCK ? decode_prefetch_bytes() : 0;
+    const uint8_t* prefetch_end = bb->b + static_cast<size_t>(n_end) * k;
+    __m512 c[4][2];
+    for (int n_pos = n_start; n_pos < n_end; n_pos += N_STEP) {
+      for (int m_begin = 0; m_begin < m; m_begin += M_STEP) {
+        const int rows = std::min(M_STEP, m - m_begin);
+        float* block = dst ? nullptr : bc->get_submat(m, n, m_begin, n_pos);
+        for (int row = 0; row < rows;) {
+          // Later row blocks reread the panel from cache.
+          const int prefetch = m_begin == 0 && row == 0 ? prefetch_bytes : 0;
+          const int r = std::min(4, rows - row);
+          switch (r) {
+            case 4:
+              fp8_vec_panel<4, 1>(m, n, k, k_group_size, ba, bb, m_begin, row, n_pos, c, prefetch, prefetch_end);
+              break;
+            case 3:
+              fp8_vec_panel<3, 1>(m, n, k, k_group_size, ba, bb, m_begin, row, n_pos, c, prefetch, prefetch_end);
+              break;
+            case 2:
+              fp8_vec_panel<2, 1>(m, n, k, k_group_size, ba, bb, m_begin, row, n_pos, c, prefetch, prefetch_end);
+              break;
+            default:
+              fp8_vec_panel<1, 2>(m, n, k, k_group_size, ba, bb, m_begin, row, n_pos, c, prefetch, prefetch_end);
+              break;
+          }
+          for (int i = 0; i < r; ++i) {
+            if (dst) {
+              avx512_32xfp32_to_32xbf16(
+                  &c[i][0], &c[i][1],
+                  reinterpret_cast<__m512i*>(dst + static_cast<size_t>(m_begin + row + i) * n + n_pos));
+            } else {
+              _mm512_store_ps(block + (row + i) * N_STEP, c[i][0]);
+              _mm512_store_ps(block + (row + i) * N_STEP + TILE_N, c[i][1]);
+            }
+          }
+          row += r;
+        }
+      }
+    }
+  }
 };
 
 // all step = 32
@@ -827,17 +990,27 @@ inline void vec_mul(int m, int n, int k, std::shared_ptr<GemmKernel224BF16::Buff
   float_mat_vec<GemmKernel224BF16, false>(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth);
 }
 
-inline void vec_mul_kgroup(int m, int n, int k, int k_group_size, std::shared_ptr<GemmKernel224FP8::BufferA> ba,
-                           std::shared_ptr<GemmKernel224FP8::BufferB> bb, std::shared_ptr<GemmKernel224FP8::BufferC> bc,
-                           int ith, int nth) {
+// Returns true when the kernel wrote the task's BF16 rows into dst itself; otherwise the
+// result is in bc for to_mat.
+inline bool vec_mul_kgroup(int m, int n, int k, int k_group_size, const std::shared_ptr<GemmKernel224FP8::BufferA>& ba,
+                           const std::shared_ptr<GemmKernel224FP8::BufferB>& bb,
+                           const std::shared_ptr<GemmKernel224FP8::BufferC>& bc, int ith, int nth,
+                           ggml_bf16_t* dst = nullptr) {
+  if (GemmKernel224FP8::decode_panels()) {
+    auto [n_start, n_end] = GemmKernel224FP8::split_range_n(n, ith, nth);
+    GemmKernel224FP8::fp8_mat_vec_kgroup(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), n_start, n_end, dst);
+    return dst != nullptr;
+  }
   float_mat_vec_kgroup<GemmKernel224FP8, false>(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
+  return false;
 }
 
-// Returns true when the AMX kernel wrote the task's BF16 rows into dst itself; otherwise the
+// Returns true when the kernel wrote the task's BF16 rows into dst itself; otherwise the
 // result is in bc for to_mat.
-inline bool mat_mul_kgroup(int m, int n, int k, int k_group_size, std::shared_ptr<GemmKernel224FP8::BufferA> ba,
-                           std::shared_ptr<GemmKernel224FP8::BufferB> bb, std::shared_ptr<GemmKernel224FP8::BufferC> bc,
-                           int ith, int nth, ggml_bf16_t* dst = nullptr) {
+inline bool mat_mul_kgroup(int m, int n, int k, int k_group_size, const std::shared_ptr<GemmKernel224FP8::BufferA>& ba,
+                           const std::shared_ptr<GemmKernel224FP8::BufferB>& bb,
+                           const std::shared_ptr<GemmKernel224FP8::BufferC>& bc, int ith, int nth,
+                           ggml_bf16_t* dst = nullptr) {
 #ifdef HAVE_AMX
   // Prefill AMX tiles need a full 16-row staging guard plus FP8->BF16
   // widening; KT_FP8_PREFILL_AMX=0 forces the AVX512-BF16 path for A/B checks.
@@ -848,8 +1021,7 @@ inline bool mat_mul_kgroup(int m, int n, int k, int k_group_size, std::shared_pt
     return dst != nullptr;
   }
 #endif
-  float_mat_vec_kgroup<GemmKernel224FP8, false>(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
-  return false;
+  return vec_mul_kgroup(m, n, k, k_group_size, ba, bb, bc, ith, nth, dst);
 }
 
 // ============================================================================

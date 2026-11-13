@@ -776,6 +776,24 @@ class AMX_MOE_BASE {
   // Runs once per expert, after its last gate/up range: whole-row work for the down input.
   void finish_decode_expert(int expert_idx, int qlen) { derived()->prepare_decode_down_input(expert_idx, qlen); }
 
+  // How many parts each fused-decode gate/up range is cut into. Each part runs as its own
+  // unit (one per projection when gate and up are split).
+  int decode_gate_up_parts() const { return 1; }
+
+  // Part `part` of `parts` of one fused-decode gate/up range, leaving its BF16 values in
+  // the expert's gate or up output. The default's single part is the whole range.
+  void decode_gate_up_part(bool do_up, int expert_idx, int ith, int nth, int part, int parts) {
+    (void)part;
+    (void)parts;
+    constexpr int qlen = 1;
+    derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
+    if (do_up) {
+      up_bc_[expert_idx]->to_mat(qlen, m_local_up_output_ptr_[expert_idx], ith, nth);
+    } else {
+      gate_bc_[expert_idx]->to_mat(qlen, m_local_gate_output_ptr_[expert_idx], ith, nth);
+    }
+  }
+
   static bool fused_decode_enabled() {
     static const bool enabled = cached_env_flag("KT_DECODE_FUSED");
     return enabled;
@@ -825,12 +843,12 @@ class AMX_MOE_BASE {
     for (int p = 0; p < activated_expert * nth_gu; p++) decode_pair_done_[p].v.store(0, std::memory_order_relaxed);
     for (int d = 0; d < nth_down; d++) decode_block_done_[d].v.store(0, std::memory_order_relaxed);
 
-    // Gate and up as separate units (the second of the pair to finish applies the
-    // activation) halve each unit. Kernels with few ranges per expert (256-wide FP8 / INT4
-    // blocks, DSv3/Kimi: 2) need that to occupy the pool at all. Fine ranges (FP4: 16-18)
-    // split only while activated_expert * nth_gu units are under 1.5 per thread; past that
-    // the pool is saturated and splitting costs ~1%. Measured with 32 threads per node:
-    // -13% on DSv4.1 at 2 CPU experts, -14% / -6% on MiMo at 1 / 2.
+    // Gate and up as separate units (the last of a range's units to finish applies the
+    // activation) halve each unit. Kernels with few ranges per expert (128-wide FP8 blocks:
+    // 4 on DSv3; 256-wide INT4: 2 on Kimi) need that to occupy the pool at all. Fine ranges
+    // (FP4: 16-18) split only while activated_expert * nth_gu units are under 1.5 per
+    // thread; past that the pool is saturated and splitting costs ~1%. Measured with 32
+    // threads per node: -13% on DSv4.1 at 2 CPU experts, -14% / -6% on MiMo at 1 / 2.
     static const int split_below = [] {
       const char* value = std::getenv("KT_DECODE_SPLIT_GATE_UP_BELOW");
       return value ? std::atoi(value) : 8;
@@ -839,7 +857,9 @@ class AMX_MOE_BASE {
     auto pool = config_.pool->get_subpool(tp_part_idx);
     const bool split_gate_up =
         nth_gu < split_below || (split_by_occupancy && 2 * activated_expert * nth_gu < 3 * pool->worker_capacity());
-    const int units_per_range = split_gate_up ? 2 : 1;
+    // A backend can also cut each range into parts that run as separate units.
+    const int parts = derived_const()->decode_gate_up_parts();
+    const int units_per_range = (split_gate_up ? 2 : 1) * parts;
     const int units_gate_up = activated_expert * nth_gu * units_per_range;
     const int units_down = activated_expert * nth_down;
     pool->do_work_stealing_job(
@@ -847,20 +867,20 @@ class AMX_MOE_BASE {
         [&, this](int unit) {
           if (unit < units_gate_up) {
             const int pair = unit / units_per_range;
+            const int sub = unit % units_per_range;
             const int i = pair / nth_gu;
             const int ith = pair % nth_gu;
             const int expert_idx = m_expert_id_map_[i];
-            const bool run_gate = !split_gate_up || unit % 2 == 0;
-            const bool run_up = !split_gate_up || unit % 2 == 1;
-            if (run_gate) {
-              derived()->do_gate_up_gemm(false, expert_idx, ith, nth_gu, qlen);
-              gate_bc_[expert_idx]->to_mat(qlen, m_local_gate_output_ptr_[expert_idx], ith, nth_gu);
+            const int part = split_gate_up ? sub / 2 : sub;
+            const bool run_gate = !split_gate_up || sub % 2 == 0;
+            const bool run_up = !split_gate_up || sub % 2 == 1;
+            if (run_gate) derived()->decode_gate_up_part(false, expert_idx, ith, nth_gu, part, parts);
+            if (run_up) derived()->decode_gate_up_part(true, expert_idx, ith, nth_gu, part, parts);
+            // The range's last unit to finish applies the activation.
+            if (units_per_range > 1 &&
+                decode_pair_done_[pair].v.fetch_add(1, std::memory_order_acq_rel) + 1 < units_per_range) {
+              return;
             }
-            if (run_up) {
-              derived()->do_gate_up_gemm(true, expert_idx, ith, nth_gu, qlen);
-              up_bc_[expert_idx]->to_mat(qlen, m_local_up_output_ptr_[expert_idx], ith, nth_gu);
-            }
-            if (split_gate_up && decode_pair_done_[pair].v.fetch_add(1, std::memory_order_acq_rel) == 0) return;
             derived()->apply_decode_activation_range(expert_idx, ith, nth_gu, qlen);
             if (decode_expert_done_[i].v.fetch_add(1, std::memory_order_acq_rel) + 1 == nth_gu) {
               derived()->finish_decode_expert(expert_idx, qlen);

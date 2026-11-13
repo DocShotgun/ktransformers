@@ -93,8 +93,8 @@ class AMX_FP8_MOE_TP : public AMX_MOE_BASE<T, AMX_FP8_MOE_TP<T>> {
   // CRTP virtual points - GEMM dispatch
   // ============================================================================
 
-  // Returns true when the AMX kernel wrote the BF16 rows into dst; otherwise the result is
-  // in the expert's BufferC.
+  // Returns true when the kernel wrote the BF16 rows into dst; otherwise the result is in
+  // the expert's BufferC.
   bool do_gate_up_gemm(bool do_up, int expert_idx, int ith, int nth, int qlen, ggml_bf16_t* dst = nullptr) {
     auto& group_size = config_.quant_config.group_size;
     int m = m_local_num_[expert_idx];
@@ -108,8 +108,8 @@ class AMX_FP8_MOE_TP : public AMX_MOE_BASE<T, AMX_FP8_MOE_TP<T>> {
       return amx::mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth,
                                  dst);
     }
-    amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
-    return false;
+    return amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth,
+                               dst);
   }
   bool do_down_gemm(int expert_idx, int ith, int nth, int qlen, ggml_bf16_t* dst = nullptr) {
     auto& group_size = config_.quant_config.group_size;
@@ -119,13 +119,12 @@ class AMX_FP8_MOE_TP : public AMX_MOE_BASE<T, AMX_FP8_MOE_TP<T>> {
       return amx::mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
                                  down_bb_[expert_idx], down_bc_[expert_idx], ith, nth, dst);
     }
-    amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
-                        down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
-    return false;
+    return amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
+                               down_bb_[expert_idx], down_bc_[expert_idx], ith, nth, dst);
   }
 
-  // Prefill tasks hand the BF16 output rows to the GEMM, so the AMX kernel skips the FP32
-  // BufferC round trip; the vector kernel still goes through to_mat.
+  // Prefill tasks hand the BF16 output rows to the GEMM, so the kernels skip the FP32
+  // BufferC round trip (except float_mat_vec_kgroup under KT_FP8_DECODE_PANELS=0).
   void gate_up_gemm_to_mat(bool do_up, int expert_idx, int ith, int nth, int qlen) {
     ggml_bf16_t* dst = do_up ? m_local_up_output_ptr_[expert_idx] : m_local_gate_output_ptr_[expert_idx];
     if (do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen, dst)) return;
@@ -136,6 +135,34 @@ class AMX_FP8_MOE_TP : public AMX_MOE_BASE<T, AMX_FP8_MOE_TP<T>> {
     ggml_bf16_t* dst = m_local_down_output_ptr_[expert_idx];
     if (do_down_gemm(expert_idx, ith, nth, qlen, dst)) return;
     down_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], dst, ith, nth);
+  }
+
+  // Decode reads its single input row in place. from_mat would stage m = 1 as a 32-row
+  // zero-padded block (448 KiB per expert on DSv3, written serially before the GEMMs),
+  // which only the AMX tiles need, and they run at m >= 16.
+  void prepare_decode_gate_input(int expert_idx, int qlen, const void* input) {
+    if (!T::decode_panels()) return Base::prepare_decode_gate_input(expert_idx, qlen, input);
+    gate_up_ba_[expert_idx]->alias_rows(static_cast<ggml_bf16_t*>(const_cast<void*>(input)));
+  }
+  void prepare_decode_down_input(int expert_idx, int qlen) {
+    if (!T::decode_panels()) return Base::prepare_decode_down_input(expert_idx, qlen);
+    down_ba_[expert_idx]->alias_rows(m_local_gate_output_ptr_[expert_idx]);
+  }
+
+  // DSv3's 512 gate/up columns per node are four 128-wide ranges, too few units to occupy
+  // a subpool at low expert counts, so each 32-column panel of a range is its own fused
+  // decode unit and writes its BF16 values straight into the gate or up output.
+  int decode_gate_up_parts() const { return T::decode_panels() ? T::N_BLOCK / T::N_STEP : 1; }
+  void decode_gate_up_part(bool do_up, int expert_idx, int ith, int nth, int part, int parts) {
+    if (parts == 1) return Base::decode_gate_up_part(do_up, expert_idx, ith, nth, part, parts);
+    auto [n_start, n_end] = T::split_range_n(config_.intermediate_size, ith, nth);
+    const int begin = n_start + part * T::N_STEP;
+    if (begin >= n_end) return;
+    auto& bb = do_up ? up_bb_[expert_idx] : gate_bb_[expert_idx];
+    auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
+    ggml_bf16_t* dst = do_up ? m_local_up_output_ptr_[expert_idx] : m_local_gate_output_ptr_[expert_idx];
+    T::fp8_mat_vec_kgroup(1, config_.intermediate_size, config_.hidden_size, config_.quant_config.group_size,
+                          gate_up_ba_[expert_idx].get(), bb.get(), bc.get(), begin, begin + T::N_STEP, dst);
   }
 
 #ifdef DEBUG_FP8_MOE
