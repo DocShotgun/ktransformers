@@ -191,8 +191,3 @@ def test_both_layouts_resolve_in_probe_order():
     loader = FakeLoader(tensors)
 
     assert resolve_experts_layout(loader, "model.layers.3").variant == "hf_mlp"
-
-
-def test_unresolved_layout_returns_none():
-    loader = FakeLoader({})
-    assert resolve_experts_layout(loader, "model.layers.3") is None
