@@ -109,4 +109,3 @@ def test_mxfp4_unresolved_layout_lists_probed_prefixes():
         loader.load_experts("model.layers.1")
     message = str(excinfo.value)
     assert "model.layers.1.mlp.experts" in message
-    assert "KT_MOE_NAMING" in message

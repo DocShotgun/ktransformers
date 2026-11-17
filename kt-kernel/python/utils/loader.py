@@ -1207,8 +1207,7 @@ class GPTQSafeTensorLoader(FP8SafeTensorLoader):
 #                         global: weight_scale_2|scaling_factor|scale_2 (NVFP4)
 #
 # `resolve_experts_layout()` probes expert 0 keys per layer and answers all
-# three questions at once; `KT_MOE_NAMING=<variant>` pins a naming variant
-# instead of probing. Base keys are probed with/without `model.` and VL
+# three questions at once. Base keys are probed with/without `model.` and VL
 # prefixes (`model.language_model.` etc.), matching real HF checkpoints.
 # ---------------------------------------------------------------------------
 
@@ -1220,7 +1219,6 @@ MOE_NAMING_VARIANTS: dict[str, tuple[str, tuple[str, str, str]]] = {
     "mistral": ("{base}.experts", ("w1", "w3", "w2")),
 }
 MOE_NAMING_PROBE_ORDER = ("hf_mlp", "deepseek_v4", "mixtral", "mistral")
-MOE_NAMING_ENV_VAR = "KT_MOE_NAMING"
 
 _BLOCK_SCALE_SUFFIXES = ("weight_scale", "scale", "weight_scale_inv", "scale_inv")
 _GLOBAL_SCALE_SUFFIXES = ("weight_scale_2", "scaling_factor", "scale_2")
@@ -1235,19 +1233,6 @@ _BASE_KEY_STRIP_PREFIXES = (
 _BASE_KEY_ADD_PREFIXES = ("model.language_model.", "language_model.model.")
 
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
-
-
-def naming_variant_candidates() -> tuple[str, ...]:
-    """Naming variants to probe, in order (`KT_MOE_NAMING` pins exactly one)."""
-    forced = os.environ.get(MOE_NAMING_ENV_VAR, "").strip().lower()
-    if not forced:
-        return MOE_NAMING_PROBE_ORDER
-    if forced not in MOE_NAMING_VARIANTS:
-        raise ValueError(
-            f"{MOE_NAMING_ENV_VAR}={forced!r} is not a known naming variant; "
-            f"expected one of {sorted(MOE_NAMING_VARIANTS)}"
-        )
-    return (forced,)
 
 
 def base_key_variants(base_key: str) -> list[str]:
@@ -1310,7 +1295,7 @@ def resolve_experts_layout(loader, base_key: str, family: str | None = None) -> 
     None to accept any. Returns None when no complete layout is found; loaders
     turn that into an error listing every probed prefix.
     """
-    for variant in naming_variant_candidates():
+    for variant in MOE_NAMING_PROBE_ORDER:
         path_tpl, proj_names = MOE_NAMING_VARIANTS[variant]
         gate = proj_names[0]
         for bk in base_key_variants(base_key):
@@ -1346,7 +1331,7 @@ def resolve_experts_layout(loader, base_key: str, family: str | None = None) -> 
 
 def _layout_not_found_error(loader_name: str, base_key: str, family: str) -> ValueError:
     tried = []
-    for variant in naming_variant_candidates():
+    for variant in MOE_NAMING_PROBE_ORDER:
         path_tpl, _ = MOE_NAMING_VARIANTS[variant]
         for bk in base_key_variants(base_key):
             tried.append(f"{path_tpl.format(base=bk)} (naming variant '{variant}')")
@@ -1355,9 +1340,33 @@ def _layout_not_found_error(loader_name: str, base_key: str, family: str) -> Val
         f"'{base_key}'. Probed expert prefixes:\n  "
         + "\n  ".join(tried)
         + "\nExpected expert-0 keys '{prefix}.{expert}.{gate_proj|w1}.weight' with block "
-        f"scale suffix ({'|'.join(_BLOCK_SCALE_SUFFIXES)}); set {MOE_NAMING_ENV_VAR}="
-        + "<" + "|".join(MOE_NAMING_VARIANTS) + "> to pin a naming variant."
+        f"scale suffix ({'|'.join(_BLOCK_SCALE_SUFFIXES)})."
     )
+
+
+def _cpu_expert_plan(loader, base_key: str, family: str, gpu_experts_mask):
+    """(layout, expert_count, skipped) for one layer; skipped[i] marks a GPU-resident expert."""
+    layout = resolve_experts_layout(loader, base_key, family=family)
+    if layout is None:
+        raise _layout_not_found_error(type(loader).__name__, base_key, family)
+    expert_count = 0
+    while loader.has_tensor(layout.weight_key(expert_count, 0)):
+        expert_count += 1
+    if gpu_experts_mask is None:
+        return layout, expert_count, [False] * expert_count
+    skipped = gpu_experts_mask.to(device="cpu", dtype=torch.bool).tolist()
+    if len(skipped) != expert_count:
+        raise ValueError(
+            f"gpu_experts_mask length does not match {family.upper()} expert count: "
+            f"{len(skipped)} != {expert_count}"
+        )
+    return layout, expert_count, skipped
+
+
+def _load_uint8(loader, key: str, device: str) -> torch.Tensor:
+    """A packed tensor (U8, I8 or float8 in the checkpoint) as contiguous uint8."""
+    tensor = loader.load_tensor(key, device).contiguous()
+    return tensor if tensor.dtype == torch.uint8 else tensor.view(torch.uint8)
 
 
 class MXFP4SafeTensorLoader(SafeTensorLoader):
@@ -1415,24 +1424,8 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
         *,
         reject_non_finite_scales: bool = False,
     ):
-        layout = resolve_experts_layout(self, base_key, family="mxfp4")
-        if layout is None:
-            raise _layout_not_found_error(type(self).__name__, base_key, "mxfp4")
+        layout, expert_count, skipped_experts = _cpu_expert_plan(self, base_key, "mxfp4", gpu_experts_mask)
         prefix = layout.prefix
-
-        expert_count = 0
-        while self.has_tensor(layout.weight_key(expert_count, 0)):
-            expert_count += 1
-
-        if gpu_experts_mask is None:
-            skipped_experts = [False] * expert_count
-        else:
-            skipped_experts = gpu_experts_mask.to(device="cpu", dtype=torch.bool).tolist()
-            if len(skipped_experts) != expert_count:
-                raise ValueError(
-                    "gpu_experts_mask length does not match MXFP4 expert count: "
-                    f"{len(skipped_experts)} != {expert_count}"
-                )
 
         gate_weights = [None] * expert_count
         up_weights = [None] * expert_count
@@ -1449,9 +1442,7 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 (1, up_weights),
                 (2, down_weights),
             ):
-                w = self.load_tensor(layout.weight_key(exp_id, proj_idx), device).contiguous()
-                if w.dtype != torch.uint8:
-                    w = w.view(torch.uint8)
+                w = _load_uint8(self, layout.weight_key(exp_id, proj_idx), device)
                 dst[exp_id] = w
 
             for proj_idx, dst in (
@@ -1520,24 +1511,8 @@ class NVFP4SafeTensorLoader(SafeTensorLoader):
         gpu_experts_mask: torch.Tensor | None = None,
         fold_global_scale: bool = True,
     ):
-        layout = resolve_experts_layout(self, base_key, family="nvfp4")
-        if layout is None:
-            raise _layout_not_found_error(type(self).__name__, base_key, "nvfp4")
+        layout, expert_count, skipped_experts = _cpu_expert_plan(self, base_key, "nvfp4", gpu_experts_mask)
         prefix = layout.prefix
-
-        expert_count = 0
-        while self.has_tensor(layout.weight_key(expert_count, 0)):
-            expert_count += 1
-
-        if gpu_experts_mask is None:
-            skipped_experts = [False] * expert_count
-        else:
-            skipped_experts = gpu_experts_mask.to(device="cpu", dtype=torch.bool).tolist()
-            if len(skipped_experts) != expert_count:
-                raise ValueError(
-                    "gpu_experts_mask length does not match NVFP4 expert count: "
-                    f"{len(skipped_experts)} != {expert_count}"
-                )
 
         gate_weights = [None] * expert_count
         up_weights = [None] * expert_count
@@ -1557,9 +1532,7 @@ class NVFP4SafeTensorLoader(SafeTensorLoader):
                 (1, up_weights, up_scales, up_globals),
                 (2, down_weights, down_scales, down_globals),
             ):
-                w = self.load_tensor(layout.weight_key(exp_id, proj_idx), device).contiguous()
-                if w.dtype != torch.uint8:
-                    w = w.view(torch.uint8)
+                w = _load_uint8(self, layout.weight_key(exp_id, proj_idx), device)
                 wdst[exp_id] = w
 
                 bs = self.load_tensor(layout.block_scale_key(exp_id, proj_idx), device)
@@ -1618,24 +1591,8 @@ class MXFP8SafeTensorLoader(SafeTensorLoader):
         device: str = "cpu",
         gpu_experts_mask: torch.Tensor | None = None,
     ):
-        layout = resolve_experts_layout(self, base_key, family="mxfp8")
-        if layout is None:
-            raise _layout_not_found_error(type(self).__name__, base_key, "mxfp8")
+        layout, expert_count, skipped_experts = _cpu_expert_plan(self, base_key, "mxfp8", gpu_experts_mask)
         prefix = layout.prefix
-
-        expert_count = 0
-        while self.has_tensor(layout.weight_key(expert_count, 0)):
-            expert_count += 1
-
-        if gpu_experts_mask is None:
-            skipped_experts = [False] * expert_count
-        else:
-            skipped_experts = gpu_experts_mask.to(device="cpu", dtype=torch.bool).tolist()
-            if len(skipped_experts) != expert_count:
-                raise ValueError(
-                    "gpu_experts_mask length does not match MXFP8 expert count: "
-                    f"{len(skipped_experts)} != {expert_count}"
-                )
 
         gate_weights = [None] * expert_count
         up_weights = [None] * expert_count
@@ -1652,9 +1609,7 @@ class MXFP8SafeTensorLoader(SafeTensorLoader):
                 (1, up_weights),
                 (2, down_weights),
             ):
-                w = self.load_tensor(layout.weight_key(exp_id, proj_idx), device).contiguous()
-                if w.dtype != torch.uint8:
-                    w = w.view(torch.uint8)
+                w = _load_uint8(self, layout.weight_key(exp_id, proj_idx), device)
                 dst[exp_id] = w
 
             for proj_idx, dst in (
@@ -1662,10 +1617,7 @@ class MXFP8SafeTensorLoader(SafeTensorLoader):
                 (1, up_scales),
                 (2, down_scales),
             ):
-                s = self.load_tensor(layout.block_scale_key(exp_id, proj_idx), device).contiguous()
-                if s.dtype != torch.uint8:
-                    s = s.view(torch.uint8)
-                dst[exp_id] = s
+                dst[exp_id] = _load_uint8(self, layout.block_scale_key(exp_id, proj_idx), device)
 
         loaded_expert_count = expert_count - sum(skipped_experts)
         print(

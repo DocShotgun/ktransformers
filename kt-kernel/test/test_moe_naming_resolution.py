@@ -4,11 +4,9 @@ import pytest
 import torch
 
 from kt_kernel.utils.loader import (
-    MOE_NAMING_ENV_VAR,
     MOE_NAMING_PROBE_ORDER,
     MOE_NAMING_VARIANTS,
     base_key_variants,
-    naming_variant_candidates,
     resolve_experts_layout,
 )
 
@@ -47,20 +45,8 @@ def add_experts(
     return tensors
 
 
-def test_naming_variant_candidates_default_order():
-    assert naming_variant_candidates() == MOE_NAMING_PROBE_ORDER
+def test_probe_order_covers_every_variant():
     assert set(MOE_NAMING_PROBE_ORDER) == set(MOE_NAMING_VARIANTS)
-
-
-def test_naming_variant_candidates_env_override(monkeypatch):
-    monkeypatch.setenv(MOE_NAMING_ENV_VAR, "deepseek_v4")
-    assert naming_variant_candidates() == ("deepseek_v4",)
-
-
-def test_naming_variant_candidates_env_invalid(monkeypatch):
-    monkeypatch.setenv(MOE_NAMING_ENV_VAR, "bogus")
-    with pytest.raises(ValueError, match=MOE_NAMING_ENV_VAR):
-        naming_variant_candidates()
 
 
 def test_base_key_variants_strip_and_add():
@@ -193,9 +179,8 @@ def test_family_filter_mismatch_returns_none():
     assert resolve_experts_layout(loader, "model.layers.3", family="mxfp4") is not None
 
 
-def test_env_override_prefers_named_variant(monkeypatch):
-    # A checkpoint carrying both layouts resolves hf_mlp by default and the
-    # pinned variant under KT_MOE_NAMING.
+def test_both_layouts_resolve_in_probe_order():
+    # A checkpoint carrying both layouts resolves the first variant probed.
     tensors = add_experts(
         {},
         "model.layers.3.mlp.experts",
@@ -206,8 +191,6 @@ def test_env_override_prefers_named_variant(monkeypatch):
     loader = FakeLoader(tensors)
 
     assert resolve_experts_layout(loader, "model.layers.3").variant == "hf_mlp"
-    monkeypatch.setenv(MOE_NAMING_ENV_VAR, "deepseek_v4")
-    assert resolve_experts_layout(loader, "model.layers.3").variant == "deepseek_v4"
 
 
 def test_unresolved_layout_returns_none():
