@@ -38,7 +38,6 @@ class AMX_FP8_MOE_TP : public AMX_MOE_BASE<T, AMX_FP8_MOE_TP<T>> {
   using Base::gate_bb_;
   using Base::gate_bc_;
   using Base::gate_up_ba_;
-  using Base::m_local_down_output_ptr_;
   using Base::m_local_gate_output_ptr_;
   using Base::m_local_num_;
   using Base::m_local_up_output_ptr_;
@@ -121,20 +120,6 @@ class AMX_FP8_MOE_TP : public AMX_MOE_BASE<T, AMX_FP8_MOE_TP<T>> {
     }
     return amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
                                down_bb_[expert_idx], down_bc_[expert_idx], ith, nth, dst);
-  }
-
-  // Prefill tasks hand the BF16 output rows to the GEMM, so the kernels skip the FP32
-  // BufferC round trip (except float_mat_vec_kgroup under KT_FP8_DECODE_PANELS=0).
-  void gate_up_gemm_to_mat(bool do_up, int expert_idx, int ith, int nth, int qlen) {
-    ggml_bf16_t* dst = do_up ? m_local_up_output_ptr_[expert_idx] : m_local_gate_output_ptr_[expert_idx];
-    if (do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen, dst)) return;
-    (do_up ? up_bc_ : gate_bc_)[expert_idx]->to_mat(m_local_num_[expert_idx], dst, ith, nth);
-  }
-
-  void down_gemm_to_mat(int expert_idx, int ith, int nth, int qlen) {
-    ggml_bf16_t* dst = m_local_down_output_ptr_[expert_idx];
-    if (do_down_gemm(expert_idx, ith, nth, qlen, dst)) return;
-    down_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], dst, ith, nth);
   }
 
   // Decode reads its single input row in place. from_mat would stage m = 1 as a 32-row

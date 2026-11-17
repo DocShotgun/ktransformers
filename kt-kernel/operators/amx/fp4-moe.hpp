@@ -1359,13 +1359,6 @@ struct GemmKernel224MXFP4SmallKGroup {
     return lut;
   }
 
-  static void configure_fp4_amx() {
-    enable_amx();
-    TileConfig config;
-    for (int tile = 0; tile < 8; ++tile) config.set_row_col(tile, 16, 64);
-    config.set_config();
-  }
-
   // Expand one 32-output-channel tile to AMX's VNNI B layout. A 32-K group
   // becomes 16 rows of 32 adjacent BF16 pairs. Reuse this expanded tile for
   // every 32-token M tile instead of decoding the FP4 weights for every token.
@@ -1564,7 +1557,7 @@ struct GemmKernel224MXFP4SmallKGroup {
                                      ggml_bf16_t* dst = nullptr) {
     auto [n_start, n_end] = split_range_n(n, ith, nth, m);
     if (n_start >= n_end) return;
-    configure_fp4_amx();
+    configure_bf16_tiles();
 
     const int panels = (n_end - n_start) / 32;
     const int k_block = std::min(k, AMX_K_BLOCK);
@@ -1915,10 +1908,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
   using Base::gate_bb_;
   using Base::gate_bc_;
   using Base::gate_up_ba_;
-  using Base::m_local_down_output_ptr_;
   using Base::m_local_gate_output_ptr_;
   using Base::m_local_num_;
-  using Base::m_local_up_output_ptr_;
   using Base::tp_part_idx;
   using Base::up_bb_;
   using Base::up_bc_;
@@ -2026,20 +2017,6 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
                         down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
     return false;
-  }
-
-  // Prefill tasks hand the BF16 output rows to the GEMM, so the AMX kernel skips
-  // the FP32 BufferC round trip; the other kernels still go through to_mat.
-  void gate_up_gemm_to_mat(bool do_up, int expert_idx, int ith, int nth, int qlen) {
-    ggml_bf16_t* dst = do_up ? m_local_up_output_ptr_[expert_idx] : m_local_gate_output_ptr_[expert_idx];
-    if (do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen, dst)) return;
-    (do_up ? up_bc_ : gate_bc_)[expert_idx]->to_mat(m_local_num_[expert_idx], dst, ith, nth);
-  }
-
-  void down_gemm_to_mat(int expert_idx, int ith, int nth, int qlen) {
-    ggml_bf16_t* dst = m_local_down_output_ptr_[expert_idx];
-    if (do_down_gemm(expert_idx, ith, nth, qlen, dst)) return;
-    down_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], dst, ith, nth);
   }
 
   // The natural-order conversion depends only on the input row, so one copy serves

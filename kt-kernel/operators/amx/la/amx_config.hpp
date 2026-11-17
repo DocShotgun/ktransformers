@@ -225,6 +225,15 @@ struct alignas(64) TileConfig {
 
 static_assert(sizeof(TileConfig) == 64);
 
+// All eight tiles as 16 rows of 64 bytes: the BF16 tiles of the FP4 and FP8 AMX
+// prefill kernels.
+inline void configure_bf16_tiles() {
+  enable_amx();
+  TileConfig config;
+  for (int tile = 0; tile < 8; ++tile) config.set_row_col(tile, 16, 64);
+  config.set_config();
+}
+
 }  // namespace amx
 #endif  // defined(__AMX__)
 #endif  // AMX_CONFIG_HPP

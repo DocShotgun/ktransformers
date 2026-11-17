@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -723,21 +724,32 @@ class AMX_MOE_BASE {
   // the per-expert conversion.
   bool share_decode_gate_input(int expert_idx, int source_expert, int qlen) { return false; }
 
-  // One prefill gate/up GEMM task, leaving its BF16 rows in the expert's gate or up
-  // output. A backend whose kernel writes those rows itself overrides this.
+  // One GEMM task, leaving its BF16 rows in the expert's gate or up output. A backend
+  // whose do_gate_up_gemm also takes those rows returns whether it wrote them itself,
+  // skipping the FP32 BufferC round trip.
   void gate_up_gemm_to_mat(bool do_up, int expert_idx, int ith, int nth, int qlen) {
-    derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
-    if (do_up) {
-      up_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_up_output_ptr_[expert_idx], ith, nth);
+    ggml_bf16_t* dst = do_up ? m_local_up_output_ptr_[expert_idx] : m_local_gate_output_ptr_[expert_idx];
+    if constexpr (requires(Derived* d) {
+                    { d->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen, dst) } -> std::same_as<bool>;
+                  }) {
+      if (derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen, dst)) return;
     } else {
-      gate_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_gate_output_ptr_[expert_idx], ith, nth);
+      derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
     }
+    (do_up ? up_bc_ : gate_bc_)[expert_idx]->to_mat(m_local_num_[expert_idx], dst, ith, nth);
   }
 
-  // The same for one prefill down GEMM task and the expert's down output.
+  // The same for one down GEMM task and the expert's down output.
   void down_gemm_to_mat(int expert_idx, int ith, int nth, int qlen) {
-    derived()->do_down_gemm(expert_idx, ith, nth, qlen);
-    down_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_down_output_ptr_[expert_idx], ith, nth);
+    ggml_bf16_t* dst = m_local_down_output_ptr_[expert_idx];
+    if constexpr (requires(Derived* d) {
+                    { d->do_down_gemm(expert_idx, ith, nth, qlen, dst) } -> std::same_as<bool>;
+                  }) {
+      if (derived()->do_down_gemm(expert_idx, ith, nth, qlen, dst)) return;
+    } else {
+      derived()->do_down_gemm(expert_idx, ith, nth, qlen);
+    }
+    down_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], dst, ith, nth);
   }
 
   void prepare_decode_down_input(int expert_idx, int qlen) {
@@ -785,13 +797,7 @@ class AMX_MOE_BASE {
   void decode_gate_up_part(bool do_up, int expert_idx, int ith, int nth, int part, int parts) {
     (void)part;
     (void)parts;
-    constexpr int qlen = 1;
-    derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
-    if (do_up) {
-      up_bc_[expert_idx]->to_mat(qlen, m_local_up_output_ptr_[expert_idx], ith, nth);
-    } else {
-      gate_bc_[expert_idx]->to_mat(qlen, m_local_gate_output_ptr_[expert_idx], ith, nth);
-    }
+    derived()->gate_up_gemm_to_mat(do_up, expert_idx, ith, nth, 1);
   }
 
   static bool fused_decode_enabled() {

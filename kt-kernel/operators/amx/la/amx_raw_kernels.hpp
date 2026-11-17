@@ -382,13 +382,6 @@ struct GemmKernel224FP8 {
   // the 128x128 scales with apply_scale_kgroup exactly like the AVX path.
   // ==========================================================================
 
-  static void configure_fp8_amx() {
-    enable_amx();
-    TileConfig config;
-    for (int tile = 0; tile < 8; ++tile) config.set_row_col(tile, 16, 64);
-    config.set_config();
-  }
-
   // Expand one 32-output-channel FP8 tile to AMX's VNNI B layout: 16 k-pair
   // rows of 32 adjacent BF16 pairs (word pair*32 + channel holds BF16 K
   // 2pair / 2pair+1 of channel, matching pack_fp4_amx_b_scalar's scratch
@@ -447,7 +440,7 @@ struct GemmKernel224FP8 {
                                      int ith, int nth, ggml_bf16_t* dst = nullptr) {
     auto [n_start, n_end] = split_range_n(n, ith, nth);
     if (n_start >= n_end) return;
-    configure_fp8_amx();
+    configure_bf16_tiles();
 
     const int panels = (n_end - n_start) / N_STEP;
     const int k_block = std::min(k, std::max(1, AMX_K_BLOCK / k_group_size) * k_group_size);
@@ -1117,7 +1110,7 @@ struct GemmKernel224FP8PerChannel {
                                                 int nth) {
     auto [n_start, n_end] = split_range_n(n, ith, nth);
     if (n_start >= n_end) return;
-    GemmKernel224FP8::configure_fp8_amx();
+    configure_bf16_tiles();
 
     // Per-worker scratch is bounded by 32 BF16 output channels times K.
     thread_local std::vector<uint8_t> packed_storage;
