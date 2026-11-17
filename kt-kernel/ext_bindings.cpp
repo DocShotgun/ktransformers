@@ -205,7 +205,6 @@ class MOEBindings {
   class WarmUpBindings {
    public:
     struct Args : HostCallbackArgs {
-      static void destroy(void* args) { delete static_cast<Args*>(args); }
       TP_MOE<T>* moe;
     };
     static void inner(void* args) {
@@ -213,14 +212,13 @@ class MOEBindings {
       args_->cpuinfer->enqueue(&TP_MOE<T>::warm_up, args_->moe);
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe) {
-      Args* args = new Args{{nullptr, false, &Args::destroy}, moe.get()};
+      Args* args = new Args{{nullptr, false, &destroy_host_callback_args<Args>}, moe.get()};
       return std::make_pair((intptr_t)&inner, (intptr_t)args);
     }
   };
   class LoadWeightsBindings {
    public:
     struct Args : HostCallbackArgs {
-      static void destroy(void* args) { delete static_cast<Args*>(args); }
       TP_MOE<T>* moe;
     };
     static void inner(void* args) {
@@ -229,7 +227,7 @@ class MOEBindings {
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe,
                                                             const uintptr_t physical_to_logical_map = 0) {
-      Args* args = new Args{{nullptr, false, &Args::destroy}, moe.get()};
+      Args* args = new Args{{nullptr, false, &destroy_host_callback_args<Args>}, moe.get()};
       if (physical_to_logical_map) {
         // printf("debug physical_to_logical_map in arg:%lu\n", physical_to_logical_map);
         moe->config.physical_to_logical_map = reinterpret_cast<void*>(physical_to_logical_map);
@@ -245,7 +243,6 @@ class MOEBindings {
   class ForwardBindings {
    public:
     struct Args : HostCallbackArgs {
-      static void destroy(void* args) { delete static_cast<Args*>(args); }
       TP_MOE<T>* moe;
       intptr_t qlen;
       int k;
@@ -254,10 +251,8 @@ class MOEBindings {
       intptr_t input;
       intptr_t output;
       bool incremental;
-      // qlen captured at task build time. `qlen` points into a pinned scalar
-      // tensor shared across forwards; the task executes deferred (worker pool /
-      // CUDA host callback) and must not dereference that shared pointer at exec
-      // time, or it reads whatever memory holds by then.
+      // `qlen` read when the task is built: it points at a pinned scalar shared
+      // across forwards, and the task runs later.
       int qlen_value;
     };
     static void inner(void* args) {
@@ -283,7 +278,7 @@ class MOEBindings {
                                                             intptr_t expert_ids, intptr_t weights, intptr_t input,
                                                             intptr_t output, bool incremental = false) {
       int qlen_value = qlen ? *reinterpret_cast<int*>(qlen) : 0;
-      Args* args = new Args{{nullptr, false, &Args::destroy},
+      Args* args = new Args{{nullptr, false, &destroy_host_callback_args<Args>},
                             moe.get(),
                             qlen,
                             k,
@@ -310,7 +305,6 @@ class MOESFTBindings {
   class WarmUpBindings {
    public:
     struct Args : HostCallbackArgs {
-      static void destroy(void* args) { delete static_cast<Args*>(args); }
       TP_MOE_SFT<T>* moe;
     };
     static void inner(void* args) {
@@ -318,7 +312,7 @@ class MOESFTBindings {
       args_->cpuinfer->enqueue(&TP_MOE_SFT<T>::warm_up, args_->moe);
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE_SFT<T>> moe) {
-      Args* args = new Args{{nullptr, false, &Args::destroy}, moe.get()};
+      Args* args = new Args{{nullptr, false, &destroy_host_callback_args<Args>}, moe.get()};
       return std::make_pair((intptr_t)&inner, (intptr_t)args);
     }
   };
@@ -326,7 +320,6 @@ class MOESFTBindings {
   class LoadWeightsBindings {
    public:
     struct Args : HostCallbackArgs {
-      static void destroy(void* args) { delete static_cast<Args*>(args); }
       TP_MOE_SFT<T>* moe;
     };
     static void inner(void* args) {
@@ -334,7 +327,7 @@ class MOESFTBindings {
       args_->cpuinfer->enqueue(&TP_MOE_SFT<T>::load_weights, args_->moe);
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE_SFT<T>> moe) {
-      Args* args = new Args{{nullptr, false, &Args::destroy}, moe.get()};
+      Args* args = new Args{{nullptr, false, &destroy_host_callback_args<Args>}, moe.get()};
       return std::make_pair((intptr_t)&inner, (intptr_t)args);
     }
   };
@@ -342,7 +335,6 @@ class MOESFTBindings {
   class ForwardSFTBindings {
    public:
     struct Args : HostCallbackArgs {
-      static void destroy(void* args) { delete static_cast<Args*>(args); }
       TP_MOE_SFT<T>* moe;
       intptr_t qlen;
       int k;
@@ -364,7 +356,7 @@ class MOESFTBindings {
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE_SFT<T>> moe, intptr_t qlen, int k,
                                                             intptr_t expert_ids, intptr_t weights, intptr_t input,
                                                             intptr_t output, bool save_for_backward) {
-      Args* args = new Args{{nullptr, false, &Args::destroy},
+      Args* args = new Args{{nullptr, false, &destroy_host_callback_args<Args>},
                             moe.get(),
                             qlen,
                             k,
@@ -380,7 +372,6 @@ class MOESFTBindings {
   class BackwardBindings {
    public:
     struct Args : HostCallbackArgs {
-      static void destroy(void* args) { delete static_cast<Args*>(args); }
       TP_MOE_SFT<T>* moe;
       intptr_t grad_output;
       intptr_t grad_input;
@@ -410,7 +401,7 @@ class MOESFTBindings {
         intptr_t grad_gate_lora_b, intptr_t grad_up_lora_a, intptr_t grad_up_lora_b, intptr_t grad_down_lora_a,
         intptr_t grad_down_lora_b, intptr_t grad_weights, intptr_t grad_gate_proj, intptr_t grad_up_proj,
         intptr_t grad_down_proj, bool accumulate_optimizer_grads = false, float optimizer_grad_scale = 1.0f) {
-      Args* args = new Args{{nullptr, false, &Args::destroy},
+      Args* args = new Args{{nullptr, false, &destroy_host_callback_args<Args>},
                             moe.get(),
                             grad_output,
                             grad_input,
@@ -433,7 +424,6 @@ class MOESFTBindings {
   class UpdateLoRAWeightsBindings {
    public:
     struct Args : HostCallbackArgs {
-      static void destroy(void* args) { delete static_cast<Args*>(args); }
       TP_MOE_SFT<T>* moe;
       intptr_t gate_lora_a;
       intptr_t gate_lora_b;
@@ -459,8 +449,14 @@ class MOESFTBindings {
                                                             intptr_t gate_lora_b, intptr_t up_lora_a,
                                                             intptr_t up_lora_b, intptr_t down_lora_a,
                                                             intptr_t down_lora_b) {
-      Args* args =
-          new Args{{nullptr, false, &Args::destroy}, moe.get(), gate_lora_a, gate_lora_b, up_lora_a, up_lora_b, down_lora_a, down_lora_b};
+      Args* args = new Args{{nullptr, false, &destroy_host_callback_args<Args>},
+                            moe.get(),
+                            gate_lora_a,
+                            gate_lora_b,
+                            up_lora_a,
+                            up_lora_b,
+                            down_lora_a,
+                            down_lora_b};
       return std::make_pair((intptr_t)&inner, (intptr_t)args);
     }
   };
@@ -538,7 +534,6 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
   if constexpr (requires { &MoeClass::write_weight_scale_to_buffer; }) {
     struct WriteWeightScaleToBufferBindings {
       struct Args : HostCallbackArgs {
-        static void destroy(void* args) { delete static_cast<Args*>(args); }
         MoeClass* moe;
         int gpu_tp_count;
         int expert_id;
@@ -567,8 +562,14 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
         for (auto item : w2_weight_ptrs) w2_weight_vec.push_back(py::cast<uintptr_t>(item));
         for (auto item : w2_scale_ptrs) w2_scale_vec.push_back(py::cast<uintptr_t>(item));
 
-        Args* args = new Args{{nullptr, false, &Args::destroy},        moe.get(),     gpu_tp_count,  expert_id,
-                              w13_weight_vec, w13_scale_vec, w2_weight_vec, w2_scale_vec};
+        Args* args = new Args{{nullptr, false, &destroy_host_callback_args<Args>},
+                              moe.get(),
+                              gpu_tp_count,
+                              expert_id,
+                              w13_weight_vec,
+                              w13_scale_vec,
+                              w2_weight_vec,
+                              w2_scale_vec};
         return std::make_pair((intptr_t)&inner, (intptr_t)args);
       }
     };

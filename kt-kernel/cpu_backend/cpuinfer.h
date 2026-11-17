@@ -41,20 +41,22 @@
 
 class CPUInfer;
 
-// Common header for every host-callback argument block.
-//
-// The block is allocated by the *_task() binding on the Python thread and
-// handed to CPUInfer::submit()/submit_with_cuda_stream().  `captured` is set
-// by CPUInfer when the stream is being captured: a CUDA graph re-invokes the
-// host callback with the same block on every replay, so the block must stay
-// alive for as long as the graph does.  In that case CPUInfer owns the block
-// and `release` frees it at teardown.  Otherwise the callback owns it and
-// releases it once the task has been enqueued.
+// Common header for every host-callback argument block, allocated by a *_task()
+// binding and handed to CPUInfer::submit*(). `captured` is set while the stream is
+// being captured: the graph re-invokes the callback with the same block on every
+// replay, so CPUInfer then owns the block and `release` frees it at teardown.
+// Otherwise the callback owns it; only the forward bindings free it.
 struct HostCallbackArgs {
   CPUInfer* cpuinfer;
   bool captured;
   void (*release)(void*);
 };
+
+// `release` for a block of type A (derived from HostCallbackArgs).
+template <class A>
+void destroy_host_callback_args(void* args) {
+  delete static_cast<A*>(args);
+}
 
 class CPUInfer {
  public:
