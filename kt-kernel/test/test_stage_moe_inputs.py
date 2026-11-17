@@ -66,23 +66,6 @@ def test_stage_matches_copies(rows, ids_dtype):
     _assert_matches(host, hidden, ids, weights)
 
 
-def test_stage_replays_in_a_graph():
-    _skip()
-    hidden, ids, weights = _inputs(1, torch.int32, seed=0)
-    host = _host_buffers(1)
-    stream = torch.cuda.Stream()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        _stage(stream, hidden, ids, weights, host)
-    for seed in range(1, 6):
-        new = _inputs(1, torch.int32, seed=seed)
-        hidden.copy_(new[0]), ids.copy_(new[1]), weights.copy_(new[2])
-        with torch.cuda.stream(stream):
-            graph.replay()
-        stream.synchronize()
-        _assert_matches(host, hidden, ids, weights)
-
-
 def _ring_and_check(stream, hidden, ids, weights, host, bell, value, launch):
     """Start the staging behind a GPU delay, spin on the doorbell, and check that every
     staged byte is already visible when it flips."""

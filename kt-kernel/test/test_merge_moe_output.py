@@ -6,7 +6,6 @@ import torch
 import kt_kernel
 
 ext = kt_kernel.kt_kernel_ext
-HIDDEN = 5120
 # routed_scaling_factor of DSv4.1, GLM-5.3 / DSv3, Kimi K2.6; None is MiMo (no multiply).
 SCALES = [1.5, 2.5, 2.827, None]
 
@@ -67,41 +66,6 @@ def test_merge_matches_torch_on_every_bit_pattern(scale):
             _merge(stream, gpu, host, out, scale)
             torch.cuda.synchronize()
             _assert_same_bits(out, _reference(gpu, host, scale))
-
-
-@pytest.mark.parametrize("rows", [1, 3, 64])
-@pytest.mark.parametrize("scale", SCALES)
-def test_merge_matches_torch_on_moe_outputs(rows, scale):
-    _skip()
-    generator = torch.Generator().manual_seed(rows)
-    gpu = (torch.randn(rows, HIDDEN, generator=generator) * 0.05).to(torch.bfloat16).cuda()
-    host = (torch.randn(rows, HIDDEN, generator=generator) * 0.05).to(torch.bfloat16).pin_memory()
-    out = torch.empty_like(gpu)
-    _merge(torch.cuda.current_stream(), gpu, host, out, scale)
-    torch.cuda.synchronize()
-    _assert_same_bits(out, _reference(gpu, host, scale))
-
-
-def test_merge_rereads_host_memory_on_graph_replay():
-    """A replayed graph sees what the CPU wrote into the pinned buffer since the last replay."""
-    _skip()
-    rows = 2
-    gpu = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device="cuda")
-    host = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16).pin_memory()
-    out = torch.empty_like(gpu)
-    stream = torch.cuda.Stream()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        _merge(stream, gpu, host, out, 1.5)
-    for seed in range(8):
-        generator = torch.Generator().manual_seed(seed)
-        gpu.copy_(torch.randn(rows, HIDDEN, generator=generator).to(torch.bfloat16))
-        host.copy_(torch.randn(rows, HIDDEN, generator=generator).to(torch.bfloat16))
-        torch.cuda.synchronize()
-        with torch.cuda.stream(stream):
-            graph.replay()
-        stream.synchronize()
-        _assert_same_bits(out, _reference(gpu, host, 1.5))
 
 
 def test_merge_reads_the_cpu_forward_of_each_replay():
