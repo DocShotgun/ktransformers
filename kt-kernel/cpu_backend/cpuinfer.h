@@ -35,6 +35,7 @@
 #endif
 
 #include "./vendors/vendor.h"
+#include "kt_env.h"
 #include "llama.cpp/ggml-impl.h"
 #include "task_queue.h"
 #include "worker_pool.h"
@@ -292,8 +293,7 @@ class CPUInfer {
   bool ensure_doorbell() {
     if (doorbell_disabled_) return false;
     if (doorbell_.load(std::memory_order_acquire) != nullptr) return true;
-    const char* env = std::getenv("KT_DOORBELL");
-    if (env != nullptr && env[0] == '0') {
+    if (!kt_env::flag("KT_DOORBELL")) {
       doorbell_disabled_ = true;
       return false;
     }

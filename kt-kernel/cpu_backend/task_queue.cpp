@@ -13,9 +13,10 @@
 #include <sched.h>
 
 #include <chrono>
-#include <cstdlib>
 #include <iostream>
 #include <thread>
+
+#include "kt_env.h"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -26,10 +27,7 @@
 
 namespace {
 int64_t spin_us_from_env(const char* name, int64_t fallback) {
-  const char* value = std::getenv(name);
-  if (value == nullptr || value[0] == '\0') return fallback;
-  const long long parsed = std::atoll(value);
-  return parsed < 0 ? fallback : parsed;
+  return kt_env::integer(name, fallback, [](long long us) { return us >= 0; });
 }
 // How long the worker spins for a follow-up task before going to sleep
 // (KT_TASKQ_SPIN_US). Decode's gap between layers is the GPU's per-layer work

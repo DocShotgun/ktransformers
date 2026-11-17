@@ -759,7 +759,7 @@ struct GemmKernel224FP8 {
   // ==========================================================================
 
   static bool decode_panels() {
-    static const bool enabled = cached_env_flag("KT_FP8_DECODE_PANELS");
+    static const bool enabled = kt_env::flag("KT_FP8_DECODE_PANELS");
     return enabled;
   }
 
@@ -768,10 +768,7 @@ struct GemmKernel224FP8 {
   // 16384 measured best: about 1% faster than no prefetch, 6% with one CPU expert; 32768
   // is slower.
   static int decode_prefetch_bytes() {
-    static const int bytes = [] {
-      const char* value = std::getenv("KT_FP8_DECODE_PREFETCH");
-      return value ? std::max(0, std::atoi(value)) / 64 * 64 : 8192;
-    }();
+    static const int bytes = std::max(0LL, kt_env::integer("KT_FP8_DECODE_PREFETCH", 8192)) / 64 * 64;
     return bytes;
   }
 
@@ -1007,7 +1004,7 @@ inline bool mat_mul_kgroup(int m, int n, int k, int k_group_size, const std::sha
 #ifdef HAVE_AMX
   // Prefill AMX tiles need a full 16-row staging guard plus FP8->BF16
   // widening; KT_FP8_PREFILL_AMX=0 forces the AVX512-BF16 path for A/B checks.
-  static const bool amx_prefill = cached_env_flag("KT_FP8_PREFILL_AMX");
+  static const bool amx_prefill = kt_env::flag("KT_FP8_PREFILL_AMX");
   if (amx_prefill && AMX_AVAILABLE && m >= 16 && n % GemmKernel224FP8::N_STEP == 0 &&
       k % GemmKernel224FP8::K_STEP == 0 && k_group_size % GemmKernel224FP8::K_STEP == 0) {
     GemmKernel224FP8::fp8_mat_mat_kgroup_amx(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth, dst);
@@ -1300,7 +1297,7 @@ inline void mat_mul_perchannel(int m, int n, int k, std::shared_ptr<GemmKernel22
   // Same staging contract as the block-wise FP8 kernel: AMX tiles need a full
   // 16-row guard and the FP8->BF16 widening. KT_FP8_PERCHANNEL_PREFILL_AMX=0
   // forces the AVX512-BF16 path for A/B checks.
-  static const bool amx_prefill = cached_env_flag("KT_FP8_PERCHANNEL_PREFILL_AMX");
+  static const bool amx_prefill = kt_env::flag("KT_FP8_PERCHANNEL_PREFILL_AMX");
   if (amx_prefill && AMX_AVAILABLE && m >= 16 && n % GemmKernel224FP8PerChannel::N_STEP == 0 &&
       k % GemmKernel224FP8PerChannel::K_STEP == 0) {
     GemmKernel224FP8PerChannel::fp8_perchannel_mat_mat_kgroup_amx(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth);

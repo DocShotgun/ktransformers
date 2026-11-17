@@ -801,7 +801,7 @@ class AMX_MOE_BASE {
   }
 
   static bool fused_decode_enabled() {
-    static const bool enabled = cached_env_flag("KT_DECODE_FUSED");
+    static const bool enabled = kt_env::flag("KT_DECODE_FUSED");
     return enabled;
   }
 
@@ -855,11 +855,8 @@ class AMX_MOE_BASE {
     // (FP4: 16-18) split only while activated_expert * nth_gu units are under 1.5 per
     // thread; past that the pool is saturated and splitting costs ~1%. Measured with 32
     // threads per node: -13% on DSv4.1 at 2 CPU experts, -14% / -6% on MiMo at 1 / 2.
-    static const int split_below = [] {
-      const char* value = std::getenv("KT_DECODE_SPLIT_GATE_UP_BELOW");
-      return value ? std::atoi(value) : 8;
-    }();
-    static const bool split_by_occupancy = cached_env_flag("KT_DECODE_SPLIT_GATE_UP_OCCUPANCY");
+    static const int split_below = kt_env::integer("KT_DECODE_SPLIT_GATE_UP_BELOW", 8);
+    static const bool split_by_occupancy = kt_env::flag("KT_DECODE_SPLIT_GATE_UP_OCCUPANCY");
     auto pool = config_.pool->get_subpool(tp_part_idx);
     const bool split_gate_up =
         nth_gu < split_below || (split_by_occupancy && 2 * activated_expert * nth_gu < 3 * pool->worker_capacity());

@@ -60,9 +60,9 @@ struct GemmKernel224MXFP4SmallKGroup {
   // Small-m (decode) task widths. Any multiple of 32 that divides N_BLOCK keeps the
   // K-major kernels bit-identical: each 32-channel tile is computed independently.
   static int decode_width_from_env(const char* name, int fallback) {
-    const char* value = std::getenv(name);
-    const int width = value ? std::atoi(value) : fallback;
-    return width >= 32 && width <= N_BLOCK && width % 32 == 0 && N_BLOCK % width == 0 ? width : fallback;
+    return kt_env::integer(name, fallback, [](long long width) {
+      return width >= 32 && width <= N_BLOCK && width % 32 == 0 && N_BLOCK % width == 0;
+    });
   }
   static int decode_narrow_width() {
     static const int width = decode_width_from_env("KT_FP4_DECODE_WIDTH", 32);
@@ -76,8 +76,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   // Bytes ahead that the m=1 K-major kernels prefetch (KT_FP4_DECODE_PREFETCH, 0 = off).
   // 2048 measured best on DSv4.1 decode (1024-8192 within 1%).
   static int decode_prefetch_bytes() {
-    const char* value = std::getenv("KT_FP4_DECODE_PREFETCH");
-    return value ? std::max(0, std::atoi(value)) / 64 * 64 : 2048;
+    return std::max(0LL, kt_env::integer("KT_FP4_DECODE_PREFETCH", 2048)) / 64 * 64;
   }
 
   static std::string name() { return "MXFP4_KGROUP"; }
@@ -399,11 +398,10 @@ struct GemmKernel224MXFP4SmallKGroup {
       scale_nv_kmajor_e4m3 = reinterpret_cast<uint8_t*>(scale_nv_kmajor);
       // NVFP4 keeps its own K-major knob (KT_NVFP4_KMAJOR_WEIGHTS) mirroring
       // the MXFP4 one; both default on for AMX/BF16 hosts.
-      const char* layout = std::getenv(k_group_size_ == 16 ? "KT_NVFP4_KMAJOR_WEIGHTS" : "KT_MXFP4_KMAJOR_WEIGHTS");
 #if defined(HAVE_AMX) && defined(__AVX512BF16__)
       // The packed layout is the fast path on AMX/BF16 hosts. Keep an opt-out
       // for comparisons and for machines with unusual routing distributions.
-      kmajor_weights = !layout || layout[0] != '0';
+      kmajor_weights = kt_env::flag(k_group_size_ == 16 ? "KT_NVFP4_KMAJOR_WEIGHTS" : "KT_MXFP4_KMAJOR_WEIGHTS");
 #else
       kmajor_weights = false;
 #endif
@@ -600,10 +598,7 @@ struct GemmKernel224MXFP4SmallKGroup {
       if (!valid) return;
       for (size_t i = 0; i < count; ++i) scale_nv_compact[i] = GGML_FP32_TO_BF16(d[i]);
       if (!kmajor_weights) return;
-      static const bool e4m3_enabled = [] {
-        const char* value = std::getenv("KT_NVFP4_E4M3_SCALES");
-        return value == nullptr || std::strcmp(value, "0") != 0;
-      }();
+      static const bool e4m3_enabled = kt_env::flag("KT_NVFP4_E4M3_SCALES");
       bool e4m3 = e4m3_enabled;
       for (size_t i = 0; e4m3 && i < count; ++i) e4m3 = e4m3_code_of_bf16(scale_nv_compact[i].bits) >= 0;
       scale_nv_e4m3 = e4m3;
@@ -1872,7 +1867,7 @@ inline bool mat_mul_kgroup(int m, int n, int k, int k_group_size,
   }
 #endif
 #ifdef HAVE_AMX
-  static const bool amx_prefill = cached_env_flag("KT_MXFP4_PREFILL_AMX");
+  static const bool amx_prefill = kt_env::flag("KT_MXFP4_PREFILL_AMX");
   if (amx_prefill && m >= 16 && n >= GemmKernel224MXFP4SmallKGroup::N_STEP &&
       k >= GemmKernel224MXFP4SmallKGroup::N_STEP && n % GemmKernel224MXFP4SmallKGroup::N_STEP == 0 &&
       k_group_size == 32 && k % 32 == 0 && bb->scale_e8_normal) {
@@ -1882,7 +1877,7 @@ inline bool mat_mul_kgroup(int m, int n, int k, int k_group_size,
   // The NVFP4 packers fold the per-16 scale into bf16(fp4 * scale). That is
   // exact for e4m3 block scales (at most 6 significant bits), i.e. whenever the
   // global scale is applied separately; folded block x global scales round it.
-  static const bool nvfp4_amx = cached_env_flag("KT_NVFP4_PREFILL_AMX");
+  static const bool nvfp4_amx = kt_env::flag("KT_NVFP4_PREFILL_AMX");
   if (nvfp4_amx && m >= 16 && n >= GemmKernel224MXFP4SmallKGroup::N_STEP &&
       k >= GemmKernel224MXFP4SmallKGroup::N_STEP && n % GemmKernel224MXFP4SmallKGroup::N_STEP == 0 &&
       k_group_size == 16 && k % 32 == 0) {

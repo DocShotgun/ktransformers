@@ -1,10 +1,9 @@
 """Run one AMX kernel backend per process so the A/B tests can compare them.
 
 Kernel selection reads its `KT_*_PREFILL_AMX` flag once and caches it (see
-`cached_env_flag` in operators/common.hpp): the dispatch runs once per
-(expert, N-block) task, so a `getenv` per call is pure overhead. The flags are
-therefore process-level, and a test that compares two backends has to give each
-one its own interpreter.
+cpu_backend/kt_env.h): the dispatch runs once per (expert, N-block) task, so a
+`getenv` per call is pure overhead. The flags are therefore process-level, and a
+test that compares two backends has to give each one its own interpreter.
 
 Usage: the test module exposes `child_main()`, which reads its inputs from the
 environment and pickles its result to `KT_AMX_OUT`; the test body calls
