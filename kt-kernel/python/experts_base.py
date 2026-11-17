@@ -217,10 +217,9 @@ def generate_gpu_experts_masks(
 # cast and three device-to-host copies; larger batches keep the copy engine.
 # Arbitrary; decode and speculative verification are far below it.
 _STAGE_MAX_ROWS = 64
-_STAGE_ON_GPU = os.environ.get("KT_STAGE_KERNEL", "1") != "0" and hasattr(kt_kernel_ext, "stage_moe_inputs")
-
-
-_MERGE_ON_GPU = os.environ.get("KT_MERGE_KERNEL", "1") != "0" and hasattr(kt_kernel_ext, "merge_moe_output")
+# Both kernels exist only in CUDA builds.
+_STAGE_ON_GPU = hasattr(kt_kernel_ext, "stage_moe_inputs")
+_MERGE_ON_GPU = hasattr(kt_kernel_ext, "merge_moe_output")
 
 
 def _can_merge_on_gpu(gpu_output: torch.Tensor, host_output: torch.Tensor) -> bool:
