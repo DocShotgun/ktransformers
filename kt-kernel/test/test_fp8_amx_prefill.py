@@ -30,10 +30,7 @@ def _run(backend, expert_counts, hidden=1024):
     def make_fp8_weights(n, k):
         fp8 = torch.randint(0, 256, (experts, n, k), dtype=torch.int32).to(torch.uint8)
         fp8[(fp8 == 0x7F) | (fp8 == 0xFF)] = 0x7E
-        scales = (
-            torch.rand(experts, n // group_size, k // group_size, dtype=torch.float32) * 0.0004
-            + 0.0001
-        )
+        scales = torch.rand(experts, n // group_size, k // group_size, dtype=torch.float32) * 0.0004 + 0.0001
         return fp8.contiguous(), scales.contiguous()
 
     gate, gate_scales = make_fp8_weights(intermediate, hidden)

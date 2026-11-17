@@ -294,9 +294,7 @@ struct GemmKernel224MXFP4SmallKGroup {
 
     // Row stride of the aliased prefill buffer, or of one K block of the
     // tiled decode buffer. The AMX kernel walks both with the same code.
-    int k_block_stride(int k_block_begin) const {
-      return row_major ? k : std::min(K_BLOCK, k - k_block_begin);
-    }
+    int k_block_stride(int k_block_begin) const { return row_major ? k : std::min(K_BLOCK, k - k_block_begin); }
 
     ggml_bf16_t* get_submat(int m, int k_, int m_begin, int k_begin) {
       if (row_major) return a + static_cast<size_t>(m_begin) * k + k_begin;
@@ -323,8 +321,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   };
 
   // BF16 bits of the positive e4m3 subnormals m * 2^-9, m = 0..7.
-  static constexpr uint16_t kE4m3SubnormalBf16[8] = {0x0000, 0x3B00, 0x3B80, 0x3BC0,
-                                                     0x3C00, 0x3C20, 0x3C40, 0x3C60};
+  static constexpr uint16_t kE4m3SubnormalBf16[8] = {0x0000, 0x3B00, 0x3B80, 0x3BC0, 0x3C00, 0x3C20, 0x3C40, 0x3C60};
 
   // The e4m3 code (0..0x7E) with exactly this BF16 value, or -1 (negative, NaN or
   // not representable).
@@ -402,8 +399,7 @@ struct GemmKernel224MXFP4SmallKGroup {
       scale_nv_kmajor_e4m3 = reinterpret_cast<uint8_t*>(scale_nv_kmajor);
       // NVFP4 keeps its own K-major knob (KT_NVFP4_KMAJOR_WEIGHTS) mirroring
       // the MXFP4 one; both default on for AMX/BF16 hosts.
-      const char* layout =
-          std::getenv(k_group_size_ == 16 ? "KT_NVFP4_KMAJOR_WEIGHTS" : "KT_MXFP4_KMAJOR_WEIGHTS");
+      const char* layout = std::getenv(k_group_size_ == 16 ? "KT_NVFP4_KMAJOR_WEIGHTS" : "KT_MXFP4_KMAJOR_WEIGHTS");
 #if defined(HAVE_AMX) && defined(__AVX512BF16__)
       // The packed layout is the fast path on AMX/BF16 hosts. Keep an opt-out
       // for comparisons and for machines with unusual routing distributions.
@@ -780,9 +776,8 @@ struct GemmKernel224MXFP4SmallKGroup {
   // K 16..31 in both the BF16 and VNNI fallback decoders). A lane-wise scale
   // vector keeps the single-FMA accumulation shape for both encodings.
   __attribute__((always_inline)) static inline __m512 fp4_scale_vec(const float* s, int scales_per_block) {
-    return scales_per_block == 1
-               ? _mm512_set1_ps(s[0])
-               : _mm512_mask_blend_ps(0xFF00u, _mm512_set1_ps(s[0]), _mm512_set1_ps(s[1]));
+    return scales_per_block == 1 ? _mm512_set1_ps(s[0])
+                                 : _mm512_mask_blend_ps(0xFF00u, _mm512_set1_ps(s[0]), _mm512_set1_ps(s[1]));
   }
 
   // mat-vec: M 个独立 token，N 维 4 行一组累加，摊销 horizontal reduce。
@@ -897,9 +892,11 @@ struct GemmKernel224MXFP4SmallKGroup {
           group1[t] = _mm512_setzero_ps();
         }
         for (int pair = 0; pair < 16; ++pair) {
-          const __m512i words = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
+          const __m512i words =
+              _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
           const __m512i low = _mm512_permutexvar_epi16(_mm512_and_si512(words, nibble_mask), lut);
-          const __m512i high = _mm512_permutexvar_epi16(_mm512_and_si512(_mm512_srli_epi16(words, 4), nibble_mask), lut);
+          const __m512i high =
+              _mm512_permutexvar_epi16(_mm512_and_si512(_mm512_srli_epi16(words, 4), nibble_mask), lut);
           for (int t = 0; t < MB; ++t) {
             const __m512bh broadcast = pair_broadcast<MEM>(activation[t] + static_cast<size_t>(group) * 32, pair);
             group0[t] = _mm512_dpbf16_ps(group0[t], (__m512bh)low, broadcast);
@@ -966,9 +963,11 @@ struct GemmKernel224MXFP4SmallKGroup {
             group1[t] = _mm512_setzero_ps();
           }
           for (int pair = half * 8; pair < half * 8 + 8; ++pair) {
-            const __m512i words = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
+            const __m512i words =
+                _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
             const __m512i low = _mm512_permutexvar_epi16(_mm512_and_si512(words, nibble_mask), lut);
-            const __m512i high = _mm512_permutexvar_epi16(_mm512_and_si512(_mm512_srli_epi16(words, 4), nibble_mask), lut);
+            const __m512i high =
+                _mm512_permutexvar_epi16(_mm512_and_si512(_mm512_srli_epi16(words, 4), nibble_mask), lut);
             for (int t = 0; t < MB; ++t) {
               const __m512bh broadcast = pair_broadcast<MEM>(activation[t] + static_cast<size_t>(group) * 32, pair);
               group0[t] = _mm512_dpbf16_ps(group0[t], (__m512bh)low, broadcast);
@@ -1008,8 +1007,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   // about as much as a whole block. Returns the first row not covered (at
   // most one row is left, for the single-row loop).
   template <bool NVFP4, bool MEM>
-  static int fp4_kmajor_row_blocks(int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int n_start,
-                                   int n_end) {
+  static int fp4_kmajor_row_blocks(int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int n_start, int n_end) {
     const auto rows = [&](auto block, int mi) {
       constexpr int MB = decltype(block)::value;
       if constexpr (NVFP4) {
@@ -1031,8 +1029,8 @@ struct GemmKernel224MXFP4SmallKGroup {
   }
 
   template <bool NVFP4>
-  static int fp4_kmajor_row_blocks(int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int n_start,
-                                   int n_end, bool natural_order) {
+  static int fp4_kmajor_row_blocks(int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int n_start, int n_end,
+                                   bool natural_order) {
     return natural_order ? fp4_kmajor_row_blocks<NVFP4, false>(m, n, k, ba, bb, bc, n_start, n_end)
                          : fp4_kmajor_row_blocks<NVFP4, true>(m, n, k, ba, bb, bc, n_start, n_end);
   }
@@ -1082,9 +1080,11 @@ struct GemmKernel224MXFP4SmallKGroup {
           __m512 group0 = _mm512_setzero_ps();
           __m512 group1 = _mm512_setzero_ps();
           for (int pair = 0; pair < 16; ++pair) {
-            const __m512i words = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
+            const __m512i words =
+                _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
             const __m512i low = _mm512_permutexvar_epi16(_mm512_and_si512(words, nibble_mask), lut);
-            const __m512i high = _mm512_permutexvar_epi16(_mm512_and_si512(_mm512_srli_epi16(words, 4), nibble_mask), lut);
+            const __m512i high =
+                _mm512_permutexvar_epi16(_mm512_and_si512(_mm512_srli_epi16(words, 4), nibble_mask), lut);
             const uint16_t a0 = natural_order ? a[pair] : a[pair * 2];
             const uint16_t a1 = natural_order ? a[16 + pair] : a[pair * 2 + 1];
             const uint32_t pair_activation = static_cast<uint32_t>(a0) | (static_cast<uint32_t>(a1) << 16);
@@ -1126,8 +1126,8 @@ struct GemmKernel224MXFP4SmallKGroup {
       // Scales take 128 B (BF16) or 64 B (e4m3) per 32-K group against the weights'
       // 512 B, so they run a quarter or an eighth as far ahead.
       const size_t scale_bytes = bb->scale_nv_e4m3 ? 1 : sizeof(ggml_bf16_t);
-      const uint8_t* scale_base = bb->scale_nv_e4m3 ? bb->scale_nv_kmajor_e4m3
-                                                    : reinterpret_cast<const uint8_t*>(bb->scale_nv_kmajor);
+      const uint8_t* scale_base =
+          bb->scale_nv_e4m3 ? bb->scale_nv_kmajor_e4m3 : reinterpret_cast<const uint8_t*>(bb->scale_nv_kmajor);
       const uint8_t* scale_end = scale_base + static_cast<size_t>(n_end) * group_count * scale_bytes;
       for (int n_pos = n_start; n_pos < n_end; n_pos += 32) {
         const uint8_t* tile = bb->b + static_cast<size_t>(n_pos) * row_bytes;
@@ -1160,9 +1160,11 @@ struct GemmKernel224MXFP4SmallKGroup {
           __m512 g1h0 = _mm512_setzero_ps();
           __m512 g1h1 = _mm512_setzero_ps();
           for (int pair = 0; pair < 16; ++pair) {
-            const __m512i words = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
+            const __m512i words =
+                _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
             const __m512i low = _mm512_permutexvar_epi16(_mm512_and_si512(words, nibble_mask), lut);
-            const __m512i high = _mm512_permutexvar_epi16(_mm512_and_si512(_mm512_srli_epi16(words, 4), nibble_mask), lut);
+            const __m512i high =
+                _mm512_permutexvar_epi16(_mm512_and_si512(_mm512_srli_epi16(words, 4), nibble_mask), lut);
             const uint16_t a0 = natural_order ? a[pair] : a[pair * 2];
             const uint16_t a1 = natural_order ? a[16 + pair] : a[pair * 2 + 1];
             const uint32_t pair_activation = static_cast<uint32_t>(a0) | (static_cast<uint32_t>(a1) << 16);
@@ -1341,7 +1343,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   static const std::array<std::array<uint32_t, 256>, 256>& scaled_fp4_lut() {
     static const auto lut = [] {
       std::array<std::array<uint32_t, 256>, 256> table{};
-      constexpr float values[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+      constexpr float values[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
                                     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
       for (int exponent = 1; exponent < 255; ++exponent) {
         const float scale = std::ldexp(1.0f, exponent - 127);
@@ -1350,8 +1352,8 @@ struct GemmKernel224MXFP4SmallKGroup {
           scaled[value] = GGML_FP32_TO_BF16(values[value] * scale).bits;
         }
         for (int pair = 0; pair < 256; ++pair) {
-          table[exponent][pair] = static_cast<uint32_t>(scaled[pair & 15]) |
-                                  (static_cast<uint32_t>(scaled[pair >> 4]) << 16);
+          table[exponent][pair] =
+              static_cast<uint32_t>(scaled[pair & 15]) | (static_cast<uint32_t>(scaled[pair >> 4]) << 16);
         }
       }
       return table;
@@ -1380,12 +1382,12 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   }
 
-// NVFP4 scalar fallback: fold each per-16 FP32 scale into BF16 pair words.
+  // NVFP4 scalar fallback: fold each per-16 FP32 scale into BF16 pair words.
   // Used when no transposed BF16 scale copy exists (fp32-scale escape hatch
   // or KT_NVFP4_KMAJOR_WEIGHTS=0) and by hosts without AVX512 BF16.
   static void pack_fp4_amx_b_scalar_nvfp4(int n, int k, int n_pos, BufferB* bb, uint32_t* packed, int group_begin,
                                           int group_end) {
-    constexpr float values[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    constexpr float values[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
                                   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
     for (int group = group_begin; group < group_end; ++group) {
       uint32_t* destination = packed + static_cast<size_t>(group - group_begin) * 16 * 32;
@@ -1418,21 +1420,21 @@ struct GemmKernel224MXFP4SmallKGroup {
     const uint8_t* tile = bb->b + static_cast<size_t>(n_pos) * row_bytes;
     const __m512i exponent_bias = _mm512_set1_epi16(127);
     alignas(64) static constexpr uint16_t duplicate_indices[32] = {
-        0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7,
-        8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15};
+        0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15};
     const __m512i duplicate0 = _mm512_load_si512(duplicate_indices);
     const __m512i duplicate1 = _mm512_add_epi16(duplicate0, _mm512_set1_epi16(16));
     for (int group = group_begin; group < group_end; ++group) {
       const uint8_t* group_scales = bb->scale_e8_kmajor + static_cast<size_t>(n_pos) * group_count + group * 32;
-      const __m512i exponents = _mm512_cvtepu8_epi16(
-          _mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_scales)));
+      const __m512i exponents =
+          _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(group_scales)));
       const __m512i scale_offsets = _mm512_slli_epi16(_mm512_sub_epi16(exponents, exponent_bias), 7);
       const __m512i scale0 = _mm512_permutexvar_epi16(duplicate0, scale_offsets);
       const __m512i scale1 = _mm512_permutexvar_epi16(duplicate1, scale_offsets);
       const uint8_t* src = tile + static_cast<size_t>(group) * 16 * 32;
       uint32_t* destination = packed + static_cast<size_t>(group - group_begin) * 16 * 32;
       for (int pair = 0; pair < 16; ++pair) {
-        const __m512i words = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
+        const __m512i words =
+            _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
         __m512i low = _mm512_permutexvar_epi16(_mm512_and_si512(words, nibble_mask), lut);
         __m512i high = _mm512_permutexvar_epi16(_mm512_and_si512(_mm512_srli_epi16(words, 4), nibble_mask), lut);
         const __mmask32 low_nonzero = _mm512_cmpneq_epi16_mask(_mm512_and_si512(low, abs_mask), zero);
@@ -1460,8 +1462,7 @@ struct GemmKernel224MXFP4SmallKGroup {
     const size_t row_bytes = static_cast<size_t>(k) / 2;
     const uint8_t* tile = bb->b + static_cast<size_t>(n_pos) * row_bytes;
     alignas(64) static constexpr uint16_t duplicate_indices[32] = {
-        0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7,
-        8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15};
+        0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15};
     const __m512i duplicate = _mm512_load_si512(duplicate_indices);
     const __m512i duplicate_hi = _mm512_add_epi16(duplicate, _mm512_set1_epi16(16));
     const auto dup_lane_lo = [](const __m512i v) __attribute__((always_inline)) {
@@ -1474,8 +1475,8 @@ struct GemmKernel224MXFP4SmallKGroup {
     // cvtpbh_ps fills lanes 0..15 and zeroes lanes 16..31, while the *_hi
     // multiplier carries dup lanes 16..31 in its lanes 0..15; cvtne2ps_pbh
     // consumes lanes 0..15 of each operand and reassembles the pair halves.
-    const auto fold_block = [&](const __m512i words, const __m512 m_lo, const __m512 m_lo_hi16,
-                                const __m512 m_hi, const __m512 m_hi_hi16, uint32_t* destination) {
+    const auto fold_block = [&](const __m512i words, const __m512 m_lo, const __m512 m_lo_hi16, const __m512 m_hi,
+                                const __m512 m_hi_hi16, uint32_t* destination) {
       const __m512i low = _mm512_permutexvar_epi16(_mm512_and_si512(words, nibble_mask), lut);
       const __m512i high = _mm512_permutexvar_epi16(_mm512_and_si512(_mm512_srli_epi16(words, 4), nibble_mask), lut);
       const __m512 f_lo0 = _mm512_mul_ps(_mm512_cvtpbh_ps((__m256bh)_mm512_castsi512_si256(low)), m_lo);
@@ -1502,11 +1503,13 @@ struct GemmKernel224MXFP4SmallKGroup {
       const uint8_t* src = tile + static_cast<size_t>(group) * 16 * 32;
       uint32_t* destination = packed + static_cast<size_t>(group - group_begin) * 16 * 32;
       for (int pair = 0; pair < 8; ++pair) {
-        const __m512i words = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
+        const __m512i words =
+            _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
         fold_block(words, dup0a_lo, dup0a_hi, dup0b_lo, dup0b_hi, destination + pair * 32);
       }
       for (int pair = 8; pair < 16; ++pair) {
-        const __m512i words = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
+        const __m512i words =
+            _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + pair * 32)));
         fold_block(words, dup1a_lo, dup1a_hi, dup1b_lo, dup1b_hi, destination + pair * 32);
       }
     }
@@ -1672,7 +1675,8 @@ struct GemmKernel224MXFP4SmallKGroup {
       _tile_stored(6, &tile_out[16][0], 32 * sizeof(float));
       _tile_stored(7, &tile_out[16][16], 32 * sizeof(float));
       for (int row = 0; row < rows; ++row) {
-        avx512_32xfp32_to_32xbf16(reinterpret_cast<__m512*>(&tile_out[row][0]), reinterpret_cast<__m512*>(&tile_out[row][16]),
+        avx512_32xfp32_to_32xbf16(reinterpret_cast<__m512*>(&tile_out[row][0]),
+                                  reinterpret_cast<__m512*>(&tile_out[row][16]),
                                   reinterpret_cast<__m512i*>(dst + static_cast<size_t>(m_pos + row) * n + n_pos));
       }
       return;
@@ -1869,9 +1873,8 @@ inline bool mat_mul_kgroup(int m, int n, int k, int k_group_size,
 #endif
 #ifdef HAVE_AMX
   static const bool amx_prefill = cached_env_flag("KT_MXFP4_PREFILL_AMX");
-  if (amx_prefill &&
-      m >= 16 && n >= GemmKernel224MXFP4SmallKGroup::N_STEP && k >= GemmKernel224MXFP4SmallKGroup::N_STEP &&
-      n % GemmKernel224MXFP4SmallKGroup::N_STEP == 0 &&
+  if (amx_prefill && m >= 16 && n >= GemmKernel224MXFP4SmallKGroup::N_STEP &&
+      k >= GemmKernel224MXFP4SmallKGroup::N_STEP && n % GemmKernel224MXFP4SmallKGroup::N_STEP == 0 &&
       k_group_size == 32 && k % 32 == 0 && bb->scale_e8_normal) {
     GemmKernel224MXFP4SmallKGroup::fp4_mat_mat_kgroup_amx(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth, dst);
     return dst != nullptr;
@@ -1880,9 +1883,8 @@ inline bool mat_mul_kgroup(int m, int n, int k, int k_group_size,
   // exact for e4m3 block scales (at most 6 significant bits), i.e. whenever the
   // global scale is applied separately; folded block x global scales round it.
   static const bool nvfp4_amx = cached_env_flag("KT_NVFP4_PREFILL_AMX");
-  if (nvfp4_amx &&
-      m >= 16 && n >= GemmKernel224MXFP4SmallKGroup::N_STEP && k >= GemmKernel224MXFP4SmallKGroup::N_STEP &&
-      n % GemmKernel224MXFP4SmallKGroup::N_STEP == 0 &&
+  if (nvfp4_amx && m >= 16 && n >= GemmKernel224MXFP4SmallKGroup::N_STEP &&
+      k >= GemmKernel224MXFP4SmallKGroup::N_STEP && n % GemmKernel224MXFP4SmallKGroup::N_STEP == 0 &&
       k_group_size == 16 && k % 32 == 0) {
     GemmKernel224MXFP4SmallKGroup::fp4_mat_mat_kgroup_amx(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth, dst);
     return dst != nullptr;
@@ -1929,9 +1931,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     printf("Creating AMX_FP4_MOE_TP %d at numa %d\n", tp_part_idx, numa_node_of_cpu(sched_getcpu()));
   }
 
-  bool should_allocate_expert_weights(int expert_idx) const {
-    return !config_.should_skip_expert(expert_idx);
-  }
+  bool should_allocate_expert_weights(int expert_idx) const { return !config_.should_skip_expert(expert_idx); }
 
   float gate_global_scale(int expert_idx) const { return gate_global_.empty() ? 1.0f : gate_global_[expert_idx]; }
   float up_global_scale(int expert_idx) const { return up_global_.empty() ? 1.0f : up_global_[expert_idx]; }
@@ -1969,7 +1969,6 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
   }
 
  public:
-
   ~AMX_FP4_MOE_TP() = default;
 
   // BufferA: raw BF16, no group_size needed
@@ -2121,7 +2120,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
 
     if (quant_config.group_size == 0 || quant_config.zero_point)
       throw std::runtime_error("FP4 (MXFP4/NVFP4) MoE only support KGroup FP4.");
-    if (config_.gate_scale == nullptr) throw std::runtime_error("FP4 (MXFP4/NVFP4) MoE only support load native weight.");
+    if (config_.gate_scale == nullptr)
+      throw std::runtime_error("FP4 (MXFP4/NVFP4) MoE only support load native weight.");
     resolve_global_scales(physical_to_logical_map);
 
     int nth = T::recommended_nth(config_.intermediate_size);
@@ -2224,13 +2224,15 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
               size_t start = chunk_idx * weight_chunk_size;
               size_t end = std::min(start + weight_chunk_size, cpu_tp_weight_bytes);
               if (start < end)
-                gate_bb_[expert_id]->copy_weight_bytes(w13_weight_dst + offset_in_gpu_weight + start, start, end - start);
+                gate_bb_[expert_id]->copy_weight_bytes(w13_weight_dst + offset_in_gpu_weight + start, start,
+                                                       end - start);
             } else if (task_id < NUM_WEIGHT_TASKS * 2) {
               int chunk_idx = task_id - NUM_WEIGHT_TASKS;
               size_t start = chunk_idx * weight_chunk_size;
               size_t end = std::min(start + weight_chunk_size, cpu_tp_weight_bytes);
               if (start < end)
-                up_bb_[expert_id]->copy_weight_bytes(w13_weight_dst + offset_in_gpu_weight + gpu_tp_weight_bytes + start, start, end - start);
+                up_bb_[expert_id]->copy_weight_bytes(
+                    w13_weight_dst + offset_in_gpu_weight + gpu_tp_weight_bytes + start, start, end - start);
             } else if (task_id < NUM_WEIGHT_TASKS * 2 + num_down_tasks) {
               int chunk_idx = task_id - NUM_WEIGHT_TASKS * 2;
               size_t cols_per_chunk = (config_.hidden_size + num_down_tasks - 1) / num_down_tasks;
@@ -2245,7 +2247,9 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
               size_t gpu_scale_slice_offset = local_idx * scale_per_col;
 
               for (size_t col = col_start; col < col_end; col++) {
-                down_bb_[expert_id]->copy_weight_bytes(w2_weight_dst + col * gpu_weight_stride + gpu_weight_slice_offset, col * weight_per_col, weight_per_col);
+                down_bb_[expert_id]->copy_weight_bytes(
+                    w2_weight_dst + col * gpu_weight_stride + gpu_weight_slice_offset, col * weight_per_col,
+                    weight_per_col);
                 down_bb_[expert_id]->copy_scale_to_bf16(w2_scale_dst + col * gpu_scale_stride + gpu_scale_slice_offset,
                                                         col * scale_per_col, scale_per_col);
               }
@@ -2302,7 +2306,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
               size_t start = chunk_idx * weight_chunk_size;
               size_t end = std::min(start + weight_chunk_size, data_per_gpu_tp_weight);
               if (start < end)
-                up_bb_[expert_id]->copy_weight_bytes(w13_weight_dst + gpu_tp_weight_bytes + start, cpu_offset_weight + start, end - start);
+                up_bb_[expert_id]->copy_weight_bytes(w13_weight_dst + gpu_tp_weight_bytes + start,
+                                                     cpu_offset_weight + start, end - start);
             } else if (task_type < NUM_WEIGHT_TASKS * 2 + num_down_tasks) {
               int chunk_idx = task_type - NUM_WEIGHT_TASKS * 2;
               size_t cols_per_chunk = (config_.hidden_size + num_down_tasks - 1) / num_down_tasks;
@@ -2318,7 +2323,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
                 size_t col_offset_scale = (col * (config_.intermediate_size / group_size)) +
                                           (local_gpu_idx * data_per_gpu_tp_scale / config_.hidden_size);
 
-                down_bb_[expert_id]->copy_weight_bytes(w2_weight_dst + col * weight_per_gpu_col, col_offset_weight, weight_per_gpu_col);
+                down_bb_[expert_id]->copy_weight_bytes(w2_weight_dst + col * weight_per_gpu_col, col_offset_weight,
+                                                       weight_per_gpu_col);
                 down_bb_[expert_id]->copy_scale_to_bf16(w2_scale_dst + col * scale_per_gpu_col, col_offset_scale,
                                                         scale_per_gpu_col);
               }

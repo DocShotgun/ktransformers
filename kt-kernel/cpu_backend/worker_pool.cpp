@@ -124,8 +124,7 @@ InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
 
 InNumaPool::~InNumaPool() {
   exit_.store(true, std::memory_order_seq_cst);
-  gen_.store(((gen_.load(std::memory_order_relaxed) >> kGenCountBits) + 1) << kGenCountBits,
-             std::memory_order_seq_cst);
+  gen_.store(((gen_.load(std::memory_order_relaxed) >> kGenCountBits) + 1) << kGenCountBits, std::memory_order_seq_cst);
   for (int i = 0; i < total_worker_count; i++) {
     {
       std::lock_guard<std::mutex> lock(thread_state_[i].mutex);
@@ -282,9 +281,8 @@ void InNumaPool::worker_thread(int thread_id, int numa_id) {
     if (std::chrono::steady_clock::now() - last_work < std::chrono::milliseconds(50)) continue;
     std::unique_lock<std::mutex> lock(s.mutex);
     s.sleeping.store(true, std::memory_order_seq_cst);
-    s.cv.wait(lock, [&] {
-      return gen_.load(std::memory_order_seq_cst) != seen || exit_.load(std::memory_order_acquire);
-    });
+    s.cv.wait(lock,
+              [&] { return gen_.load(std::memory_order_seq_cst) != seen || exit_.load(std::memory_order_acquire); });
     s.sleeping.store(false, std::memory_order_relaxed);
     last_work = std::chrono::steady_clock::now();
   }
@@ -463,9 +461,8 @@ void NumaJobDistributor::worker_thread(int numa_id) {
       if ((++spins & 255) != 0) continue;
       if (std::chrono::steady_clock::now() - last_work < std::chrono::milliseconds(50)) continue;
       std::unique_lock<std::mutex> lock(*mutexes[numa_id]);
-      cvs[numa_id]->wait(lock, [&] {
-        return status[numa_id]->load(std::memory_order_acquire) != ThreadStatus::WAITING;
-      });
+      cvs[numa_id]->wait(lock,
+                         [&] { return status[numa_id]->load(std::memory_order_acquire) != ThreadStatus::WAITING; });
     } else if (stat == ThreadStatus::EXIT) {
       return;
     }

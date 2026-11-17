@@ -37,8 +37,13 @@ def _replays_match_eager(qlen, replays=20):
 
     def task(layer):
         return moe.forward_task(
-            layer["batch"].data_ptr(), TOPK, layer["ids"].data_ptr(), layer["weights"].data_ptr(),
-            layer["inputs"].data_ptr(), layer["output"].data_ptr(), False,
+            layer["batch"].data_ptr(),
+            TOPK,
+            layer["ids"].data_ptr(),
+            layer["weights"].data_ptr(),
+            layer["inputs"].data_ptr(),
+            layer["output"].data_ptr(),
+            False,
         )
 
     def fill(seed):
@@ -101,15 +106,29 @@ def _staged_replays_match_eager(qlen, replays=10):
 
     def task(layer):
         return moe.forward_task(
-            layer["batch"].data_ptr(), TOPK, layer["ids"].data_ptr(), layer["weights"].data_ptr(),
-            layer["inputs"].data_ptr(), layer["output"].data_ptr(), False,
+            layer["batch"].data_ptr(),
+            TOPK,
+            layer["ids"].data_ptr(),
+            layer["weights"].data_ptr(),
+            layer["inputs"].data_ptr(),
+            layer["output"].data_ptr(),
+            False,
         )
 
     def stage(stream, layer, bell, bell_value):
         ext.stage_moe_inputs(
-            stream.cuda_stream, layer["hidden"].data_ptr(), layer["hidden"].numel() * 2,
-            layer["device_ids"].data_ptr(), True, layer["device_weights"].data_ptr(), qlen * TOPK,
-            layer["inputs"].data_ptr(), layer["ids"].data_ptr(), layer["weights"].data_ptr(), bell, bell_value,
+            stream.cuda_stream,
+            layer["hidden"].data_ptr(),
+            layer["hidden"].numel() * 2,
+            layer["device_ids"].data_ptr(),
+            True,
+            layer["device_weights"].data_ptr(),
+            qlen * TOPK,
+            layer["inputs"].data_ptr(),
+            layer["ids"].data_ptr(),
+            layer["weights"].data_ptr(),
+            bell,
+            bell_value,
         )
 
     def fill(seed):
@@ -177,7 +196,11 @@ def _run_worker(**env):
     worker_env = dict(os.environ)
     worker_env.update(env)
     result = subprocess.run(
-        [sys.executable, __file__], env=worker_env, cwd=os.path.dirname(__file__), capture_output=True, text=True,
+        [sys.executable, __file__],
+        env=worker_env,
+        cwd=os.path.dirname(__file__),
+        capture_output=True,
+        text=True,
         timeout=600,
     )
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]

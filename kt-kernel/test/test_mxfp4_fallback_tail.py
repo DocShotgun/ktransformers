@@ -22,13 +22,10 @@ def _run(backend, qlen, weight_layout, hidden=256, intermediate=512, seed=None):
     torch.manual_seed(qlen * 7 + int(weight_layout) if seed is None else seed)
     experts = 2
     packed = [
-        torch.randint(0, 256, (experts, intermediate, hidden // 2), dtype=torch.uint8).contiguous()
-        for _ in range(3)
+        torch.randint(0, 256, (experts, intermediate, hidden // 2), dtype=torch.uint8).contiguous() for _ in range(3)
     ]
     scales = [
-        (2.0 ** torch.randint(-6, -3, (experts, intermediate, hidden // 32)))
-        .to(torch.bfloat16)
-        .contiguous()
+        (2.0 ** torch.randint(-6, -3, (experts, intermediate, hidden // 32))).to(torch.bfloat16).contiguous()
         for _ in range(3)
     ]
     pool = ext.CPUInfer(16)
@@ -85,9 +82,7 @@ def test_mxfp4_fallback_tile_tails(tmp_path, qlen, weight_layout):
 
     # Kernel selection is cached per process, so each backend gets its own.
     results = {
-        backend: amx_backend.run_backend(
-            __name__, backend, tmp_path, qlen=qlen, weight_layout=weight_layout
-        )
+        backend: amx_backend.run_backend(__name__, backend, tmp_path, qlen=qlen, weight_layout=weight_layout)
         for backend in ("0", "1")
     }
     expected = results["1"]

@@ -483,9 +483,9 @@ struct GemmKernel224FP8 {
             for (int chunk = 0; chunk < k_len / K_STEP; ++chunk) {
               ggml_bf16_t* destination = tail + static_cast<size_t>(chunk) * M_STEP * K_STEP;
               for (int row = 0; row < M_STEP; ++row) {
-                const __m512i value =
-                    row < rows ? _mm512_loadu_si512(a_base + static_cast<size_t>(row) * k + chunk * K_STEP)
-                               : _mm512_setzero_si512();
+                const __m512i value = row < rows
+                                          ? _mm512_loadu_si512(a_base + static_cast<size_t>(row) * k + chunk * K_STEP)
+                                          : _mm512_setzero_si512();
                 _mm512_store_si512(destination + row * K_STEP, value);
               }
             }
@@ -1115,8 +1115,8 @@ struct GemmKernel224FP8PerChannel {
     // Per-worker scratch is bounded by 32 BF16 output channels times K.
     thread_local std::vector<uint8_t> packed_storage;
     packed_storage.resize(static_cast<size_t>(k) * 64 + 63);
-    auto* packed = reinterpret_cast<uint32_t*>((reinterpret_cast<uintptr_t>(packed_storage.data()) + 63) &
-                                               ~uintptr_t(63));
+    auto* packed =
+        reinterpret_cast<uint32_t*>((reinterpret_cast<uintptr_t>(packed_storage.data()) + 63) & ~uintptr_t(63));
     for (int n_pos = n_start; n_pos < n_end; n_pos += N_STEP) {
       GemmKernel224FP8::pack_fp8_amx_b(n, k, n_pos, bb, packed);
       for (int m_pos = 0; m_pos < m; m_pos += M_STEP) {

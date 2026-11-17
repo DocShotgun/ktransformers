@@ -1241,7 +1241,7 @@ def base_key_variants(base_key: str) -> list[str]:
     core = base_key
     for strip in _BASE_KEY_STRIP_PREFIXES:
         if base_key.startswith(strip):
-            core = base_key[len(strip):]
+            core = base_key[len(strip) :]
             break
     if core not in variants:
         variants.append(core)
@@ -1456,10 +1456,7 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 )
 
         loaded_expert_count = expert_count - sum(skipped_experts)
-        print(
-            f"[MXFP4SafeTensorLoader] Loaded {loaded_expert_count}/{expert_count} "
-            f"CPU experts from {prefix}"
-        )
+        print(f"[MXFP4SafeTensorLoader] Loaded {loaded_expert_count}/{expert_count} " f"CPU experts from {prefix}")
         return {
             "gate": gate_weights,
             "up": up_weights,
@@ -1550,10 +1547,7 @@ class NVFP4SafeTensorLoader(SafeTensorLoader):
                     gdst[exp_id] = float(gs.to(torch.float32).reshape(()))
 
         loaded_expert_count = expert_count - sum(skipped_experts)
-        print(
-            f"[NVFP4SafeTensorLoader] Loaded {loaded_expert_count}/{expert_count} "
-            f"CPU experts from {prefix}"
-        )
+        print(f"[NVFP4SafeTensorLoader] Loaded {loaded_expert_count}/{expert_count} " f"CPU experts from {prefix}")
         result = {
             "gate": gate_weights,
             "up": up_weights,
@@ -1620,10 +1614,7 @@ class MXFP8SafeTensorLoader(SafeTensorLoader):
                 dst[exp_id] = _load_uint8(self, layout.block_scale_key(exp_id, proj_idx), device)
 
         loaded_expert_count = expert_count - sum(skipped_experts)
-        print(
-            f"[MXFP8SafeTensorLoader] Loaded {loaded_expert_count}/{expert_count} "
-            f"CPU experts from {prefix}"
-        )
+        print(f"[MXFP8SafeTensorLoader] Loaded {loaded_expert_count}/{expert_count} " f"CPU experts from {prefix}")
         return {
             "gate": gate_weights,
             "up": up_weights,

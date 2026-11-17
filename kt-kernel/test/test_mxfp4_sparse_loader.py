@@ -31,8 +31,7 @@ def make_fake(prefix, proj_names, scale_suffix, expert_count=3):
 
     def has_tensor(key):
         return any(
-            key == f"{prefix}.{expert}.{gate}.weight"
-            or key == f"{prefix}.{expert}.{gate}.{scale_suffix}"
+            key == f"{prefix}.{expert}.{gate}.weight" or key == f"{prefix}.{expert}.{gate}.{scale_suffix}"
             for expert in range(expert_count)
         )
 
@@ -52,9 +51,7 @@ def test_mxfp4_loader_skips_gpu_resident_experts(variant):
     prefix, proj_names, scale_suffix = NAMINGS[variant]
     loader, loaded_keys = make_fake(prefix, proj_names, scale_suffix)
 
-    weights = loader.load_experts(
-        "model.layers.1", gpu_experts_mask=torch.tensor([True, False, True])
-    )
+    weights = loader.load_experts("model.layers.1", gpu_experts_mask=torch.tensor([True, False, True]))
 
     for projection in (
         "gate",
@@ -68,15 +65,11 @@ def test_mxfp4_loader_skips_gpu_resident_experts(variant):
         assert weights[projection][1] is not None
         assert weights[projection][2] is None
     # Only expert 1's weights are read (scale reads include resolver dtype probes).
-    assert set(k for k in loaded_keys if k.endswith(".weight")) == {
-        f"{prefix}.1.{proj}.weight" for proj in proj_names
-    }
+    assert set(k for k in loaded_keys if k.endswith(".weight")) == {f"{prefix}.1.{proj}.weight" for proj in proj_names}
 
     # ue8m0 127 encodes 2^(127-127) = 1.0; lossless in bf16.
     assert weights["gate_scale"][1].dtype == torch.bfloat16
-    torch.testing.assert_close(
-        weights["gate_scale"][1], torch.full((2, 1), 1.0, dtype=torch.bfloat16)
-    )
+    torch.testing.assert_close(weights["gate_scale"][1], torch.full((2, 1), 1.0, dtype=torch.bfloat16))
 
 
 @pytest.mark.parametrize("variant", sorted(NAMINGS))
@@ -95,9 +88,7 @@ def test_mxfp4_gpu_mask_length_mismatch():
     loader, _ = make_fake(prefix, proj_names, scale_suffix)
 
     with pytest.raises(ValueError, match="gpu_experts_mask length"):
-        loader.load_experts(
-            "model.layers.1", gpu_experts_mask=torch.ones(5, dtype=torch.bool)
-        )
+        loader.load_experts("model.layers.1", gpu_experts_mask=torch.ones(5, dtype=torch.bool))
 
 
 def test_mxfp4_unresolved_layout_lists_probed_prefixes():

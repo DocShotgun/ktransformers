@@ -9,12 +9,8 @@ import amx_backend
 
 
 def unpack_mxfp4(packed, scales):
-    values = torch.tensor(
-        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
-    )
-    unscaled = torch.stack(
-        (values[(packed & 15).long()], values[(packed >> 4).long()]), dim=-1
-    ).flatten(-2)
+    values = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6])
+    unscaled = torch.stack((values[(packed & 15).long()], values[(packed >> 4).long()]), dim=-1).flatten(-2)
     return unscaled * scales.float().repeat_interleave(32, -1)
 
 
@@ -26,13 +22,10 @@ def _run(backend, expert_counts, weight_layout):
     torch.manual_seed(13)
     experts, hidden, intermediate, qlen = 2, 1024, 1024, 64
     packed = [
-        torch.randint(0, 256, (experts, intermediate, hidden // 2), dtype=torch.uint8).contiguous()
-        for _ in range(3)
+        torch.randint(0, 256, (experts, intermediate, hidden // 2), dtype=torch.uint8).contiguous() for _ in range(3)
     ]
     scales = [
-        (2.0 ** torch.randint(-6, -3, (experts, intermediate, hidden // 32)))
-        .to(torch.bfloat16)
-        .contiguous()
+        (2.0 ** torch.randint(-6, -3, (experts, intermediate, hidden // 32))).to(torch.bfloat16).contiguous()
         for _ in range(3)
     ]
     pool, config, moe = amx_backend.build_moe(

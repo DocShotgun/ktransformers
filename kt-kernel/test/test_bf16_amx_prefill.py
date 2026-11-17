@@ -14,21 +14,9 @@ def _run(backend, expert_counts):
 
     torch.manual_seed(13)
     experts, hidden, intermediate, qlen = 2, 1024, 1024, 64
-    gate = (
-        (torch.randn(experts, intermediate, hidden, dtype=torch.float32) / 100.0)
-        .to(torch.bfloat16)
-        .contiguous()
-    )
-    up = (
-        (torch.randn(experts, intermediate, hidden, dtype=torch.float32) / 100.0)
-        .to(torch.bfloat16)
-        .contiguous()
-    )
-    down = (
-        (torch.randn(experts, hidden, intermediate, dtype=torch.float32) / 100.0)
-        .to(torch.bfloat16)
-        .contiguous()
-    )
+    gate = (torch.randn(experts, intermediate, hidden, dtype=torch.float32) / 100.0).to(torch.bfloat16).contiguous()
+    up = (torch.randn(experts, intermediate, hidden, dtype=torch.float32) / 100.0).to(torch.bfloat16).contiguous()
+    down = (torch.randn(experts, hidden, intermediate, dtype=torch.float32) / 100.0).to(torch.bfloat16).contiguous()
     pool, _, moe = amx_backend.build_moe("AMXBF16_MOE", experts, hidden, intermediate, qlen, (gate, up, down))
 
     ids, weights = amx_backend.two_expert_routes(expert_counts)

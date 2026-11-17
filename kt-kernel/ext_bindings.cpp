@@ -728,10 +728,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   m.def(
       "merge_moe_output",
       [](intptr_t stream, intptr_t gpu, intptr_t host, intptr_t out, int64_t elems, float scale, bool apply_scale) {
-        const cudaError_t err = kt_merge_moe_output(reinterpret_cast<cudaStream_t>(stream),
-                                                    reinterpret_cast<const void*>(gpu),
-                                                    reinterpret_cast<const void*>(host), reinterpret_cast<void*>(out),
-                                                    elems, scale, apply_scale);
+        const cudaError_t err = kt_merge_moe_output(
+            reinterpret_cast<cudaStream_t>(stream), reinterpret_cast<const void*>(gpu),
+            reinterpret_cast<const void*>(host), reinterpret_cast<void*>(out), elems, scale, apply_scale);
         if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
       },
       "stream"_a, "gpu"_a, "host"_a, "out"_a, "elems"_a, "scale"_a, "apply_scale"_a,

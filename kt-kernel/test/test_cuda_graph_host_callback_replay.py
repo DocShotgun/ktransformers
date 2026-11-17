@@ -59,8 +59,13 @@ def test_graph_replays_recompute_moe_on_current_inputs():
 
     def task():
         return moe.forward_task(
-            batch_size.data_ptr(), topk, ids.data_ptr(), weights.data_ptr(),
-            inputs.data_ptr(), output.data_ptr(), False,
+            batch_size.data_ptr(),
+            topk,
+            ids.data_ptr(),
+            weights.data_ptr(),
+            inputs.data_ptr(),
+            output.data_ptr(),
+            False,
         )
 
     def fill(seed):

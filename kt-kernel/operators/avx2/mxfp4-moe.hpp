@@ -673,9 +673,7 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
            config_.quant_config.group_size);
   }
 
-  bool should_allocate_expert_weights(int expert_idx) const {
-    return !config_.should_skip_expert(expert_idx);
-  }
+  bool should_allocate_expert_weights(int expert_idx) const { return !config_.should_skip_expert(expert_idx); }
 
   size_t buffer_a_required_size_impl(size_t m, size_t k) const {
     return T::BufferA::required_size(m, k, config_.quant_config.group_size);

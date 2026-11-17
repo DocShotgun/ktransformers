@@ -97,8 +97,8 @@ void TaskQueue::sync(size_t allow_n_pending) {
   // critical path. The spin is unconditional; only the duration is bounded.
   if (pending.load(std::memory_order_acquire) > allow_n_pending) {
     auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(kSyncSpinUs);
-    while (pending.load(std::memory_order_acquire) > allow_n_pending
-           && !done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < spin_until) {
+    while (pending.load(std::memory_order_acquire) > allow_n_pending && !done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < spin_until) {
       KT_CPU_PAUSE();
     }
   }

@@ -344,9 +344,7 @@ class KExpertsCPUBuffer:
             cls._views.clear()
         arena = {
             "max_rows": rows,
-            "output": [
-                torch.empty((rows, hidden_size), device=device, dtype=dtype) for _ in range(cls.buffer_depth)
-            ],
+            "output": [torch.empty((rows, hidden_size), device=device, dtype=dtype) for _ in range(cls.buffer_depth)],
         }
         cls._device_arenas[key] = arena
         return arena

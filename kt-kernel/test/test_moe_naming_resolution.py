@@ -91,9 +91,7 @@ def test_mxfp4_naming_variants(variant, prefix, proj_names, block_suffix):
     assert layout.global_scale_key(1, 0) is None
 
 
-@pytest.mark.parametrize(
-    "global_suffix", ("weight_scale_2", "scaling_factor", "scale_2")
-)
+@pytest.mark.parametrize("global_suffix", ("weight_scale_2", "scaling_factor", "scale_2"))
 def test_nvfp4_global_scale_aliases(global_suffix):
     loader = FakeLoader(
         add_experts(
@@ -108,9 +106,7 @@ def test_nvfp4_global_scale_aliases(global_suffix):
     layout = resolve_experts_layout(loader, "model.layers.3")
     assert layout.family == "nvfp4"
     assert layout.global_scale_suffix == global_suffix
-    assert layout.global_scale_key(0, 1) == (
-        f"model.layers.3.mlp.experts.0.up_proj.{global_suffix}"
-    )
+    assert layout.global_scale_key(0, 1) == (f"model.layers.3.mlp.experts.0.up_proj.{global_suffix}")
 
 
 @pytest.mark.parametrize(

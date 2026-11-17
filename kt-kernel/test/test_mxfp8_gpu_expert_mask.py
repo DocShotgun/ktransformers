@@ -66,7 +66,13 @@ def _run(backend):
         output = torch.zeros(qlen, HIDDEN, dtype=torch.bfloat16)
         pool.submit(
             moe.forward_task(
-                batch_size.data_ptr(), TOPK, ids.data_ptr(), weights.data_ptr(), inputs.data_ptr(), output.data_ptr(), False
+                batch_size.data_ptr(),
+                TOPK,
+                ids.data_ptr(),
+                weights.data_ptr(),
+                inputs.data_ptr(),
+                output.data_ptr(),
+                False,
             )
         )
         pool.sync()

@@ -24,8 +24,8 @@ __global__ void stage_inputs_kernel(const uint4* hidden, uint4* host_hidden, int
   const int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   for (int64_t i = tid; i < hidden_vecs; i += stride) host_hidden[i] = hidden[i];
   for (int64_t i = tid; i < routes; i += stride) {
-    host_ids[i] = ids_int32 ? static_cast<int64_t>(static_cast<const int32_t*>(ids)[i])
-                            : static_cast<const int64_t*>(ids)[i];
+    host_ids[i] =
+        ids_int32 ? static_cast<int64_t>(static_cast<const int32_t*>(ids)[i]) : static_cast<const int64_t*>(ids)[i];
     host_weights[i] = weights[i];
   }
   // Make the stores visible to the host before anything later in the stream

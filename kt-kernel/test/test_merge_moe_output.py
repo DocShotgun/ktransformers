@@ -25,8 +25,13 @@ def _reference(gpu, host, scale):
 
 def _merge(stream, gpu, host, out, scale):
     ext.merge_moe_output(
-        stream.cuda_stream, gpu.data_ptr(), host.data_ptr(), out.data_ptr(), gpu.numel(),
-        1.0 if scale is None else scale, scale is not None,
+        stream.cuda_stream,
+        gpu.data_ptr(),
+        host.data_ptr(),
+        out.data_ptr(),
+        gpu.numel(),
+        1.0 if scale is None else scale,
+        scale is not None,
     )
 
 
@@ -138,8 +143,13 @@ def test_merge_reads_the_cpu_forward_of_each_replay():
         references = []
         for layer in per_layer:
             task = moe.forward_task(
-                batch.data_ptr(), topk, layer["ids"].data_ptr(), layer["weights"].data_ptr(),
-                layer["inputs"].data_ptr(), output.data_ptr(), False,
+                batch.data_ptr(),
+                topk,
+                layer["ids"].data_ptr(),
+                layer["weights"].data_ptr(),
+                layer["inputs"].data_ptr(),
+                output.data_ptr(),
+                False,
             )
             pool.submit_with_cuda_stream_doorbell(stream.cuda_stream, task)
             pool.sync_with_cuda_stream(stream.cuda_stream, 0)

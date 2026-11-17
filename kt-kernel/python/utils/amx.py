@@ -980,7 +980,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 )
             if nvfp4_separate_globals:
                 if backend_cls is not AMXFP4_KGroup_MOE:
-                    raise RuntimeError("NVFP4 scales were loaded unfolded for AMX FP4, but another backend was selected")
+                    raise RuntimeError(
+                        "NVFP4 scales were loaded unfolded for AMX FP4, but another backend was selected"
+                    )
                 # Indexed by logical expert like the scale pointers; GPU experts load none.
                 moe_config.gate_global_scales = [1.0 if g is None else g for g in weights["gate_global"]]
                 moe_config.up_global_scales = [1.0 if g is None else g for g in weights["up_global"]]

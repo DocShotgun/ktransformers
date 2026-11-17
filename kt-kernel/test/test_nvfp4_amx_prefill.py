@@ -17,19 +17,13 @@ import amx_backend
 
 
 def unpack_nvfp4(packed, scales):
-    values = torch.tensor(
-        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
-    )
-    unscaled = torch.stack(
-        (values[(packed & 15).long()], values[(packed >> 4).long()]), dim=-1
-    ).flatten(-2)
+    values = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6])
+    unscaled = torch.stack((values[(packed & 15).long()], values[(packed >> 4).long()]), dim=-1).flatten(-2)
     return unscaled * scales.float().repeat_interleave(16, -1)
 
 
 def make_nvfp4_rows(experts, rows, cols, pow2_scales=False):
-    packed = torch.randint(
-        0, 256, (experts, rows, cols // 2), dtype=torch.uint8
-    ).contiguous()
+    packed = torch.randint(0, 256, (experts, rows, cols // 2), dtype=torch.uint8).contiguous()
     # Real e4m3 block scales (exact in bf16) and non-power-of-two globals, like
     # GLM-5.3's. All-power-of-two block scales must not select the MXFP4 (E8)
     # layout, whose kernels assume one scale per 32 K; 8..128 keeps the outputs
@@ -138,9 +132,7 @@ def _check(fallback, reference, amx):
 # hidden 8192 > K_BLOCK (7168): one row's scales (k / 16 = 512 groups) span
 # more than a K block.
 @pytest.mark.parametrize("hidden,intermediate", [(1024, 1024), (1024, 1152), (8192, 256)])
-def test_nvfp4_amx_prefill_matches_avx512(
-    tmp_path, expert_counts, weight_layout, hidden, intermediate
-):
+def test_nvfp4_amx_prefill_matches_avx512(tmp_path, expert_counts, weight_layout, hidden, intermediate):
     amx_backend.require_amx("AMXFP4_KGroup_MOE")
     (fallback, reference), (amx, _) = amx_backend.run_both(
         __name__,
@@ -154,9 +146,7 @@ def test_nvfp4_amx_prefill_matches_avx512(
 
     if weight_layout == "1":
         for key in ("prefill", "decode", "small_prefill"):
-            torch.testing.assert_close(
-                amx[key], amx[f"row_{key}"], atol=2e-3, rtol=5e-3
-            )
+            torch.testing.assert_close(amx[key], amx[f"row_{key}"], atol=2e-3, rtol=5e-3)
 
 
 @pytest.mark.parametrize("weight_layout", ["0", "1"])

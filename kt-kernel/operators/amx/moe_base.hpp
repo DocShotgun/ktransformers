@@ -88,7 +88,7 @@ class AMX_MOE_BASE {
   std::unique_ptr<PaddedCounter[]> decode_expert_ready_;  // [num_experts_per_tok]
   std::unique_ptr<PaddedCounter[]> decode_block_done_;    // [decode_block_capacity_]
   int decode_block_capacity_ = 0;
-  std::unique_ptr<PaddedCounter[]> decode_pair_done_;     // [decode_pair_capacity_], per (expert, gate/up range)
+  std::unique_ptr<PaddedCounter[]> decode_pair_done_;  // [decode_pair_capacity_], per (expert, gate/up range)
   int decode_pair_capacity_ = 0;
   std::vector<const ggml_bf16_t*> decode_sources_;
   std::vector<float> decode_route_weights_;
@@ -905,8 +905,7 @@ class AMX_MOE_BASE {
           }
           derived()->do_down_gemm(expert_idx, d, nth_down, qlen);
           down_bc_[expert_idx]->to_mat(qlen, m_local_down_output_ptr_[expert_idx], d, nth_down);
-          if (sum_in_job &&
-              decode_block_done_[d].v.fetch_add(1, std::memory_order_acq_rel) + 1 == activated_expert) {
+          if (sum_in_job && decode_block_done_[d].v.fetch_add(1, std::memory_order_acq_rel) + 1 == activated_expert) {
             auto [n_start, n_end] = T::split_range_n(hidden, d, nth_down);
             sum_decode_range(n_start, n_end, out);
           }

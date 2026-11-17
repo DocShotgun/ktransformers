@@ -27,9 +27,18 @@ def _host_buffers(rows):
 
 def _stage(stream, hidden, ids, weights, host, bell=None, bell_value=0):
     ext.stage_moe_inputs(
-        stream.cuda_stream, hidden.data_ptr(), hidden.numel() * 2, ids.data_ptr(), ids.dtype == torch.int32,
-        weights.data_ptr(), ids.numel(), host[0].data_ptr(), host[1].data_ptr(), host[2].data_ptr(),
-        0 if bell is None else bell.data_ptr(), bell_value,
+        stream.cuda_stream,
+        hidden.data_ptr(),
+        hidden.numel() * 2,
+        ids.data_ptr(),
+        ids.dtype == torch.int32,
+        weights.data_ptr(),
+        ids.numel(),
+        host[0].data_ptr(),
+        host[1].data_ptr(),
+        host[2].data_ptr(),
+        0 if bell is None else bell.data_ptr(),
+        bell_value,
     )
 
 
@@ -102,8 +111,16 @@ def test_stage_rings_its_doorbell_after_every_store():
     for value in (7, 8, 9):
         bell.zero_()
         host[0].zero_(), host[1].zero_(), host[2].zero_()
-        _ring_and_check(stream, hidden, ids, weights, host, bell, value,
-                        lambda: _stage(stream, hidden, ids, weights, host, bell, value))
+        _ring_and_check(
+            stream,
+            hidden,
+            ids,
+            weights,
+            host,
+            bell,
+            value,
+            lambda: _stage(stream, hidden, ids, weights, host, bell, value),
+        )
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):

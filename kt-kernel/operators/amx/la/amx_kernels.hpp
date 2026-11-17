@@ -3681,8 +3681,8 @@ struct GemmKernel224Int4SmallKGroup {
     if (packed_storage.size() < packed_bytes) {
       packed_storage.assign(packed_bytes, 0);
     }
-    auto* packed = reinterpret_cast<uint32_t*>((reinterpret_cast<uintptr_t>(packed_storage.data()) + 63) &
-                                               ~uintptr_t(63));
+    auto* packed =
+        reinterpret_cast<uint32_t*>((reinterpret_cast<uintptr_t>(packed_storage.data()) + 63) & ~uintptr_t(63));
     alignas(64) int8_t a_scratch[AMX_M_STEP * AMX_TILE_K_BYTES];
     alignas(64) int32_t partial[AMX_M_STEP][N_STEP];
     alignas(64) float acc[AMX_M_STEP][N_STEP];
@@ -3754,9 +3754,8 @@ struct GemmKernel224Int4SmallKGroup {
   static inline void integer_mat_mat_kgroup_amx(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb,
                                                 BufferC* bc, int ith, int nth) {
     integer_mat_mat_kgroup_amx_impl(
-        m, n, k, ba, bb, bc, ith, nth, [bb, n, k](int n_begin, int k_begin) -> const uint8_t* {
-          return bb->get_submat(n, k, n_begin, k_begin);
-        });
+        m, n, k, ba, bb, bc, ith, nth,
+        [bb, n, k](int n_begin, int k_begin) -> const uint8_t* { return bb->get_submat(n, k, n_begin, k_begin); });
   }
 };
 
@@ -3962,10 +3961,9 @@ struct GemmKernel224Int4SmallKGroupBlocked : public GemmKernel224Int4SmallKGroup
                                                 BufferC* bc, int ith, int nth) {
     // Blocked-B row tiles are contiguous 64-K nibble blocks: 32-K chunks land
     // at half-block byte offsets inside get_kblock().
-    integer_mat_mat_kgroup_amx_impl(
-        m, n, k, ba, bb, bc, ith, nth, [bb](int n_begin, int k_begin) -> const uint8_t* {
-          return bb->get_kblock(n_begin, k_begin & ~63) + (k_begin & 63) / 2;
-        });
+    integer_mat_mat_kgroup_amx_impl(m, n, k, ba, bb, bc, ith, nth, [bb](int n_begin, int k_begin) -> const uint8_t* {
+      return bb->get_kblock(n_begin, k_begin & ~63) + (k_begin & 63) / 2;
+    });
   }
 };
 
@@ -3984,8 +3982,8 @@ inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
   // Prefill AMX tiles stage nibble x 16 int8 quads per 32-output-channel
   // block; KT_RAWINT4_PREFILL_AMX=0 forces the AVX512 matmat for A/B checks.
   static const bool amx_prefill = cached_env_flag("KT_RAWINT4_PREFILL_AMX");
-  if (amx_prefill && AMX_AVAILABLE && m >= 16 &&
-      n % GemmKernel224Int4SmallKGroup::N_STEP == 0 && k % GemmKernel224Int4SmallKGroup::K_STEP == 0) {
+  if (amx_prefill && AMX_AVAILABLE && m >= 16 && n % GemmKernel224Int4SmallKGroup::N_STEP == 0 &&
+      k % GemmKernel224Int4SmallKGroup::K_STEP == 0) {
     GemmKernel224Int4SmallKGroup::integer_mat_mat_kgroup_amx(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith,
                                                              nth);
     return;
@@ -4011,10 +4009,10 @@ inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
   // Prefill AMX tiles stage nibble x 16 int8 quads per 32-output-channel
   // block; KT_RAWINT4_PREFILL_AMX=0 forces the AVX512 matmat for A/B checks.
   static const bool amx_prefill = cached_env_flag("KT_RAWINT4_PREFILL_AMX");
-  if (amx_prefill && AMX_AVAILABLE && m >= 16 &&
-      n % GemmKernel224Int4SmallKGroupBlocked::N_STEP == 0 && k % GemmKernel224Int4SmallKGroupBlocked::K_STEP == 0) {
-    GemmKernel224Int4SmallKGroupBlocked::integer_mat_mat_kgroup_amx(m, n, k, k_group_size, ba.get(), bb.get(),
-                                                                    bc.get(), ith, nth);
+  if (amx_prefill && AMX_AVAILABLE && m >= 16 && n % GemmKernel224Int4SmallKGroupBlocked::N_STEP == 0 &&
+      k % GemmKernel224Int4SmallKGroupBlocked::K_STEP == 0) {
+    GemmKernel224Int4SmallKGroupBlocked::integer_mat_mat_kgroup_amx(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(),
+                                                                    ith, nth);
     return;
   }
 #endif

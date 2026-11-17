@@ -249,8 +249,7 @@ class CPUInfer {
            status != musaStreamCaptureStatusNone;
 #elif defined(KTRANSFORMERS_USE_MACA)
     mcStreamCaptureStatus status = mcStreamCaptureStatusNone;
-    return mcStreamIsCapturing((mcStream_t)user_stream, &status) == mcSuccess &&
-           status != mcStreamCaptureStatusNone;
+    return mcStreamIsCapturing((mcStream_t)user_stream, &status) == mcSuccess && status != mcStreamCaptureStatusNone;
 #else
     (void)user_stream;
     return false;  // Ascend ACL has no stream capture.
@@ -306,8 +305,8 @@ class CPUInfer {
     // this thread's mode around it.
     cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
     cudaThreadExchangeStreamCaptureMode(&mode);
-    const bool ok = cudaGetDriverEntryPointByVersion("cuStreamWriteValue32", &fn, 12000, cudaEnableDefault,
-                                                     &status) == cudaSuccess &&
+    const bool ok = cudaGetDriverEntryPointByVersion("cuStreamWriteValue32", &fn, 12000, cudaEnableDefault, &status) ==
+                        cudaSuccess &&
                     status == cudaDriverEntryPointSuccess && fn != nullptr &&
                     cudaHostAlloc(&host, 64, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess &&
                     cudaHostGetDevicePointer(&device, host, 0) == cudaSuccess;

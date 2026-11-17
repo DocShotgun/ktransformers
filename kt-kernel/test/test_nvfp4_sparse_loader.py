@@ -30,8 +30,22 @@ GLOBAL_SUFFIXES = ("weight_scale_2", "scaling_factor", "scale_2")
 
 PROJS_HF = ("gate_proj", "up_proj", "down_proj")
 FP4_VALUES = (
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
 )
 
 
@@ -48,31 +62,19 @@ def make_checkpoint(
     tensors = {}
     for i in range(expert_count):
         for proj in proj_names:
-            rows, cols = (
-                (intermediate, hidden)
-                if proj != down_name
-                else (hidden, intermediate)
-            )
+            rows, cols = (intermediate, hidden) if proj != down_name else (hidden, intermediate)
             pfx = f"{prefix}.{i}.{proj}"
-            tensors[f"{pfx}.weight"] = torch.randint(
-                0, 256, (rows, cols // 2), dtype=torch.uint8
-            )
-            tensors[f"{pfx}.{block_suffix}"] = (
-                torch.randn(rows, cols // 16).clamp(-4, 4).to(torch.float8_e4m3fn)
-            )
+            tensors[f"{pfx}.weight"] = torch.randint(0, 256, (rows, cols // 2), dtype=torch.uint8)
+            tensors[f"{pfx}.{block_suffix}"] = torch.randn(rows, cols // 16).clamp(-4, 4).to(torch.float8_e4m3fn)
             if global_suffix is not None:
-                tensors[f"{pfx}.{global_suffix}"] = torch.tensor(
-                    0.0123, dtype=torch.float32
-                )
+                tensors[f"{pfx}.{global_suffix}"] = torch.tensor(0.0123, dtype=torch.float32)
     save_file(tensors, str(tmp_path / "model.safetensors"))
     return tmp_path
 
 
 def unpack_fp4(packed, scales):
     values = torch.tensor(FP4_VALUES, dtype=torch.float64)
-    unscaled = torch.stack(
-        (values[(packed & 15).long()], values[(packed >> 4).long()]), dim=-1
-    ).flatten(-2)
+    unscaled = torch.stack((values[(packed & 15).long()], values[(packed >> 4).long()]), dim=-1).flatten(-2)
     return unscaled * scales
 
 
@@ -131,11 +133,10 @@ def test_nvfp4_fold_matches_fp64(tmp_path, naming, global_suffix):
     torch.manual_seed(3)
     activation = torch.randn(cols, dtype=torch.float64)
     reference = unpack_fp4(packed, scale_ref.repeat_interleave(16, -1)) @ activation
-    folded_out = unpack_fp4(
-        packed, folded.double().repeat_interleave(16, -1)
-    ) @ activation
+    folded_out = unpack_fp4(packed, folded.double().repeat_interleave(16, -1)) @ activation
     cosine = F.cosine_similarity(reference, folded_out, dim=0)
     assert cosine >= 0.99999
+
 
 @pytest.mark.parametrize("global_suffix", ("weight_scale_2", None))
 def test_nvfp4_unfolded_scales_are_exact(tmp_path, global_suffix):
