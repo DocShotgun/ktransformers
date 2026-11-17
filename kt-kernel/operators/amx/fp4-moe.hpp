@@ -25,6 +25,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "la/amx_bf16_prefill.hpp"
 #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
 #include "moe_base.hpp"
 
@@ -1419,12 +1420,10 @@ struct GemmKernel224MXFP4SmallKGroup {
   }
 #endif
 
-  // K and M extents of one blocking step of fp4_mat_mat_kgroup_amx. A K block
-  // of a 256-column task expands to 512 KB of BF16 weight tiles (512 to 2048
-  // measured within 2% on DSv4.1, MiMo and GLM-5.3), and an M chunk bounds the
-  // per-thread accumulator scratch to 512 KB.
+  // K extent of one blocking step of fp4_mat_mat_kgroup_amx. A K block of a
+  // 256-column task expands to 512 KB of BF16 weight tiles (512 to 2048 measured
+  // within 2% on DSv4.1, MiMo and GLM-5.3).
   static constexpr int AMX_K_BLOCK = 1024;
-  static constexpr int AMX_M_CHUNK = 512;
 
   // Expand the weights of the 32-column panel at n_pos, 32-K groups
   // [group_begin, group_end), into AMX VNNI tiles at `packed`.
@@ -1446,126 +1445,41 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   }
 
-  // AMX prefill GEMM for one task's columns [n_start, n_end): C = A x B with
-  // the FP4 scales folded into BF16 weight tiles.
-  //
-  // Blocking: for every K block the task's weight panels are expanded once,
-  // then each 32-row M block reads its activation slice in place and sweeps
-  // all panels with a 2x2 tile kernel, so neither operand is re-streamed per
-  // panel. Accumulators of earlier K blocks round-trip through FP32 scratch,
-  // which is exact: every output element adds its K steps in the same order
-  // as one pass over K, so results do not depend on the blocking.
-  //
-  // Output: with dst, rows go straight to the row-major BF16 matrix (stride n),
-  // rounded like BufferC::to_mat, and bc is not touched; otherwise the FP32
-  // tiles land in bc for to_mat.
+  // fp4_mat_mat_kgroup_amx's hooks for the shared AMX prefill driver
+  // (la/amx_bf16_prefill.hpp). The FP4 scales are folded into the BF16 weight
+  // tiles, so the tiles accumulate unscaled.
+  struct AmxPrefill {
+    static constexpr bool kScaledGroups = false;
+    // The zero stores cost 1-2% at 16-48 rows per expert, and the stale rows only
+    // feed discarded output rows (store_tiles copies `rows` rows).
+    static constexpr bool kZeroPadTail = false;
+    int m, n, k;
+    BufferA* ba;
+    BufferB* bb;
+    BufferC* bc;
+    ggml_bf16_t* dst;
+
+    int k_block() const { return std::min(k, AMX_K_BLOCK); }
+    void pack(int n_pos, int k_begin, int k_len, uint32_t* packed) const {
+      pack_fp4_amx_b(n, k, n_pos, bb, packed, k_begin / 32, (k_begin + k_len) / 32);
+    }
+    const ggml_bf16_t* a_rows(int m_pos, int kk) const { return ba->get_submat(m, k, m_pos, kk); }
+    int a_stride(int kk) const { return ba->k_block_stride(kk / K_BLOCK * K_BLOCK); }
+    // Prefill rows are read in place, so a short last block is always copied.
+    bool copy_tail() const { return true; }
+    void store_tiles(int m_pos, int n_pos, int rows, float (&block)[32][32]) const {
+      store_amx_result(m, n, m_pos, n_pos, rows, bc, dst, block);
+    }
+  };
+
+  // AMX prefill GEMM for one task's columns. With dst, rows go straight to the
+  // row-major BF16 matrix (stride n), rounded like BufferC::to_mat, and bc is not
+  // touched; otherwise the FP32 tiles land in bc for to_mat.
   static void fp4_mat_mat_kgroup_amx(int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith, int nth,
                                      ggml_bf16_t* dst = nullptr) {
     auto [n_start, n_end] = split_range_n(n, ith, nth, m);
     if (n_start >= n_end) return;
-    configure_bf16_tiles();
-
-    const int panels = (n_end - n_start) / 32;
-    const int k_block = std::min(k, AMX_K_BLOCK);
-    const auto align = [](auto* p) {
-      return reinterpret_cast<decltype(p)>((reinterpret_cast<uintptr_t>(p) + 63) & ~uintptr_t(63));
-    };
-    // Per-worker scratch: one K block of the task's weight panels, the
-    // accumulators of one M chunk (only when K spans several blocks), and the
-    // activation slice of a short last M block. No expanded copy of the model
-    // is retained in host RAM.
-    thread_local std::vector<uint8_t> packed_storage;
-    packed_storage.resize(static_cast<size_t>(panels) * k_block * 64 + 63);
-    uint32_t* packed = reinterpret_cast<uint32_t*>(align(packed_storage.data()));
-    thread_local std::vector<float> acc_storage;
-    thread_local std::vector<ggml_bf16_t> tail_storage;
-    alignas(64) float tile_out[32][32];
-
-    for (int chunk_begin = 0; chunk_begin < m; chunk_begin += AMX_M_CHUNK) {
-      const int chunk_end = std::min(m, chunk_begin + AMX_M_CHUNK);
-      float* acc = nullptr;
-      if (k > k_block) {
-        acc_storage.resize(static_cast<size_t>(chunk_end - chunk_begin + 31) / 32 * panels * 32 * 32 + 16);
-        acc = align(acc_storage.data());
-      }
-      for (int k_begin = 0; k_begin < k; k_begin += k_block) {
-        const int groups = std::min(k_block, k - k_begin) / 32;
-        const int group_begin = k_begin / 32;
-        const bool first = k_begin == 0;
-        const bool last = k_begin + groups * 32 >= k;
-        for (int panel = 0; panel < panels; ++panel) {
-          pack_fp4_amx_b(n, k, n_start + panel * 32, bb, packed + static_cast<size_t>(panel) * groups * 16 * 32,
-                         group_begin, group_begin + groups);
-        }
-        for (int m_pos = chunk_begin; m_pos < chunk_end; m_pos += 32) {
-          const int rows = std::min(32, m - m_pos);
-          // A short last block copies its rows as [group][32 rows][32 K], so
-          // each tile load reads 16 consecutive lines. Rows past `rows` keep
-          // stale values: they only feed output rows that are discarded, since
-          // each output row depends on its own activation row alone.
-          const ggml_bf16_t* tail = nullptr;
-          if (rows < 32) {
-            tail_storage.resize(static_cast<size_t>(32) * k_block + 32);
-            auto* copy = align(tail_storage.data());
-            for (int group = 0; group < groups; ++group) {
-              const int kk = (group_begin + group) * 32;
-              const ggml_bf16_t* source = ba->get_submat(m, k, m_pos, kk);
-              const size_t stride = ba->k_block_stride(kk / K_BLOCK * K_BLOCK);
-              ggml_bf16_t* destination = copy + static_cast<size_t>(group) * 32 * 32;
-              for (int row = 0; row < rows; ++row) {
-                _mm512_store_si512(destination + row * 32, _mm512_loadu_si512(source + row * stride));
-              }
-            }
-            tail = copy;
-          }
-          const int acc_block = (m_pos - chunk_begin) / 32;
-          for (int panel = 0; panel < panels; ++panel) {
-            const int n_pos = n_start + panel * 32;
-            float* acc_tile = acc ? acc + (static_cast<size_t>(acc_block) * panels + panel) * 32 * 32 : nullptr;
-            if (first) {
-              _tile_zero(4);
-              _tile_zero(5);
-              _tile_zero(6);
-              _tile_zero(7);
-            } else {
-              _tile_loadd(4, acc_tile, 32 * sizeof(float));
-              _tile_loadd(5, acc_tile + 16, 32 * sizeof(float));
-              _tile_loadd(6, acc_tile + 16 * 32, 32 * sizeof(float));
-              _tile_loadd(7, acc_tile + 16 * 32 + 16, 32 * sizeof(float));
-            }
-            const uint32_t* b = packed + static_cast<size_t>(panel) * groups * 16 * 32;
-            for (int group = 0; group < groups; ++group) {
-              const ggml_bf16_t* a;
-              int a_stride;
-              if (tail) {
-                a = tail + static_cast<size_t>(group) * 32 * 32;
-                a_stride = 32 * sizeof(ggml_bf16_t);
-              } else {
-                const int kk = (group_begin + group) * 32;
-                a = ba->get_submat(m, k, m_pos, kk);
-                a_stride = ba->k_block_stride(kk / K_BLOCK * K_BLOCK) * sizeof(ggml_bf16_t);
-              }
-              _tile_loadd(0, a, a_stride);
-              _tile_loadd(1, reinterpret_cast<const uint8_t*>(a) + 16 * a_stride, a_stride);
-              _tile_loadd(2, b + group * 16 * 32, 128);
-              _tile_loadd(3, b + group * 16 * 32 + 16, 128);
-              _tile_dpbf16ps(4, 0, 2);
-              _tile_dpbf16ps(5, 0, 3);
-              _tile_dpbf16ps(6, 1, 2);
-              _tile_dpbf16ps(7, 1, 3);
-            }
-            if (!last) {
-              _tile_stored(4, acc_tile, 32 * sizeof(float));
-              _tile_stored(5, acc_tile + 16, 32 * sizeof(float));
-              _tile_stored(6, acc_tile + 16 * 32, 32 * sizeof(float));
-              _tile_stored(7, acc_tile + 16 * 32 + 16, 32 * sizeof(float));
-              continue;
-            }
-            store_amx_result(m, n, m_pos, n_pos, rows, bc, dst, tile_out);
-          }
-        }
-      }
-    }
+    bf16_prefill::run(AmxPrefill{m, n, k, ba, bb, bc, dst}, m, k, n_start, n_end);
   }
 
   // Epilogue of fp4_mat_mat_kgroup_amx for the 32x32 block at (m_pos, n_pos)
