@@ -584,9 +584,7 @@ class AMXMoEWrapper(BaseMoEWrapper):
 class NativeMoEWrapper(BaseMoEWrapper):
     """Wrapper for native CPU/SYCL experts stored in compressed SafeTensor format."""
 
-    # Loader instances keyed by weight method. Every layer loads with the wrapper's
-    # own method, so a model holds one loader; there is no per-layer detection.
-    _native_loader_instances: dict = {}
+    _native_loader_instance = None
 
     def __init__(
         self,
@@ -704,10 +702,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
             swiglu_limit=swiglu_limit,
         )
 
-        loaders = NativeMoEWrapper._native_loader_instances
-        if loaders.get(method) is None:
-            loaders[method] = NativeMoEWrapper._create_loader(method, weight_path)
-        self.loader = loaders[method]
+        if NativeMoEWrapper._native_loader_instance is None:
+            NativeMoEWrapper._native_loader_instance = NativeMoEWrapper._create_loader(method, weight_path)
+        self.loader = NativeMoEWrapper._native_loader_instance
 
         self.gate_weights = None
         self.up_weights = None
@@ -737,33 +734,11 @@ class NativeMoEWrapper(BaseMoEWrapper):
         else:
             raise NotImplementedError(f"Unsupported method for NativeMoEWrapper: {method}")
 
-    def _get_loader(self, method: str = None):
-        """Return the loader instance for `method`, recreating it after a release."""
-        import time
-
-        method = method or self.method
-        loaders = NativeMoEWrapper._native_loader_instances
-        loader = loaders.get(method)
-        if loader is None:
-            t_recreate_start = time.time()
-            loader = NativeMoEWrapper._create_loader(method, self.weight_path)
-            loaders[method] = loader
-            t_recreate_elapsed = (time.time() - t_recreate_start) * 1000
-            logger.info(
-                "[KT] Recreated NativeMoEWrapper loader for layer %d (took %.1fms)",
-                self.layer_idx,
-                t_recreate_elapsed,
-            )
-        self.loader = loader
-        return loader
-
     @staticmethod
     def _release_loader(layer_idx: int = -1):
-        loaders = NativeMoEWrapper._native_loader_instances
-        if loaders:
-            for loader in loaders.values():
-                loader.close_all_handles()
-            loaders.clear()
+        if NativeMoEWrapper._native_loader_instance is not None:
+            NativeMoEWrapper._native_loader_instance.close_all_handles()
+            NativeMoEWrapper._native_loader_instance = None
             if layer_idx >= 0:
                 logger.info(
                     "[KT] Released NativeMoEWrapper loader after layer %d: " "safetensors mmap handles freed.",
@@ -788,7 +763,18 @@ class NativeMoEWrapper(BaseMoEWrapper):
     def load_weights(self, physical_to_logical_map_cpu: torch.Tensor):
         import time
 
-        loader = self._get_loader(self.method)
+        if NativeMoEWrapper._native_loader_instance is None:
+            t_recreate_start = time.time()
+            NativeMoEWrapper._native_loader_instance = NativeMoEWrapper._create_loader(self.method, self.weight_path)
+            self.loader = NativeMoEWrapper._native_loader_instance
+            t_recreate_elapsed = (time.time() - t_recreate_start) * 1000
+            logger.info(
+                "[KT] Recreated NativeMoEWrapper loader for layer %d (took %.1fms)",
+                self.layer_idx,
+                t_recreate_elapsed,
+            )
+        else:
+            self.loader = NativeMoEWrapper._native_loader_instance
 
         t0 = time.time()
         _candidates = [
@@ -797,12 +783,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
             f"model.language_model.layers.{self.layer_idx}",
         ]
         weights = None
-        # The loaders below iterate experts in checkpoint order, which is the
-        # *logical* order: TP_MOE::load_weights indexes the pointer arrays
-        # with expert_map(physical_to_logical_map, slot). gpu_experts_mask is
-        # indexed by physical slot, so translate it once here. With an
-        # identity map (the common case) this is a no-op; with EPLB placement
-        # it is what keeps the skipped slots and the loaded weights aligned.
+        # The loaders return experts in checkpoint (logical) order, which TP_MOE::load_weights
+        # indexes through physical_to_logical_map, while gpu_experts_mask is indexed by
+        # physical slot; translate the mask (a no-op under the identity map).
         gpu_logical_experts_mask = None
         if self.method in ("MXFP4", "NVFP4", "MXFP8") and self.num_gpu_experts:
             physical_gpu_experts = self.gpu_experts_mask.nonzero(as_tuple=False).flatten()
@@ -819,17 +802,15 @@ class NativeMoEWrapper(BaseMoEWrapper):
         for base_key in _candidates:
             try:
                 if self.method == "NVFP4":
-                    weights = loader.load_experts(
+                    weights = self.loader.load_experts(
                         base_key,
                         gpu_experts_mask=gpu_logical_experts_mask,
                         fold_global_scale=not nvfp4_separate_globals,
                     )
                 elif self.method in ("MXFP4", "MXFP8"):
-                    weights = loader.load_experts(
-                        base_key, gpu_experts_mask=gpu_logical_experts_mask
-                    )
+                    weights = self.loader.load_experts(base_key, gpu_experts_mask=gpu_logical_experts_mask)
                 else:
-                    weights = loader.load_experts(base_key)
+                    weights = self.loader.load_experts(base_key)
                 break
             except (ValueError, KeyError):
                 continue
