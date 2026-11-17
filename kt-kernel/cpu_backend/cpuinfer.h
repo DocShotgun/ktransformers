@@ -151,22 +151,15 @@ class CPUInfer {
   // or when the memory write is unavailable, it is submit_with_cuda_stream.
   void submit_with_cuda_stream_doorbell(intptr_t user_cuda_stream, std::pair<intptr_t, intptr_t> params) {
 #if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS)
-    if (stream_is_capturing(user_cuda_stream) && ensure_doorbell()) {
-      const uint32_t slot = doorbell_slot_count_.load(std::memory_order_relaxed);
-      if (slot < kDoorbellSlots) {
+    if (const uint32_t ring = claim_doorbell_slot(user_cuda_stream, params)) {
+      if (write_value_((CUstream)user_cuda_stream, doorbell_device_, ring, CU_STREAM_WRITE_VALUE_DEFAULT) ==
+          CUDA_SUCCESS) {
         auto* args = static_cast<HostCallbackArgs*>((void*)params.second);
-        args->cpuinfer = this;
-        args->captured = true;
-        doorbell_slots_[slot] = {(void (*)(void*))params.first, args};
-        doorbell_slot_count_.store(slot + 1, std::memory_order_release);
-        if (write_value_((CUstream)user_cuda_stream, doorbell_device_, slot + 1, CU_STREAM_WRITE_VALUE_DEFAULT) ==
-            CUDA_SUCCESS) {
-          keep_alive([args]() { args->release(args); });
-          return;
-        }
-        // The slot stays registered but is never rung; fall back to the host node.
-        doorbell_disabled_ = true;
+        keep_alive([args]() { args->release(args); });
+        return;
       }
+      // The slot stays registered but is never rung; fall back to the host node.
+      doorbell_disabled_ = true;
     }
 #endif
     submit_with_cuda_stream(user_cuda_stream, params);
@@ -179,17 +172,10 @@ class CPUInfer {
   // means the caller must submit the task itself. Same one-in-flight rule.
   std::pair<intptr_t, uint32_t> register_doorbell(intptr_t user_cuda_stream, std::pair<intptr_t, intptr_t> params) {
 #if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS)
-    if (stream_is_capturing(user_cuda_stream) && ensure_doorbell()) {
-      const uint32_t slot = doorbell_slot_count_.load(std::memory_order_relaxed);
-      if (slot < kDoorbellSlots) {
-        auto* args = static_cast<HostCallbackArgs*>((void*)params.second);
-        args->cpuinfer = this;
-        args->captured = true;
-        doorbell_slots_[slot] = {(void (*)(void*))params.first, args};
-        doorbell_slot_count_.store(slot + 1, std::memory_order_release);
-        keep_alive([args]() { args->release(args); });
-        return {static_cast<intptr_t>(doorbell_device_), slot + 1};
-      }
+    if (const uint32_t ring = claim_doorbell_slot(user_cuda_stream, params)) {
+      auto* args = static_cast<HostCallbackArgs*>((void*)params.second);
+      keep_alive([args]() { args->release(args); });
+      return {static_cast<intptr_t>(doorbell_device_), ring};
     }
 #endif
     (void)user_cuda_stream;
@@ -336,6 +322,21 @@ class CPUInfer {
     auto* bell = new (host) std::atomic<uint32_t>(0);
     doorbell_.store(bell, std::memory_order_release);
     return true;
+  }
+
+  // While the stream is being captured, registers params' task in the next doorbell slot
+  // and returns the value that rings it (slot + 1); 0 when no slot was taken. The caller
+  // takes ownership of the captured block once the slot will be rung.
+  uint32_t claim_doorbell_slot(intptr_t user_cuda_stream, std::pair<intptr_t, intptr_t> params) {
+    if (!stream_is_capturing(user_cuda_stream) || !ensure_doorbell()) return 0;
+    const uint32_t slot = doorbell_slot_count_.load(std::memory_order_relaxed);
+    if (slot >= kDoorbellSlots) return 0;
+    auto* args = static_cast<HostCallbackArgs*>((void*)params.second);
+    args->cpuinfer = this;
+    args->captured = true;
+    doorbell_slots_[slot] = {(void (*)(void*))params.first, args};
+    doorbell_slot_count_.store(slot + 1, std::memory_order_release);
+    return slot + 1;
   }
 
   using WriteValueFn = CUresult (*)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
