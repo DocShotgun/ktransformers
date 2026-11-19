@@ -226,6 +226,27 @@ class AMX_MOE_BASE {
     derived_const()->write_weights_to_buffer(std::forward<Args>(args)...);
   }
 
+  // First row of this prefill's scratch. Every layer on a node shares one arena, and GEMMs
+  // that read activations in place leave each gathered row cached by many cores, so
+  // rewriting those rows in the next layer makes every store wait for the copies to be
+  // invalidated (the input gather ran at 10-40 GB/s per node instead of about 100).
+  // Consecutive calls therefore take consecutive rows, wrapping at the end of the arena;
+  // a node's calls run on its NUMA job thread, which keeps the cursor. Past
+  // KT_PREFILL_SCRATCH_ROTATE_MB of gathered input per node (0 = never) the rows have left
+  // the caches anyway, and fresh rows would only add DRAM traffic.
+  size_t prefill_scratch_start() const {
+    static const size_t max_bytes =
+        (size_t)kt_env::integer("KT_PREFILL_SCRATCH_ROTATE_MB", 256, [](long long mb) { return mb >= 0; }) << 20;
+    static thread_local size_t cursor = 0;
+    size_t rows = 0;
+    for (int count : m_local_num_) rows += count;
+    if (rows * config_.hidden_size * sizeof(ggml_bf16_t) > max_bytes) return 0;
+    if (cursor + rows > (size_t)config_.num_experts_per_tok * config_.max_len) cursor = 0;
+    const size_t start = cursor;
+    cursor += rows;
+    return start;
+  }
+
   void forward_prefill(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
                        void* output) {
     auto pool = config_.pool->get_subpool(tp_part_idx);
@@ -258,7 +279,7 @@ class AMX_MOE_BASE {
       }
     }
 
-    size_t offset = 0;
+    size_t offset = prefill_scratch_start();
     void* gate_up_ba_pool_ptr = gate_up_ba_pool_;
     void* gate_bc_pool_ptr = gate_bc_pool_;
     void* up_bc_pool_ptr = up_bc_pool_;
