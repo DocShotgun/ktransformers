@@ -43,6 +43,7 @@ INFERENCE_METHODS = frozenset(
         "MXFP4",  # MXFP4 (E2M1 nibble + ue8m0 group scale, e.g. DeepSeek-V4-Flash routed experts)
         "NVFP4",  # NVFP4 (E2M1 nibble + e4m3 per-16 block scale x per-tensor global, ModelOpt)
         "MXFP8",  # MXFP8 (E4M3fn byte + ue8m0 group scale, e.g. MiniMax-M3-Preview)
+        "W4A16",  # int4 weights x BF16 activations (compressed-tensors pack-quantized)
         "LLAMAFILE",  # GGUF format
         "MOE_INT4",
         "MOE_INT8",  # General kernel
@@ -357,6 +358,7 @@ def _create_inference_wrapper(
         "MXFP4",
         "NVFP4",
         "MXFP8",
+        "W4A16",
     ]:
         backend_cls = NativeMoEWrapper
     elif method == "LLAMAFILE":

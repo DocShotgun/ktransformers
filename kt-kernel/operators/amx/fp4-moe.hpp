@@ -620,6 +620,12 @@ struct GemmKernel224MXFP4SmallKGroup {
       if (e4m3) release_scale_tail(3 * count);
     }
 
+    // One projection's scales as the loader hands them over (BF16 bits, row-major).
+    void load_scales(const ggml_bf16_t* source) {
+      load_scale_e8(source);
+      finalize_scale_nv();
+    }
+
     const uint8_t* get_scale_e8(int n_, int n_begin, int k_, int k_begin) const {
       (void)n_;
       (void)k_;
@@ -1807,6 +1813,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
 
   // With dst, a kernel that writes the BF16 output rows itself does so and the
   // call returns true; otherwise the FP32 result is in the expert's BufferC.
+  // The GEMM calls are unqualified so that argument-dependent lookup also finds the
+  // overloads of kernels declared after this class (int4-w4a16-moe.hpp).
   bool do_gate_up_gemm(bool do_up, int expert_idx, int ith, int nth, int qlen, ggml_bf16_t* dst = nullptr) {
     auto& group_size = config_.quant_config.group_size;
     int m = m_local_num_[expert_idx];
@@ -1815,10 +1823,9 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
 
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
-      return amx::mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth,
-                                 dst);
+      return mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth, dst);
     }
-    amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
+    vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
     return false;
   }
 
@@ -1827,11 +1834,11 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     int m = m_local_num_[expert_idx];
 
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
-      return amx::mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
-                                 down_bb_[expert_idx], down_bc_[expert_idx], ith, nth, dst);
+      return mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
+                            down_bb_[expert_idx], down_bc_[expert_idx], ith, nth, dst);
     }
-    amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
-                        down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
+    vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
+                   down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
     return false;
   }
 
@@ -1981,15 +1988,9 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
           if (config_.should_skip_expert(expert_idx)) return;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           size_t scale_elem_count = (config_.hidden_size * config_.intermediate_size) / config_.quant_config.group_size;
-          gate_bb_[expert_idx]->load_scale_e8(
-              (ggml_bf16_t*)config_.gate_scale + (logical_expert_id * scale_elem_count));
-          gate_bb_[expert_idx]->finalize_scale_nv();
-          up_bb_[expert_idx]->load_scale_e8(
-              (ggml_bf16_t*)config_.up_scale + (logical_expert_id * scale_elem_count));
-          up_bb_[expert_idx]->finalize_scale_nv();
-          down_bb_[expert_idx]->load_scale_e8(
-              (ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count));
-          down_bb_[expert_idx]->finalize_scale_nv();
+          gate_bb_[expert_idx]->load_scales((ggml_bf16_t*)config_.gate_scale + (logical_expert_id * scale_elem_count));
+          up_bb_[expert_idx]->load_scales((ggml_bf16_t*)config_.up_scale + (logical_expert_id * scale_elem_count));
+          down_bb_[expert_idx]->load_scales((ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count));
         },
         nullptr);
   }

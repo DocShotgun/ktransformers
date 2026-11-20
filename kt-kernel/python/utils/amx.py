@@ -28,6 +28,7 @@ AMXInt8_MOE = getattr(_moe_mod, "AMXInt8_MOE", None)
 AMXInt4_KGroup_MOE = getattr(_moe_mod, "AMXInt4_KGroup_MOE", None)
 AMXInt4_KGroupBlocked_MOE = getattr(_moe_mod, "AMXInt4_KGroupBlocked_MOE", None)
 AMXFP4_KGroup_MOE = getattr(_moe_mod, "AMXFP4_KGroup_MOE", None)
+AMXInt4W4A16_MOE = getattr(_moe_mod, "AMXInt4W4A16_MOE", None)
 AMXMXFP8_KGroup_MOE = getattr(_moe_mod, "AMXMXFP8_KGroup_MOE", None)
 AMXFP8_MOE = getattr(_moe_mod, "AMXFP8_MOE", None)
 AMXBF16_MOE = getattr(_moe_mod, "AMXBF16_MOE", None)
@@ -209,6 +210,37 @@ def _select_rawint4_backend(group_size: Optional[int] = None):
     if _HAS_AVX2_RAWINT4_SUPPORT:
         return AVX2RawInt4_MOE
     return None
+
+
+def _w4a16_checkpoint_format(weight_path: str) -> str:
+    """The int4 format that weight_path's config.json declares, checked against what W4A16 reads."""
+    import json
+
+    with open(os.path.join(weight_path, "config.json")) as f:
+        config = json.load(f)
+    quant = config.get("quantization_config") or config.get("text_config", {}).get("quantization_config")
+    if not quant:
+        raise ValueError(f"W4A16 needs a quantization_config in {weight_path}/config.json")
+    quant_method = quant.get("quant_method")
+    if quant_method != "compressed-tensors":
+        raise NotImplementedError(f"W4A16 does not read quant_method={quant_method!r} checkpoints yet")
+    if quant.get("format") != "pack-quantized":
+        raise NotImplementedError(
+            f"W4A16 reads compressed-tensors format 'pack-quantized', got {quant.get('format')!r}"
+        )
+    int4_groups = [
+        group["weights"]
+        for group in quant.get("config_groups", {}).values()
+        if group.get("weights") and group["weights"].get("num_bits") == 4 and group["weights"].get("type") == "int"
+    ]
+    if not int4_groups:
+        raise ValueError("W4A16: the checkpoint's compressed-tensors config has no int4 weight group")
+    for weights in int4_groups:
+        if not weights.get("symmetric", False):
+            raise NotImplementedError("W4A16 does not read asymmetric (zero-point) int4 checkpoints yet")
+        if weights.get("actorder") == "group":
+            raise NotImplementedError("W4A16 does not read actorder='group' (g_idx) checkpoints")
+    return quant_method
 
 
 def _select_mxfp4_backend():
@@ -629,6 +661,11 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 "AVX-VNNI-256 will be selected automatically when available on the current CPU.\n"
                 "Please recompile kt_kernel_ext with AVX512 or AVX2 enabled."
             )
+        if method == "W4A16" and AMXInt4W4A16_MOE is None:
+            raise RuntimeError(
+                "W4A16 backend not available. Required ISA: AMX + AVX512_BF16.\n"
+                "Please recompile kt_kernel_ext with AMX and AVX512_BF16 enabled."
+            )
         if method == "FP8" and not _HAS_FP8_SUPPORT and not _HAS_AVX2_FP8_SUPPORT:
             raise RuntimeError(
                 "FP8 backend not available. Required ISA:\n"
@@ -716,6 +753,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
     @staticmethod
     def _create_loader(method: str, weight_path: str):
         if method == "RAWINT4":
+            return CompressedSafeTensorLoader(weight_path)
+        elif method == "W4A16":
+            _w4a16_checkpoint_format(weight_path)
             return CompressedSafeTensorLoader(weight_path)
         elif method == "FP8":
             return FP8SafeTensorLoader(weight_path)
@@ -843,6 +883,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 raise ValueError("No CPU expert scales were loaded")
             if self.method == "RAWINT4":
                 assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for RAWINT4"
+            elif self.method == "W4A16":
+                assert scale_sample.dtype == torch.bfloat16, "Expected bf16 scales for W4A16"
             elif self.method == "FP8":
                 if self.gate_scales[0].dtype != torch.float32:
                     self.gate_scales = [t.to(torch.float32).contiguous() for t in weights["gate_scale"]]
@@ -943,6 +985,24 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 )
             retain_source_weights = backend_cls is AVX2RawInt4_MOE
             self.moe = backend_cls(moe_config)
+        elif self.method == "W4A16":
+            # Codes q + 8, two per byte with the low nibble first along K, and BF16 group scales.
+            group_size = self.hidden_size // scale_sample.shape[1]
+            weight_sample = next(t for t in self.gate_weights if t is not None)
+            down_scale_sample = next(t for t in self.down_scales if t is not None)
+            if weight_sample.dtype != torch.uint8 or 2 * weight_sample.numel() != (
+                self.hidden_size * self.moe_intermediate_size
+            ):
+                raise ValueError(
+                    f"W4A16 expects 4-bit expert weights; got {weight_sample.dtype} "
+                    f"{tuple(weight_sample.shape)} for a {self.moe_intermediate_size}x{self.hidden_size} projection"
+                )
+            if self.moe_intermediate_size // down_scale_sample.shape[1] != group_size:
+                raise ValueError("W4A16 needs one group size for gate/up and down")
+            moe_config.quant_config.bits = 4
+            moe_config.quant_config.group_size = group_size
+            moe_config.quant_config.zero_point = False
+            self.moe = AMXInt4W4A16_MOE(moe_config)
         elif self.method == "MXFP4":
             # MXFP4: E2M1 nibble-packed weights, ue8m0/bf16 per-32 group scale
             # (e.g. DeepSeek-V4-Flash routed experts)

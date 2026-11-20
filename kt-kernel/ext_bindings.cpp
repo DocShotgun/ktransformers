@@ -52,6 +52,7 @@ static const bool _is_plain_ = false;
 #include "operators/amx/fp4-moe.hpp"             // MXFP4 MoE: FP4 E2M1 weights × BF16 activations
 #include "operators/amx/fp8-moe.hpp"             // FP8 MoE requires AVX512 BF16 support, with fallback for AVX512F+BW
 #include "operators/amx/fp8-perchannel-moe.hpp"  // FP8 Per-Channel MoE for GLM-4.7-FP8
+#include "operators/amx/int4-w4a16-moe.hpp"      // INT4 weights x BF16 activations on the FP4 kernels
 #include "operators/amx/k2-moe.hpp"
 #include "operators/amx/la/amx_kernels.hpp"
 #include "operators/amx/moe.hpp"
@@ -1060,6 +1061,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   bind_moe_module<AMX_FP8_MOE_TP<amx::GemmKernel224FP8>>(moe_module, "AMXFP8_MOE");
   bind_moe_module<AMX_FP8_PERCHANNEL_MOE_TP<amx::GemmKernel224FP8PerChannel>>(moe_module, "AMXFP8PerChannel_MOE");
   bind_moe_module<AMX_FP4_MOE_TP<amx::GemmKernel224MXFP4SmallKGroup>>(moe_module, "AMXFP4_KGroup_MOE");
+#if defined(__AVX512BF16__) && defined(HAVE_AMX)
+  bind_moe_module<AMX_FP4_MOE_TP<amx::GemmKernel224Int4W4A16>>(moe_module, "AMXInt4W4A16_MOE");
+#endif
   bind_moe_module<AMX_MXFP8_MOE_TP<amx::GemmKernel224MXFP8SmallKGroup>>(moe_module, "AMXMXFP8_KGroup_MOE");
 #endif
 #if defined(__AVX512BF16__)
