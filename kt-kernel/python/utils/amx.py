@@ -1,17 +1,16 @@
 import gc
 import glob
 import logging
-import math
 import os
 import torch
 import ctypes
-import functools
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
 # Use relative imports for package structure
 from ..experts_base import BaseMoEWrapper
+from . import w4a16
 from .loader import (
     SafeTensorLoader,
     CompressedSafeTensorLoader,
@@ -212,65 +211,6 @@ def _select_rawint4_backend(group_size: Optional[int] = None):
     if _HAS_AVX2_RAWINT4_SUPPORT:
         return AVX2RawInt4_MOE
     return None
-
-
-def _w4a16_checkpoint_format(weight_path: str) -> str:
-    """The int4 format that weight_path's config.json declares, checked against what W4A16 reads."""
-    import json
-
-    with open(os.path.join(weight_path, "config.json")) as f:
-        config = json.load(f)
-    quant = config.get("quantization_config") or config.get("text_config", {}).get("quantization_config")
-    if not quant:
-        raise ValueError(f"W4A16 needs a quantization_config in {weight_path}/config.json")
-    quant_method = quant.get("quant_method")
-    if quant_method != "compressed-tensors":
-        raise NotImplementedError(f"W4A16 does not read quant_method={quant_method!r} checkpoints yet")
-    if quant.get("format") != "pack-quantized":
-        raise NotImplementedError(
-            f"W4A16 reads compressed-tensors format 'pack-quantized', got {quant.get('format')!r}"
-        )
-    int4_groups = [
-        group["weights"]
-        for group in quant.get("config_groups", {}).values()
-        if group.get("weights") and group["weights"].get("num_bits") == 4 and group["weights"].get("type") == "int"
-    ]
-    if not int4_groups:
-        raise ValueError("W4A16: the checkpoint's compressed-tensors config has no int4 weight group")
-    for weights in int4_groups:
-        if not weights.get("symmetric", False):
-            raise NotImplementedError("W4A16 does not read asymmetric (zero-point) int4 checkpoints yet")
-        if weights.get("actorder") == "group":
-            raise NotImplementedError("W4A16 does not read actorder='group' (g_idx) checkpoints")
-    return quant_method
-
-
-def _w4a16_regroup_scales(scales, group_size: int, k_per_part: int):
-    """(scales, group size) regrouped to gcd(group_size, k_per_part).
-
-    The NUMA parts split down's K into slices of k_per_part, and no group may span two parts.
-    Repeating each scale for its sub-groups leaves every weight's scale unchanged.
-    """
-    part_group_size = math.gcd(group_size, k_per_part)
-    if part_group_size % 32:
-        raise ValueError(
-            f"W4A16 needs groups of a multiple of 32 within each NUMA part; group {group_size} and "
-            f"{k_per_part} intermediate columns per part leave {part_group_size}"
-        )
-    if part_group_size == group_size:
-        return scales, group_size
-    repeat = group_size // part_group_size
-    return [None if s is None else s.repeat_interleave(repeat, dim=1).contiguous() for s in scales], part_group_size
-
-
-@functools.lru_cache(maxsize=None)
-def _log_w4a16_regroup(group_size: int, k_per_part: int, part_group_size: int) -> None:
-    logger.info(
-        "[KT] W4A16: group %d spans NUMA parts of %d columns; scales regrouped to %d",
-        group_size,
-        k_per_part,
-        part_group_size,
-    )
 
 
 def _select_mxfp4_backend():
@@ -787,8 +727,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
         if method == "RAWINT4":
             return CompressedSafeTensorLoader(weight_path)
         elif method == "W4A16":
-            _w4a16_checkpoint_format(weight_path)
-            return CompressedSafeTensorLoader(weight_path)
+            w4a16.check_checkpoint(weight_path)
+            return w4a16.W4A16SafeTensorLoader(weight_path)
         elif method == "FP8":
             return FP8SafeTensorLoader(weight_path)
         elif method == "FP8_PERCHANNEL":
@@ -859,7 +799,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         # indexes through physical_to_logical_map, while gpu_experts_mask is indexed by
         # physical slot; translate the mask (a no-op under the identity map).
         gpu_logical_experts_mask = None
-        if self.method in ("MXFP4", "NVFP4", "MXFP8") and self.num_gpu_experts:
+        if self.method in ("MXFP4", "NVFP4", "MXFP8", "W4A16") and self.num_gpu_experts:
             physical_gpu_experts = self.gpu_experts_mask.nonzero(as_tuple=False).flatten()
             gpu_logical_experts = physical_to_logical_map_cpu[physical_gpu_experts].to(torch.int64)
             if torch.any((gpu_logical_experts < 0) | (gpu_logical_experts >= self.num_experts)):
@@ -879,7 +819,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
                         gpu_experts_mask=gpu_logical_experts_mask,
                         fold_global_scale=not nvfp4_separate_globals,
                     )
-                elif self.method in ("MXFP4", "MXFP8"):
+                elif self.method in ("MXFP4", "MXFP8", "W4A16"):
                     weights = self.loader.load_experts(base_key, gpu_experts_mask=gpu_logical_experts_mask)
                 else:
                     weights = self.loader.load_experts(base_key)
@@ -916,18 +856,22 @@ class NativeMoEWrapper(BaseMoEWrapper):
             if self.method == "RAWINT4":
                 assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for RAWINT4"
             elif self.method == "W4A16":
-                assert scale_sample.dtype == torch.bfloat16, "Expected bf16 scales for W4A16"
-                group_size = self.hidden_size // scale_sample.shape[1]
-                down_scale_sample = next(t for t in self.down_scales if t is not None)
-                if self.moe_intermediate_size // down_scale_sample.shape[1] != group_size:
-                    raise ValueError("W4A16 needs one group size for gate/up and down")
+                # Groups may not span the NUMA parts of down's K: regroup scales and zeros.
+                k_of = {"gate": self.hidden_size, "up": self.hidden_size, "down": self.moe_intermediate_size}
+                group_sizes = {
+                    name: k_of[name] // next(t for t in weights[f"{name}_scale"] if t is not None).shape[1]
+                    for name in w4a16.PROJECTIONS
+                }
                 k_per_part = self.moe_intermediate_size // self._tp_parts
-                (self.gate_scales, part_group_size), (self.up_scales, _), (self.down_scales, _) = [
-                    _w4a16_regroup_scales(scales, group_size, k_per_part)
-                    for scales in (self.gate_scales, self.up_scales, self.down_scales)
-                ]
-                if part_group_size != group_size:
-                    _log_w4a16_regroup(group_size, k_per_part, part_group_size)
+                target = w4a16.part_group_size(group_sizes.values(), k_per_part)
+                if any(g != target for g in group_sizes.values()):
+                    w4a16.log_regroup(tuple(group_sizes.values()), k_per_part, target)
+                self.gate_scales, self.up_scales, self.down_scales = (
+                    w4a16.regroup(weights[f"{name}_scale"], group_sizes[name], target) for name in w4a16.PROJECTIONS
+                )
+                self.gate_zeros, self.up_zeros, self.down_zeros = (
+                    w4a16.regroup(weights[f"{name}_zero"], group_sizes[name], target) for name in w4a16.PROJECTIONS
+                )
             elif self.method == "FP8":
                 if self.gate_scales[0].dtype != torch.float32:
                     self.gate_scales = [t.to(torch.float32).contiguous() for t in weights["gate_scale"]]
@@ -1029,9 +973,14 @@ class NativeMoEWrapper(BaseMoEWrapper):
             retain_source_weights = backend_cls is AVX2RawInt4_MOE
             self.moe = backend_cls(moe_config)
         elif self.method == "W4A16":
-            # Codes q + 8, two per byte with the low nibble first along K, and BF16 group scales
-            # (regrouped above to fit the NUMA parts).
+            # Codes q + 8, two per byte with the low nibble first along K, BF16 group scales and
+            # zero codes, regrouped above to fit the NUMA parts.
             group_size = self.hidden_size // next(t for t in self.gate_scales if t is not None).shape[1]
+            has_zeros = any(t is not None for t in self.gate_zeros)
+            if has_zeros:
+                moe_config.gate_zeros = [[0 if t is None else t.data_ptr() for t in self.gate_zeros]]
+                moe_config.up_zeros = [[0 if t is None else t.data_ptr() for t in self.up_zeros]]
+                moe_config.down_zeros = [[0 if t is None else t.data_ptr() for t in self.down_zeros]]
             weight_sample = next(t for t in self.gate_weights if t is not None)
             if weight_sample.dtype != torch.uint8 or 2 * weight_sample.numel() != (
                 self.hidden_size * self.moe_intermediate_size
@@ -1042,7 +991,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 )
             moe_config.quant_config.bits = 4
             moe_config.quant_config.group_size = group_size
-            moe_config.quant_config.zero_point = False
+            moe_config.quant_config.zero_point = has_zeros
             self.moe = AMXInt4W4A16_MOE(moe_config)
         elif self.method == "MXFP4":
             # MXFP4: E2M1 nibble-packed weights, ue8m0/bf16 per-32 group scale
@@ -1166,6 +1115,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
             del self.gate_scales
             del self.up_scales
             del self.down_scales
+        if self.method == "W4A16":
+            del self.gate_zeros, self.up_zeros, self.down_zeros
 
         NativeMoEWrapper._release_loader(layer_idx=self.layer_idx)
         t6 = time.time()

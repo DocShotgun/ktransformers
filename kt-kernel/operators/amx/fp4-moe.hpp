@@ -620,8 +620,10 @@ struct GemmKernel224MXFP4SmallKGroup {
       if (e4m3) release_scale_tail(3 * count);
     }
 
-    // One projection's scales as the loader hands them over (BF16 bits, row-major).
-    void load_scales(const ggml_bf16_t* source) {
+    // One projection's scales as the loader hands them over (BF16 bits, row-major); FP4
+    // has no zero points.
+    void load_scales(const ggml_bf16_t* source, [[maybe_unused]] const uint8_t* zero) {
+      assert(zero == nullptr);
       load_scale_e8(source);
       finalize_scale_nv();
     }
@@ -1746,9 +1748,18 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
   AMX_FP4_MOE_TP() = default;
   AMX_FP4_MOE_TP(GeneralMOEConfig config, int tp_part_idx_ = 0) : Base(config, tp_part_idx_) {}
 
+  // Kernels that read zero points declare kZeroPoints (int4-w4a16-moe.hpp).
+  static constexpr bool kernel_reads_zero_points() {
+    if constexpr (requires { T::kZeroPoints; }) {
+      return T::kZeroPoints;
+    } else {
+      return false;
+    }
+  }
+
   void derived_init() {
     auto& quant_config = config_.quant_config;
-    if (quant_config.group_size == 0 || quant_config.zero_point) {
+    if (quant_config.group_size == 0 || (quant_config.zero_point && !kernel_reads_zero_points())) {
       throw std::runtime_error("FP4 (MXFP4/NVFP4) MoE only supports KGroup FP4");
     }
     printf("Creating AMX_FP4_MOE_TP %d at numa %d\n", tp_part_idx, numa_node_of_cpu(sched_getcpu()));
@@ -1942,7 +1953,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;
     auto pool = config_.pool->get_subpool(tp_part_idx);
 
-    if (quant_config.group_size == 0 || quant_config.zero_point)
+    if (quant_config.group_size == 0 || (quant_config.zero_point && !kernel_reads_zero_points()))
       throw std::runtime_error("FP4 (MXFP4/NVFP4) MoE only support KGroup FP4.");
     if (config_.gate_scale == nullptr)
       throw std::runtime_error("FP4 (MXFP4/NVFP4) MoE only support load native weight.");
@@ -1988,9 +1999,16 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
           if (config_.should_skip_expert(expert_idx)) return;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           size_t scale_elem_count = (config_.hidden_size * config_.intermediate_size) / config_.quant_config.group_size;
-          gate_bb_[expert_idx]->load_scales((ggml_bf16_t*)config_.gate_scale + (logical_expert_id * scale_elem_count));
-          up_bb_[expert_idx]->load_scales((ggml_bf16_t*)config_.up_scale + (logical_expert_id * scale_elem_count));
-          down_bb_[expert_idx]->load_scales((ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count));
+          // Zero codes, one byte per scale, when the kernel reads them.
+          const auto zeros = [&](void* base) -> const uint8_t* {
+            return base ? (const uint8_t*)base + logical_expert_id * scale_elem_count : nullptr;
+          };
+          gate_bb_[expert_idx]->load_scales((ggml_bf16_t*)config_.gate_scale + (logical_expert_id * scale_elem_count),
+                                            zeros(config_.gate_zero));
+          up_bb_[expert_idx]->load_scales((ggml_bf16_t*)config_.up_scale + (logical_expert_id * scale_elem_count),
+                                          zeros(config_.up_zero));
+          down_bb_[expert_idx]->load_scales((ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count),
+                                            zeros(config_.down_zero));
         },
         nullptr);
   }
@@ -2194,6 +2212,23 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
       tpc.gate_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
       tpc.up_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
       tpc.down_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
+      // Zero codes (int4 W4A16), laid out like the scales with one byte each.
+      const bool has_zeros = use_per_expert_ptrs ? !config.gate_zeros.empty() : config.gate_zero != nullptr;
+      tpc.gate_zero = has_zeros ? new uint8_t[tpc.expert_num * scales_elem_count] : nullptr;
+      tpc.up_zero = has_zeros ? new uint8_t[tpc.expert_num * scales_elem_count] : nullptr;
+      tpc.down_zero = has_zeros ? new uint8_t[tpc.expert_num * scales_elem_count] : nullptr;
+      // This part's slice of one expert's [n, groups] zero codes.
+      const auto copy_zeros = [&](size_t expert_id, const uint8_t* gate, const uint8_t* up, const uint8_t* down) {
+        memcpy((uint8_t*)tpc.gate_zero + expert_id * scales_elem_count, gate + i * scales_elem_count,
+               scales_elem_count);
+        memcpy((uint8_t*)tpc.up_zero + expert_id * scales_elem_count, up + i * scales_elem_count, scales_elem_count);
+        const size_t part_groups = tpc.intermediate_size / group_size;
+        const size_t groups = config.intermediate_size / group_size;
+        for (size_t col = 0; col < config.hidden_size; col++) {
+          memcpy((uint8_t*)tpc.down_zero + expert_id * scales_elem_count + col * part_groups,
+                 down + col * groups + i * part_groups, part_groups);
+        }
+      };
 
       if (use_per_expert_ptrs) {
         pool->get_subpool(i)->do_work_stealing_job(
@@ -2227,6 +2262,11 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
                        src_down_scale +
                            (col * (config.intermediate_size / group_size) + i * (tpc.intermediate_size / group_size)),
                        sizeof(ggml_bf16_t) * (tpc.intermediate_size / group_size));
+              }
+              if (has_zeros) {
+                copy_zeros(expert_id, (const uint8_t*)config.gate_zeros[0][expert_id],
+                           (const uint8_t*)config.up_zeros[0][expert_id],
+                           (const uint8_t*)config.down_zeros[0][expert_id]);
               }
             },
             nullptr);
@@ -2270,6 +2310,12 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
                               col * (config.intermediate_size / group_size) + i * (tpc.intermediate_size / group_size)),
                          sizeof(ggml_bf16_t) * (tpc.intermediate_size / group_size));
                 }
+                if (has_zeros) {
+                  const size_t expert_groups = (config.hidden_size / group_size) * config.intermediate_size;
+                  copy_zeros(expert_id, (const uint8_t*)config.gate_zero + expert_id * expert_groups,
+                             (const uint8_t*)config.up_zero + expert_id * expert_groups,
+                             (const uint8_t*)config.down_zero + expert_id * expert_groups);
+                }
               },
               nullptr);
         }
@@ -2287,6 +2333,9 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
       delete[] (ggml_bf16_t*)(tpc.gate_scale);
       delete[] (ggml_bf16_t*)(tpc.up_scale);
       delete[] (ggml_bf16_t*)(tpc.down_scale);
+      delete[] (uint8_t*)(tpc.gate_zero);
+      delete[] (uint8_t*)(tpc.up_zero);
+      delete[] (uint8_t*)(tpc.down_zero);
     });
 
     this->weights_loaded = true;

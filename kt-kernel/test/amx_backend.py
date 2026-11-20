@@ -94,10 +94,12 @@ def build_moe(
     bits=None,
     group_size=None,
     per_channel=False,
+    zeros=None,
     **fields,
 ):
     """(pool, config, moe): a loaded `moe_class` over the (gate, up, down) `weights` on a
-    16-thread pool. `fields` are further MOEConfig attributes."""
+    16-thread pool, with (gate, up, down) `zeros` when given. `fields` are further MOEConfig
+    attributes."""
     import kt_kernel
 
     ext = kt_kernel.kt_kernel_ext
@@ -112,7 +114,9 @@ def build_moe(
     if bits is not None:
         config.quant_config.bits = bits
         config.quant_config.group_size = group_size
-        config.quant_config.zero_point = False
+        config.quant_config.zero_point = zeros is not None
+    if zeros is not None:
+        config.gate_zero, config.up_zero, config.down_zero = [zero.data_ptr() for zero in zeros]
     if per_channel:
         config.quant_config.per_channel = True
     for name, value in fields.items():
