@@ -1,9 +1,11 @@
 import gc
 import glob
 import logging
+import math
 import os
 import torch
 import ctypes
+import functools
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
@@ -241,6 +243,34 @@ def _w4a16_checkpoint_format(weight_path: str) -> str:
         if weights.get("actorder") == "group":
             raise NotImplementedError("W4A16 does not read actorder='group' (g_idx) checkpoints")
     return quant_method
+
+
+def _w4a16_regroup_scales(scales, group_size: int, k_per_part: int):
+    """(scales, group size) regrouped to gcd(group_size, k_per_part).
+
+    The NUMA parts split down's K into slices of k_per_part, and no group may span two parts.
+    Repeating each scale for its sub-groups leaves every weight's scale unchanged.
+    """
+    part_group_size = math.gcd(group_size, k_per_part)
+    if part_group_size % 32:
+        raise ValueError(
+            f"W4A16 needs groups of a multiple of 32 within each NUMA part; group {group_size} and "
+            f"{k_per_part} intermediate columns per part leave {part_group_size}"
+        )
+    if part_group_size == group_size:
+        return scales, group_size
+    repeat = group_size // part_group_size
+    return [None if s is None else s.repeat_interleave(repeat, dim=1).contiguous() for s in scales], part_group_size
+
+
+@functools.lru_cache(maxsize=None)
+def _log_w4a16_regroup(group_size: int, k_per_part: int, part_group_size: int) -> None:
+    logger.info(
+        "[KT] W4A16: group %d spans NUMA parts of %d columns; scales regrouped to %d",
+        group_size,
+        k_per_part,
+        part_group_size,
+    )
 
 
 def _select_mxfp4_backend():
@@ -742,6 +772,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
         if NativeMoEWrapper._native_loader_instance is None:
             NativeMoEWrapper._native_loader_instance = NativeMoEWrapper._create_loader(method, weight_path)
         self.loader = NativeMoEWrapper._native_loader_instance
+        # TP_MOE splits the intermediate dimension over one part per subpool.
+        self._tp_parts = threadpool_count
 
         self.gate_weights = None
         self.up_weights = None
@@ -885,6 +917,17 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for RAWINT4"
             elif self.method == "W4A16":
                 assert scale_sample.dtype == torch.bfloat16, "Expected bf16 scales for W4A16"
+                group_size = self.hidden_size // scale_sample.shape[1]
+                down_scale_sample = next(t for t in self.down_scales if t is not None)
+                if self.moe_intermediate_size // down_scale_sample.shape[1] != group_size:
+                    raise ValueError("W4A16 needs one group size for gate/up and down")
+                k_per_part = self.moe_intermediate_size // self._tp_parts
+                (self.gate_scales, part_group_size), (self.up_scales, _), (self.down_scales, _) = [
+                    _w4a16_regroup_scales(scales, group_size, k_per_part)
+                    for scales in (self.gate_scales, self.up_scales, self.down_scales)
+                ]
+                if part_group_size != group_size:
+                    _log_w4a16_regroup(group_size, k_per_part, part_group_size)
             elif self.method == "FP8":
                 if self.gate_scales[0].dtype != torch.float32:
                     self.gate_scales = [t.to(torch.float32).contiguous() for t in weights["gate_scale"]]
@@ -986,10 +1029,10 @@ class NativeMoEWrapper(BaseMoEWrapper):
             retain_source_weights = backend_cls is AVX2RawInt4_MOE
             self.moe = backend_cls(moe_config)
         elif self.method == "W4A16":
-            # Codes q + 8, two per byte with the low nibble first along K, and BF16 group scales.
-            group_size = self.hidden_size // scale_sample.shape[1]
+            # Codes q + 8, two per byte with the low nibble first along K, and BF16 group scales
+            # (regrouped above to fit the NUMA parts).
+            group_size = self.hidden_size // next(t for t in self.gate_scales if t is not None).shape[1]
             weight_sample = next(t for t in self.gate_weights if t is not None)
-            down_scale_sample = next(t for t in self.down_scales if t is not None)
             if weight_sample.dtype != torch.uint8 or 2 * weight_sample.numel() != (
                 self.hidden_size * self.moe_intermediate_size
             ):
@@ -997,8 +1040,6 @@ class NativeMoEWrapper(BaseMoEWrapper):
                     f"W4A16 expects 4-bit expert weights; got {weight_sample.dtype} "
                     f"{tuple(weight_sample.shape)} for a {self.moe_intermediate_size}x{self.hidden_size} projection"
                 )
-            if self.moe_intermediate_size // down_scale_sample.shape[1] != group_size:
-                raise ValueError("W4A16 needs one group size for gate/up and down")
             moe_config.quant_config.bits = 4
             moe_config.quant_config.group_size = group_size
             moe_config.quant_config.zero_point = False

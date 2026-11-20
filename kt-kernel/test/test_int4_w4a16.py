@@ -8,6 +8,7 @@ the tolerances below.
 
 import pytest
 import torch
+from kt_kernel.utils.amx import _w4a16_regroup_scales
 
 import amx_backend
 
@@ -27,20 +28,25 @@ def dequantize(codes, scales, group_size, fold):
     return weight.bfloat16().float() if fold else weight
 
 
-@pytest.mark.parametrize("group_size", [32, 128])
+# hidden 2048 spans two AMX K blocks of 1024. Split over four NUMA parts, intermediate
+# 1024 leaves 256 columns of down's K per part and 768 leaves 192, which takes groups of
+# 128 regrouped to 64 (valid for any part count).
+@pytest.mark.parametrize("group_size, intermediate", [(32, 1024), (128, 1024), (128, 768)])
 @pytest.mark.parametrize("expert_counts", [(33, 31), (20, 7)])
-def test_int4_w4a16_matches_reference(expert_counts, group_size):
+def test_int4_w4a16_matches_reference(expert_counts, group_size, intermediate):
     amx_backend.require_amx("AMXInt4W4A16_MOE")
     generator = torch.Generator().manual_seed(23)
-    # hidden 2048 spans two AMX K blocks of 1024. intermediate 1024 leaves 256 per NUMA
-    # TP part on down's K, so groups of 128 do not straddle parts.
-    experts, hidden, intermediate = 2, 2048, 1024
+    experts, hidden = 2, 2048
     qlen = sum(expert_counts)
     shapes = {"gate": (intermediate, hidden), "up": (intermediate, hidden), "down": (hidden, intermediate)}
     projections = {
         name: [quantize(n, k, group_size, generator) for _ in range(experts)] for name, (n, k) in shapes.items()
     }
     stack = lambda name, index: torch.stack([expert[index] for expert in projections[name]]).contiguous()
+    regrouped = {
+        name: _w4a16_regroup_scales([expert[2] for expert in projections[name]], group_size, intermediate // 4)
+        for name in shapes
+    }
 
     pool, _, moe = amx_backend.build_moe(
         "AMXInt4W4A16_MOE",
@@ -49,9 +55,9 @@ def test_int4_w4a16_matches_reference(expert_counts, group_size):
         intermediate,
         qlen,
         tuple(stack(name, 1) for name in shapes),
-        tuple(stack(name, 2) for name in shapes),
+        tuple(torch.stack(regrouped[name][0]).contiguous() for name in shapes),
         bits=4,
-        group_size=group_size,
+        group_size=regrouped["gate"][1],
     )
     ids, weights = amx_backend.two_expert_routes(expert_counts)
     inputs = (torch.randn(qlen, hidden, generator=generator) * 0.5).to(torch.bfloat16).contiguous()
