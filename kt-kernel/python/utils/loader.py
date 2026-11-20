@@ -1344,22 +1344,30 @@ def _layout_not_found_error(loader_name: str, base_key: str, family: str) -> Val
     )
 
 
+def expert_plan(has_expert, gpu_experts_mask, label: str):
+    """(expert_count, skipped) for one layer: experts 0.. while has_expert(i); skipped[i]
+    marks a GPU-resident expert."""
+    expert_count = 0
+    while has_expert(expert_count):
+        expert_count += 1
+    if gpu_experts_mask is None:
+        return expert_count, [False] * expert_count
+    skipped = gpu_experts_mask.to(device="cpu", dtype=torch.bool).tolist()
+    if len(skipped) != expert_count:
+        raise ValueError(
+            f"gpu_experts_mask length does not match {label} expert count: {len(skipped)} != {expert_count}"
+        )
+    return expert_count, skipped
+
+
 def _cpu_expert_plan(loader, base_key: str, family: str, gpu_experts_mask):
     """(layout, expert_count, skipped) for one layer; skipped[i] marks a GPU-resident expert."""
     layout = resolve_experts_layout(loader, base_key, family=family)
     if layout is None:
         raise _layout_not_found_error(type(loader).__name__, base_key, family)
-    expert_count = 0
-    while loader.has_tensor(layout.weight_key(expert_count, 0)):
-        expert_count += 1
-    if gpu_experts_mask is None:
-        return layout, expert_count, [False] * expert_count
-    skipped = gpu_experts_mask.to(device="cpu", dtype=torch.bool).tolist()
-    if len(skipped) != expert_count:
-        raise ValueError(
-            f"gpu_experts_mask length does not match {family.upper()} expert count: "
-            f"{len(skipped)} != {expert_count}"
-        )
+    expert_count, skipped = expert_plan(
+        lambda expert: loader.has_tensor(layout.weight_key(expert, 0)), gpu_experts_mask, family.upper()
+    )
     return layout, expert_count, skipped
 
 

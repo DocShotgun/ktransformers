@@ -17,7 +17,7 @@ import os
 
 import torch
 
-from .loader import MOE_NAMING_PROBE_ORDER, MOE_NAMING_VARIANTS, SafeTensorLoader, base_key_variants
+from .loader import MOE_NAMING_PROBE_ORDER, MOE_NAMING_VARIANTS, SafeTensorLoader, base_key_variants, expert_plan
 
 logger = logging.getLogger(__name__)
 
@@ -101,14 +101,11 @@ class W4A16SafeTensorLoader(SafeTensorLoader):
 
     def load_experts(self, base_key: str, gpu_experts_mask: torch.Tensor | None = None, device: str = "cpu"):
         prefix, proj_names = self._experts_prefix(base_key)
-        count = 0
-        while self.has_tensor(f"{prefix}.{count}.{proj_names[0]}.weight_packed"):
-            count += 1
-        skipped = [False] * count if gpu_experts_mask is None else gpu_experts_mask.to(torch.bool).tolist()
-        if len(skipped) != count:
-            raise ValueError(
-                f"gpu_experts_mask length does not match the W4A16 expert count: {len(skipped)} != {count}"
-            )
+        _, skipped = expert_plan(
+            lambda expert: self.has_tensor(f"{prefix}.{expert}.{proj_names[0]}.weight_packed"),
+            gpu_experts_mask,
+            "W4A16",
+        )
         result = {}
         for name, proj in zip(PROJECTIONS, proj_names):
             loaded = [
